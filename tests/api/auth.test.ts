@@ -1,10 +1,10 @@
 // tests/api/auth.test.ts
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import Fastify from 'fastify'
 import cookie from '@fastify/cookie'
-import { registerAuthRoutes } from '../../src/api/auth.js'
+import { registerAuthRoutes, requireSession } from '../../src/api/auth.js'
 import { createLockout } from '../../src/auth/lockout.js'
-import { SESSION_COOKIE } from '../../src/auth/session.js'
+import { SESSION_COOKIE, signSession } from '../../src/auth/session.js'
 
 function build(authenticate: (u: string, p: string) => Promise<{ userId: string; token: string; isAdministrator: boolean }>) {
   const app = Fastify()
@@ -57,6 +57,29 @@ describe('POST /api/auth/login', () => {
     }
   })
 
+  it('treats an error with no kind as a Jellyfin-side problem: 503 and no consumed attempt', async () => {
+    const app = build(async () => { throw new Error('boom') })
+    for (let i = 0; i < 5; i += 1) {
+      const r = await app.inject({ method: 'POST', url: '/api/auth/login', payload: { username: 'bob', password: 'x' } })
+      expect(r.statusCode).toBe(503)
+    }
+  })
+
+  it('serializes concurrent attempts for the same key so a burst cannot bypass the lockout', async () => {
+    let calls = 0
+    const app = build(async () => {
+      calls += 1
+      await new Promise((r) => setTimeout(r, 20))
+      throw Object.assign(new Error('bad'), { kind: 'auth', name: 'ConnectorError' })
+    })
+    const attempts = Array.from({ length: 20 }, () =>
+      app.inject({ method: 'POST', url: '/api/auth/login', payload: { username: 'burst', password: 'x' } }),
+    )
+    const results = await Promise.all(attempts)
+    expect(calls).toBeLessThanOrEqual(3)
+    expect(results.some((r) => r.statusCode === 429)).toBe(true)
+  })
+
   it('never echoes the password back in any response', async () => {
     const app = build(async () => { throw Object.assign(new Error('nope'), { kind: 'auth', name: 'ConnectorError' }) })
     const res = await app.inject({ method: 'POST', url: '/api/auth/login', payload: { username: 'bob', password: 'hunter2' } })
@@ -85,5 +108,30 @@ describe('GET /api/auth/me', () => {
       headers: { cookie: `${SESSION_COOKIE}=eyJhIjoxfQ.forged` },
     })
     expect(res.statusCode).toBe(401)
+  })
+})
+
+describe('requireSession preHandler', () => {
+  const secret = 'a-very-long-test-secret'
+
+  function buildProtected() {
+    const app = Fastify()
+    app.register(cookie)
+    app.get('/protected', { preHandler: requireSession(secret) }, async () => ({ ok: true }))
+    return app
+  }
+
+  it('blocks a request with no session', async () => {
+    const app = buildProtected()
+    const res = await app.inject({ method: 'GET', url: '/protected' })
+    expect(res.statusCode).toBe(401)
+  })
+
+  it('lets a request with a valid session reach the handler', async () => {
+    const app = buildProtected()
+    const token = signSession({ username: 'bob', userId: 'u1', issuedAt: Date.now() }, secret)
+    const res = await app.inject({ method: 'GET', url: '/protected', headers: { cookie: `${SESSION_COOKIE}=${token}` } })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toEqual({ ok: true })
   })
 })
