@@ -1,0 +1,181 @@
+import { HttpClient } from './http.js'
+
+export interface JellyfinLibrary { id: string; name: string; collectionType: string | null; locations: string[] }
+
+export interface JellyfinItem {
+  id: string
+  type: string
+  name: string
+  sortName: string | null
+  year: number | null
+  seriesId: string | null
+  seriesName: string | null
+  seasonNo: number | null
+  episodeNo: number | null
+  providerIds: Record<string, string>
+  jfPath: string | null
+  sizeBytes: number | null
+  runtimeTicks: number | null
+  container: string | null
+  videoCodec: string | null
+  audioCodec: string | null
+  audioChannels: number | null
+  width: number | null
+  height: number | null
+  bitrate: number | null
+  hasPrimaryImage: boolean
+  dateCreated: string | null
+  mediaSourceId: string | null
+}
+
+export interface JellyfinClientOptions {
+  url: string
+  apiKey: string
+  concurrency: number
+  minDelayMs: number
+  fetchImpl?: typeof fetch
+}
+
+const ITEM_FIELDS = 'Path,ProviderIds,MediaSources,MediaStreams,DateCreated,ParentId,ProductionYear,SortName'
+const ITEM_TYPES = 'Movie,Episode,Series,Season'
+const CLIENT_HEADER =
+  'MediaBrowser Client="Jellymaid", Device="Jellymaid", DeviceId="jellymaid-server", Version="1.0.0"'
+
+interface RawStream { Type?: string; Codec?: string; Width?: number; Height?: number; Channels?: number }
+interface RawSource { Id?: string; Size?: number; Container?: string; Bitrate?: number; MediaStreams?: RawStream[] }
+interface RawItem {
+  Id: string; Type?: string; Name?: string; SortName?: string; ProductionYear?: number
+  SeriesId?: string; SeriesName?: string; ParentIndexNumber?: number; IndexNumber?: number
+  ProviderIds?: Record<string, string>; Path?: string; RunTimeTicks?: number
+  ImageTags?: Record<string, string>; DateCreated?: string; MediaSources?: RawSource[]
+}
+
+function normalize(raw: RawItem): JellyfinItem {
+  const source = raw.MediaSources?.[0]
+  const streams = source?.MediaStreams ?? []
+  const video = streams.find((s) => s.Type === 'Video')
+  const audio = streams.find((s) => s.Type === 'Audio')
+  const providerIds: Record<string, string> = {}
+  for (const [k, v] of Object.entries(raw.ProviderIds ?? {})) providerIds[k.toLowerCase()] = v
+  return {
+    id: raw.Id,
+    type: raw.Type ?? 'Unknown',
+    name: raw.Name ?? '',
+    sortName: raw.SortName ?? null,
+    year: raw.ProductionYear ?? null,
+    seriesId: raw.SeriesId ?? null,
+    seriesName: raw.SeriesName ?? null,
+    seasonNo: raw.ParentIndexNumber ?? null,
+    episodeNo: raw.IndexNumber ?? null,
+    providerIds,
+    jfPath: raw.Path ?? null,
+    sizeBytes: source?.Size ?? null,
+    runtimeTicks: raw.RunTimeTicks ?? null,
+    container: source?.Container ?? null,
+    videoCodec: video?.Codec ?? null,
+    audioCodec: audio?.Codec ?? null,
+    audioChannels: audio?.Channels ?? null,
+    width: video?.Width ?? null,
+    height: video?.Height ?? null,
+    bitrate: source?.Bitrate ?? null,
+    hasPrimaryImage: Boolean(raw.ImageTags?.Primary),
+    dateCreated: raw.DateCreated ?? null,
+    mediaSourceId: source?.Id ?? null,
+  }
+}
+
+export interface JellyfinClient {
+  authenticateByName(username: string, password: string): Promise<{ userId: string; token: string; isAdministrator: boolean }>
+  virtualFolders(): Promise<JellyfinLibrary[]>
+  items(opts: { startIndex: number; limit: number }): Promise<{ items: JellyfinItem[]; totalRecordCount: number }>
+  mergeVersions(ids: string[]): Promise<void>
+  splitVersions(id: string): Promise<void>
+  deleteItem(id: string): Promise<void>
+  refreshLibrary(): Promise<void>
+  ping(): Promise<void>
+}
+
+export function createJellyfinClient(opts: JellyfinClientOptions): JellyfinClient {
+  const http = new HttpClient({
+    service: 'jellyfin',
+    baseUrl: opts.url,
+    concurrency: opts.concurrency,
+    minDelayMs: opts.minDelayMs,
+    defaultHeaders: { 'X-Emby-Token': opts.apiKey, 'Content-Type': 'application/json' },
+    fetchImpl: opts.fetchImpl,
+  })
+
+  return {
+    async authenticateByName(username, password) {
+      const auth = await http.request<{ User?: { Id: string }; AccessToken?: string }>(
+        '/Users/AuthenticateByName',
+        {
+          method: 'POST',
+          headers: { Authorization: CLIENT_HEADER, 'X-Emby-Token': '' },
+          body: JSON.stringify({ Username: username, Pw: password }),
+        },
+      )
+      const token = auth.AccessToken ?? ''
+      const userId = auth.User?.Id ?? ''
+      try {
+        const me = await http.request<{ Policy?: { IsAdministrator?: boolean } }>('/Users/Me', {
+          headers: { 'X-Emby-Token': token },
+        })
+        return { userId, token, isAdministrator: Boolean(me.Policy?.IsAdministrator) }
+      } finally {
+        // The token exists only to answer "is this an admin". Revoke it immediately.
+        await http.request('/Sessions/Logout', { method: 'POST', headers: { 'X-Emby-Token': token } }, 'none')
+          .catch(() => undefined)
+      }
+    },
+
+    async virtualFolders() {
+      const raw = await http.request<Array<{ ItemId?: string; Id?: string; Name?: string; CollectionType?: string; Locations?: string[] }>>(
+        '/Library/VirtualFolders',
+      )
+      return raw.map((f) => ({
+        id: f.ItemId ?? f.Id ?? f.Name ?? '',
+        name: f.Name ?? '',
+        collectionType: f.CollectionType ?? null,
+        locations: f.Locations ?? [],
+      }))
+    },
+
+    async items({ startIndex, limit }) {
+      const qs = new URLSearchParams({
+        Recursive: 'true',
+        IncludeItemTypes: ITEM_TYPES,
+        Fields: ITEM_FIELDS,
+        StartIndex: String(startIndex),
+        Limit: String(limit),
+        EnableTotalRecordCount: 'true',
+      })
+      const raw = await http.request<{ Items?: RawItem[]; TotalRecordCount?: number }>(`/Items?${qs.toString()}`)
+      return {
+        items: (raw.Items ?? []).map(normalize),
+        totalRecordCount: raw.TotalRecordCount ?? 0,
+      }
+    },
+
+    async mergeVersions(ids) {
+      if (ids.length < 2) throw new Error('mergeVersions requires at least two ids')
+      await http.request(`/Videos/MergeVersions?Ids=${encodeURIComponent(ids.join(','))}`, { method: 'POST' }, 'none')
+    },
+
+    async splitVersions(id) {
+      await http.request(`/Videos/${encodeURIComponent(id)}/AlternateSources`, { method: 'DELETE' }, 'none')
+    },
+
+    async deleteItem(id) {
+      await http.request(`/Items/${encodeURIComponent(id)}`, { method: 'DELETE' }, 'none')
+    },
+
+    async refreshLibrary() {
+      await http.request('/Library/Refresh', { method: 'POST' }, 'none')
+    },
+
+    async ping() {
+      await http.request('/System/Info', {}, 'json')
+    },
+  }
+}
