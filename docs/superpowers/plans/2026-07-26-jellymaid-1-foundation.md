@@ -2123,6 +2123,15 @@ export interface Lockout {
   check(key: string): { locked: boolean; retryAfterMs: number }
   recordFailure(key: string): void
   reset(key: string): void
+  /**
+   * Serialises attempts for one key and returns a release function.
+   *
+   * Without this the lockout is decorative: the handler checks, awaits a network
+   * round-trip, and only then records the failure — so N concurrent requests all
+   * pass the check before any of them records anything. Measured: 50 concurrent
+   * logins produced 50 real password guesses and zero 429s.
+   */
+  beginAttempt(key: string): Promise<() => void>
 }
 
 export function createLockout(opts: {
@@ -2131,6 +2140,7 @@ export function createLockout(opts: {
   const now = opts.now ?? Date.now
   const failures = new Map<string, number[]>()
   const locks = new Map<string, number>()
+  const queues = new Map<string, Promise<void>>()
 
   return {
     check(key) {
@@ -2151,6 +2161,23 @@ export function createLockout(opts: {
       }
     },
     reset(key) { failures.delete(key); locks.delete(key) },
+    async beginAttempt(key) {
+      // Wait for whoever is currently holding this key's turn.
+      const prior = queues.get(key) ?? Promise.resolve()
+      let release!: () => void
+      const done = new Promise<void>((resolve) => { release = resolve })
+      // The new queue tail resolves only once the prior holder AND we are both done,
+      // so the next caller in line waits for us too.
+      const tail = prior.then(() => done)
+      queues.set(key, tail)
+      await prior
+      return () => {
+        release()
+        // Only the last-enqueued holder for this key clears the map entry, so it
+        // doesn't grow without bound once nobody is waiting on this key anymore.
+        if (queues.get(key) === tail) queues.delete(key)
+      }
+    },
   }
 }
 ```
@@ -2319,36 +2346,49 @@ export function registerAuthRoutes(app: FastifyInstance, deps: AuthDeps): void {
     const { username, password } = parsed.data
     const key = clientKey(req, username)
 
-    const lock = deps.lockout.check(key)
-    if (lock.locked) {
-      return reply.code(429).send({ error: 'too many failed attempts', retryAfterMs: lock.retryAfterMs })
-    }
-
-    let result: { userId: string; token: string; isAdministrator: boolean }
+    // Serialise attempts for this key. Everything from the check to the record must
+    // happen without another request for the same key interleaving, or a burst of
+    // concurrent logins all pass the check before any of them records a failure.
+    const release = await deps.lockout.beginAttempt(key)
     try {
-      result = await deps.jellyfin.authenticateByName(username, password)
-    } catch (err) {
-      const kind = (err as { kind?: string }).kind
-      // Jellyfin being unreachable is not the operator's fault: no attempt is consumed.
-      if (kind && kind !== 'auth') {
-        return reply.code(503).send({ error: 'Jellyfin is unreachable' })
+      const lock = deps.lockout.check(key)
+      if (lock.locked) {
+        return reply.code(429).send({ error: 'too many failed attempts', retryAfterMs: lock.retryAfterMs })
       }
-      deps.lockout.recordFailure(key)
-      return reply.code(401).send({ error: 'invalid credentials' })
-    }
 
-    if (!result.isAdministrator) {
-      deps.lockout.recordFailure(key)
-      return reply.code(403).send({ error: 'a Jellyfin administrator account is required' })
-    }
+      let result: { userId: string; token: string; isAdministrator: boolean }
+      try {
+        result = await deps.jellyfin.authenticateByName(username, password)
+      } catch (err) {
+        // ONLY a genuine credential rejection counts against the operator. An
+        // unreachable Jellyfin — or any error we cannot classify — must not consume
+        // an attempt, or an outage locks the operator out of their own cleanup tool.
+        if ((err as { kind?: string }).kind !== 'auth') {
+          return reply.code(503).send({ error: 'Jellyfin is unreachable' })
+        }
+        deps.lockout.recordFailure(key)
+        return reply.code(401).send({ error: 'invalid credentials' })
+      }
 
-    deps.lockout.reset(key)
-    const token = signSession({ username, userId: result.userId, issuedAt: Date.now() }, deps.sessionSecret)
+      if (!result.isAdministrator) {
+        deps.lockout.recordFailure(key)
+        return reply.code(403).send({ error: 'a Jellyfin administrator account is required' })
+      }
+
+      deps.lockout.reset(key)
+      return sendSession(reply, username, result.userId)
+    } finally {
+      release()
+    }
+  })
+
+  function sendSession(reply: FastifyReply, username: string, userId: string) {
+    const token = signSession({ username, userId, issuedAt: Date.now() }, deps.sessionSecret)
     reply.setCookie(SESSION_COOKIE, token, {
       httpOnly: true, sameSite: 'lax', secure: deps.secureCookie, path: '/', maxAge: SESSION_MAX_AGE_SECONDS,
     })
-    return reply.send({ username, userId: result.userId })
-  })
+    return reply.send({ username, userId })
+  }
 
   app.post('/api/auth/logout', async (_req, reply) => {
     reply.clearCookie(SESSION_COOKIE, { path: '/' })
