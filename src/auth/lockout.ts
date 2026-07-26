@@ -9,7 +9,20 @@ export interface Lockout {
    * in a `finally`, or every subsequent caller for that key wedges forever.
    */
   beginAttempt(key: string): Promise<() => void>
+  /**
+   * Number of keys currently held in memory. A pure observation — it does NOT sweep, so a test
+   * can prove the opportunistic sweep actually happens rather than proving its own call did it.
+   */
+  size(): number
 }
+
+/**
+ * Full sweeps run at most once every this many check/recordFailure calls. Keys are derived from
+ * unauthenticated input (one dimension is the client IP), so entries must not accumulate for the
+ * life of the process — but sweeping the whole map on every call would make each unauthenticated
+ * request cost O(all keys). Sweeping every N calls bounds it to amortised O(1) per call.
+ */
+const SWEEP_EVERY = 64
 
 export function createLockout(opts: {
   maxFailures: number; windowMs: number; lockMs: number; now?: () => number
@@ -18,9 +31,29 @@ export function createLockout(opts: {
   const failures = new Map<string, number[]>()
   const locks = new Map<string, number>()
   const queues = new Map<string, Promise<void>>()
+  let callsSinceSweep = 0
+
+  /** Drops expired locks and failure lists whose newest entry has fallen out of the window. */
+  function sweep(): void {
+    const t = now()
+    const cutoff = t - opts.windowMs
+    for (const [key, until] of locks) if (until <= t) locks.delete(key)
+    for (const [key, times] of failures) {
+      const newest = times[times.length - 1]
+      if (newest === undefined || newest <= cutoff) failures.delete(key)
+    }
+  }
+
+  function maybeSweep(): void {
+    callsSinceSweep += 1
+    if (callsSinceSweep < SWEEP_EVERY) return
+    callsSinceSweep = 0
+    sweep()
+  }
 
   return {
     check(key) {
+      maybeSweep()
       const until = locks.get(key)
       if (until === undefined) return { locked: false, retryAfterMs: 0 }
       const remaining = until - now()
@@ -28,13 +61,15 @@ export function createLockout(opts: {
       return { locked: true, retryAfterMs: remaining }
     },
     recordFailure(key) {
+      maybeSweep()
       const cutoff = now() - opts.windowMs
       const recent = (failures.get(key) ?? []).filter((t) => t > cutoff)
       recent.push(now())
       failures.set(key, recent)
       if (recent.length >= opts.maxFailures) {
         locks.set(key, now() + opts.lockMs)
-        failures.set(key, [])
+        // The lock carries this key's state from here; keeping the spent list would only leak.
+        failures.delete(key)
       }
     },
     reset(key) { failures.delete(key); locks.delete(key) },
@@ -55,5 +90,6 @@ export function createLockout(opts: {
         if (queues.get(key) === tail) queues.delete(key)
       }
     },
+    size: () => new Set([...failures.keys(), ...locks.keys()]).size,
   }
 }

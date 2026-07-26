@@ -80,6 +80,61 @@ describe('POST /api/auth/login', () => {
     expect(results.some((r) => r.statusCode === 429)).toBe(true)
   })
 
+  it('locks the USERNAME after three failures spread across three different IPs', async () => {
+    const app = build(async () => { throw Object.assign(new Error('bad'), { kind: 'auth', name: 'ConnectorError' }) })
+    for (const ip of ['10.0.0.1', '10.0.0.2', '10.0.0.3']) {
+      const r = await app.inject({
+        method: 'POST', url: '/api/auth/login', remoteAddress: ip,
+        payload: { username: 'victim', password: 'x' },
+      })
+      expect(r.statusCode).toBe(401)
+    }
+    // A fourth IP the lockout has never seen still must not get a free guess at this account.
+    const res = await app.inject({
+      method: 'POST', url: '/api/auth/login', remoteAddress: '10.0.0.4',
+      payload: { username: 'victim', password: 'x' },
+    })
+    expect(res.statusCode).toBe(429)
+  })
+
+  it('locks the IP after three failures spread across three different usernames', async () => {
+    const app = build(async () => { throw Object.assign(new Error('bad'), { kind: 'auth', name: 'ConnectorError' }) })
+    for (const username of ['alice', 'bob', 'carol'] as const) {
+      const r = await app.inject({
+        method: 'POST', url: '/api/auth/login', remoteAddress: '10.9.9.9',
+        payload: { username, password: 'x' },
+      })
+      expect(r.statusCode).toBe(401)
+    }
+    // A username the lockout has never seen still must not get a free guess from this IP.
+    const res = await app.inject({
+      method: 'POST', url: '/api/auth/login', remoteAddress: '10.9.9.9',
+      payload: { username: 'dave', password: 'x' },
+    })
+    expect(res.statusCode).toBe(429)
+  })
+
+  it('a successful login clears both the username and the IP counters', async () => {
+    let admitted = false
+    const app = build(async () => {
+      if (admitted) return { userId: 'u1', token: 'T', isAdministrator: true }
+      throw Object.assign(new Error('bad'), { kind: 'auth', name: 'ConnectorError' })
+    })
+    for (let i = 0; i < 2; i += 1) {
+      await app.inject({ method: 'POST', url: '/api/auth/login', remoteAddress: '10.5.5.5', payload: { username: 'bob', password: 'x' } })
+    }
+    admitted = true
+    const ok = await app.inject({ method: 'POST', url: '/api/auth/login', remoteAddress: '10.5.5.5', payload: { username: 'bob', password: 'pw' } })
+    expect(ok.statusCode).toBe(200)
+
+    admitted = false
+    // Both counters were reset, so three more failures are needed before the lock returns.
+    for (let i = 0; i < 2; i += 1) {
+      const r = await app.inject({ method: 'POST', url: '/api/auth/login', remoteAddress: '10.5.5.5', payload: { username: 'bob', password: 'x' } })
+      expect(r.statusCode).toBe(401)
+    }
+  })
+
   it('never echoes the password back in any response', async () => {
     const app = build(async () => { throw Object.assign(new Error('nope'), { kind: 'auth', name: 'ConnectorError' }) })
     const res = await app.inject({ method: 'POST', url: '/api/auth/login', payload: { username: 'bob', password: 'hunter2' } })
@@ -129,9 +184,32 @@ describe('requireSession preHandler', () => {
 
   it('lets a request with a valid session reach the handler', async () => {
     const app = buildProtected()
-    const token = signSession({ username: 'bob', userId: 'u1', issuedAt: Date.now() }, secret)
+    const token = signSession({ username: 'bob', userId: 'u1', issuedAt: Date.now(), isAdministrator: true }, secret)
     const res = await app.inject({ method: 'GET', url: '/protected', headers: { cookie: `${SESSION_COOKIE}=${token}` } })
     expect(res.statusCode).toBe(200)
     expect(res.json()).toEqual({ ok: true })
+  })
+
+  it('rejects a correctly signed session that does NOT carry the admin flag', async () => {
+    // The role is re-asserted from the signed payload rather than assumed because login checked
+    // it once. A session minted without the flag is not an admin session.
+    const app = buildProtected()
+    const token = signSession({ username: 'bob', userId: 'u1', issuedAt: Date.now() } as never, secret)
+    const res = await app.inject({ method: 'GET', url: '/protected', headers: { cookie: `${SESSION_COOKIE}=${token}` } })
+    expect(res.statusCode).toBe(401)
+  })
+
+  it('rejects a session whose admin flag is truthy but not exactly true', async () => {
+    const app = buildProtected()
+    const token = signSession({ username: 'bob', userId: 'u1', issuedAt: Date.now(), isAdministrator: 'yes' } as never, secret)
+    const res = await app.inject({ method: 'GET', url: '/protected', headers: { cookie: `${SESSION_COOKIE}=${token}` } })
+    expect(res.statusCode).toBe(401)
+  })
+
+  it('issues sessions that carry the admin flag, so the guard admits a real login', async () => {
+    const login = await build(admin).inject({ method: 'POST', url: '/api/auth/login', payload: { username: 'bob', password: 'pw' } })
+    const cookieHeader = String(login.headers['set-cookie']).split(';')[0]!
+    const res = await buildProtected().inject({ method: 'GET', url: '/protected', headers: { cookie: cookieHeader } })
+    expect(res.statusCode).toBe(200)
   })
 })

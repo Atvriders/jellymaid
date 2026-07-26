@@ -51,9 +51,17 @@ CREATE TABLE fs_entries (
   is_dir         INTEGER NOT NULL,
   size_bytes     INTEGER NOT NULL DEFAULT 0,
   mtime          INTEGER NOT NULL DEFAULT 0,
-  dev            INTEGER NOT NULL DEFAULT 0,
-  inode          INTEGER NOT NULL DEFAULT 0,
-  nlink          INTEGER NOT NULL DEFAULT 1,
+  -- Unknown is NULL, never 0/0/1, and these deliberately have no default.
+  -- (dev, inode) is the correlation key that proves two paths are the same bytes (hardlink and
+  -- cross-seed detection). A row the walker could not stat must not land on a MATCHABLE value:
+  -- 0/0 would make every unstattable row a "duplicate" of every other on idx_fs_entries_inode.
+  -- NULL never equals NULL in a join, which is exactly the answer "we do not know" deserves.
+  -- nlink DEFAULT 1 is worse still: it is indistinguishable from a genuine "this is the only
+  -- link, deleting it reclaims the full size" — the input a later delete guard trusts.
+  -- torrent_files spells unknown the same way, so both halves of the join key agree.
+  dev            INTEGER,
+  inode          INTEGER,
+  nlink          INTEGER,
   is_media       INTEGER NOT NULL DEFAULT 0,
   library_root   TEXT,
   root_role      TEXT,                   -- library | download

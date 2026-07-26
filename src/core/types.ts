@@ -67,11 +67,11 @@ export interface PathMapping {
 /**
  * Stable identity for a finding. Must not change across rescans, or dismissals
  * would resurrect. Arrays are sorted so subject ordering cannot perturb the id.
- * When joining sorted array elements, use NUL byte as separator to prevent collisions
- * from strings containing spaces (e.g., ['x', 'y z'] and ['x y', 'z'] would both
- * join to 'x y z' with space separator, but differ with NUL).
+ * EVERY join uses a NUL byte, including the ruleId-to-key join, because any separator that can
+ * occur inside an element collides: with a space, findingId('a', 'b c') and findingId('a b', 'c')
+ * hash the same string, exactly as ['x', 'y z'] and ['x y', 'z'] would.
  */
 export function findingId(ruleId: RuleId, subjectKey: string | string[]): string {
   const key = Array.isArray(subjectKey) ? [...subjectKey].sort().join('\0') : subjectKey
-  return createHash('sha256').update(`${ruleId} ${key}`).digest('hex').slice(0, 32)
+  return createHash('sha256').update(`${ruleId}\0${key}`).digest('hex').slice(0, 32)
 }

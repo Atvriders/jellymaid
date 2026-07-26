@@ -1,9 +1,21 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, readdirSync, statSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createPathMap, verifyMappings, autoDetectMappings } from '../../src/fs/pathmap.js'
 import type { PathMapping } from '../../src/core/types.js'
+
+/** Stands in for the production walk so the test can count how often each mount is enumerated. */
+function walkDirsForTest(root: string, maxDepth: number, depth = 0): string[] {
+  if (depth > maxDepth || !existsSync(root)) return []
+  const out = [root]
+  for (const name of readdirSync(root)) {
+    if (name.startsWith('.')) continue
+    const child = join(root, name)
+    if (statSync(child).isDirectory()) out.push(...walkDirsForTest(child, maxDepth, depth + 1))
+  }
+  return out
+}
 
 const MAPPINGS: PathMapping[] = [
   { role: 'library', jellyfin: '/media/Movies', container: '/mnt/media/Movies', qbit: '/downloads/movies' },
@@ -143,6 +155,101 @@ describe('autoDetectMappings', () => {
     })
     expect(proposed).toEqual([
       { role: 'library', jellyfin: '/media/Movies', container: join(dir, 'Movies'), qbit: null },
+    ])
+  })
+
+  it('proposes NOTHING for a jellyfin root two items place in different containers', async () => {
+    // Both items agree the Jellyfin root is /media/Movies but corroborate different containers.
+    // At most one can be right, and a wrong mapping is far more dangerous than an absent one.
+    const dir = mkdtempSync(join(tmpdir(), 'jm-ad-conflict-'))
+    mkdirSync(join(dir, 'diskA', 'Movies', 'Heat (1995)'), { recursive: true })
+    writeFileSync(join(dir, 'diskA', 'Movies', 'Heat (1995)', 'Heat.mkv'), 'x')
+    mkdirSync(join(dir, 'diskB', 'Movies', 'Alien (1979)'), { recursive: true })
+    writeFileSync(join(dir, 'diskB', 'Movies', 'Alien (1979)', 'Alien.mkv'), 'x')
+
+    const proposed = await autoDetectMappings({
+      mountRoots: [join(dir, 'diskA'), join(dir, 'diskB')],
+      sampleItems: async () => [
+        { id: 'i1', jfPath: '/media/Movies/Heat (1995)/Heat.mkv' },
+        { id: 'i2', jfPath: '/media/Movies/Alien (1979)/Alien.mkv' },
+      ],
+    })
+    expect(proposed).toEqual([])
+  })
+
+  it('keeps an unrelated root when a different root is conflicted', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jm-ad-conflict2-'))
+    mkdirSync(join(dir, 'diskA', 'Movies', 'Heat (1995)'), { recursive: true })
+    writeFileSync(join(dir, 'diskA', 'Movies', 'Heat (1995)', 'Heat.mkv'), 'x')
+    mkdirSync(join(dir, 'diskB', 'Movies', 'Alien (1979)'), { recursive: true })
+    writeFileSync(join(dir, 'diskB', 'Movies', 'Alien (1979)', 'Alien.mkv'), 'x')
+    mkdirSync(join(dir, 'diskA', 'TV', 'Show'), { recursive: true })
+    writeFileSync(join(dir, 'diskA', 'TV', 'Show', 'S01E01.mkv'), 'x')
+
+    const proposed = await autoDetectMappings({
+      mountRoots: [join(dir, 'diskA'), join(dir, 'diskB')],
+      sampleItems: async () => [
+        { id: 'i1', jfPath: '/media/Movies/Heat (1995)/Heat.mkv' },
+        { id: 'i2', jfPath: '/media/Movies/Alien (1979)/Alien.mkv' },
+        { id: 'i3', jfPath: '/media/TV/Show/S01E01.mkv' },
+      ],
+    })
+    expect(proposed).toEqual([
+      { role: 'library', jellyfin: '/media/TV', container: join(dir, 'diskA', 'TV'), qbit: null },
+    ])
+  })
+
+  it('stays conflicted even if a later item agrees with the first container', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jm-ad-conflict3-'))
+    mkdirSync(join(dir, 'diskA', 'Movies', 'Heat (1995)'), { recursive: true })
+    writeFileSync(join(dir, 'diskA', 'Movies', 'Heat (1995)', 'Heat.mkv'), 'x')
+    mkdirSync(join(dir, 'diskB', 'Movies', 'Alien (1979)'), { recursive: true })
+    writeFileSync(join(dir, 'diskB', 'Movies', 'Alien (1979)', 'Alien.mkv'), 'x')
+    mkdirSync(join(dir, 'diskA', 'Movies', 'Ronin (1998)'), { recursive: true })
+    writeFileSync(join(dir, 'diskA', 'Movies', 'Ronin (1998)', 'Ronin.mkv'), 'x')
+
+    const proposed = await autoDetectMappings({
+      mountRoots: [join(dir, 'diskA'), join(dir, 'diskB')],
+      sampleItems: async () => [
+        { id: 'i1', jfPath: '/media/Movies/Heat (1995)/Heat.mkv' },
+        { id: 'i2', jfPath: '/media/Movies/Alien (1979)/Alien.mkv' },
+        { id: 'i3', jfPath: '/media/Movies/Ronin (1998)/Ronin.mkv' },
+      ],
+    })
+    expect(proposed).toEqual([])
+  })
+
+  it('walks each mount exactly once per call, however many items and splits are tried', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jm-ad-walk-'))
+    for (let i = 0; i < 12; i += 1) {
+      mkdirSync(join(dir, 'Movies', `Film ${i} (2000)`), { recursive: true })
+      writeFileSync(join(dir, 'Movies', `Film ${i} (2000)`, `Film${i}.mkv`), 'x')
+    }
+    const other = mkdtempSync(join(tmpdir(), 'jm-ad-walk2-'))
+    for (let i = 0; i < 12; i += 1) {
+      mkdirSync(join(other, 'Shows', `Show ${i}`), { recursive: true })
+      writeFileSync(join(other, 'Shows', `Show ${i}`, `S01E0${i % 10}.mkv`), 'x')
+    }
+    const walked: string[] = []
+    const proposed = await autoDetectMappings({
+      mountRoots: [dir, other],
+      // Deep jfPaths so several candidate splits are tried per item — each of which used to
+      // re-enumerate the whole mount synchronously, freezing the event loop for seconds. Items
+      // land on both mounts, so both are enumerated, and each must be enumerated only once.
+      sampleItems: async () => [
+        ...Array.from({ length: 12 }, (_, i) => ({
+          id: `m${i}`, jfPath: `/media/library/Movies/Film ${i} (2000)/Film${i}.mkv`,
+        })),
+        ...Array.from({ length: 12 }, (_, i) => ({
+          id: `s${i}`, jfPath: `/media/library/Shows/Show ${i}/S01E0${i % 10}.mkv`,
+        })),
+      ],
+      walk: (root, maxDepth) => { walked.push(root); return walkDirsForTest(root, maxDepth) },
+    })
+    expect([...walked].sort()).toEqual([dir, other].sort())
+    expect(proposed).toEqual([
+      { role: 'library', jellyfin: '/media/library/Movies', container: join(dir, 'Movies'), qbit: null },
+      { role: 'library', jellyfin: '/media/library/Shows', container: join(other, 'Shows'), qbit: null },
     ])
   })
 

@@ -375,7 +375,7 @@ export interface PathMapping {
  */
 export function findingId(ruleId: RuleId, subjectKey: string | string[]): string {
   const key = Array.isArray(subjectKey) ? [...subjectKey].sort().join('\\0') : subjectKey
-  return createHash('sha256').update(`${ruleId} ${key}`).digest('hex').slice(0, 32)
+  return createHash('sha256').update(`${ruleId}\\0${key}`).digest('hex').slice(0, 32)
 }
 ```
 
@@ -526,9 +526,11 @@ import { z } from 'zod'
 
 export const pathMappingSchema = z.object({
   role: z.enum(['library', 'download']),
-  jellyfin: z.string().min(1).nullable(),
-  container: z.string().min(1),
-  qbit: z.string().min(1).nullable(),
+  // Absolute paths only, and never "/": container is the root a later plan's delete sweep
+  // may not climb above, and a relative path would resolve against process.cwd().
+  jellyfin: absolutePath.nullable(),
+  container: absolutePath,
+  qbit: absolutePath.nullable(),
 }).superRefine((m, ctx) => {
   if (m.role === 'library' && m.jellyfin === null) {
     ctx.addIssue({ code: 'custom', message: 'library mappings require a jellyfin path' })
@@ -585,7 +587,9 @@ const arrSchema = z.object({ url: z.string().url(), apiKey: z.string().min(1) })
 export const envConfigSchema = z.object({
   dataDir: z.string().min(1),
   port: z.coerce.number().int().default(8099),
-  trustProxy: z.boolean().default(false),
+  // A proxy HOP COUNT, not a boolean: Fastify trusts N hops from the right, making the
+  // RIGHTMOST X-Forwarded-For token authoritative. `true` takes the caller-supplied leftmost one.
+  trustProxy: z.number().int().min(0).default(0),
   sessionSecret: z.string().min(16),
   jellyfin: z.object({ url: z.string().url(), apiKey: z.string().min(1) }),
   qbittorrent: z.object({ url: z.string().url(), user: z.string().min(1), pass: z.string().min(1) }),
@@ -676,7 +680,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   const parsed = envConfigSchema.safeParse({
     dataDir,
     port: env.PORT ?? 8099,
-    trustProxy: env.TRUST_PROXY === '1' || env.TRUST_PROXY === 'true',
+    trustProxy, // parsed hop count: absent/'0'/'false' -> 0, '1'/'true' -> 1, other integer -> itself
     sessionSecret: env.SESSION_SECRET ?? persistentSecret(dataDir),
     jellyfin: { url: env.JELLYFIN_URL, apiKey: env.JELLYFIN_API_KEY },
     qbittorrent: { url: env.QBIT_URL, user: env.QBIT_USER, pass: env.QBIT_PASS },
@@ -857,9 +861,12 @@ CREATE TABLE fs_entries (
   is_dir         INTEGER NOT NULL,
   size_bytes     INTEGER NOT NULL DEFAULT 0,
   mtime          INTEGER NOT NULL DEFAULT 0,
-  dev            INTEGER NOT NULL DEFAULT 0,
-  inode          INTEGER NOT NULL DEFAULT 0,
-  nlink          INTEGER NOT NULL DEFAULT 1,
+  -- Unknown is NULL, never 0/0/1, and no defaults: (dev, inode) is the correlation key that
+  -- proves two paths are the same bytes, and 0/0 would make every unstattable row match every
+  -- other. nlink DEFAULT 1 would read as "only link, safe to delete" to a later delete guard.
+  dev            INTEGER,
+  inode          INTEGER,
+  nlink          INTEGER,
   is_media       INTEGER NOT NULL DEFAULT 0,
   library_root   TEXT,
   root_role      TEXT,                   -- library | download
@@ -1251,8 +1258,10 @@ export class HttpClient {
     this.fetchImpl = opts.fetchImpl ?? fetch
   }
 
-  async request<T>(path: string, init: RequestInit = {}, parse: 'json' | 'text' | 'none' = 'json'): Promise<T> {
-    const maxRetries = this.opts.maxRetries ?? 3
+  async request<T>(path: string, init: HttpRequestInit = {}, parse: 'json' | 'text' | 'none' = 'json'): Promise<T> {
+    // Idempotent methods only (GET/HEAD/PUT/DELETE, or no method). A POST is retried only when
+    // the caller opts in via `retry: true` — a timeout is not evidence the request did not land.
+    const maxRetries = shouldRetry(init) ? this.opts.maxRetries ?? 3 : 0
     const backoffBase = this.opts.backoffBaseMs ?? 250
     const url = path.startsWith('http') ? path : `${this.opts.baseUrl.replace(/\/$/, '')}${path}`
     let lastError: ConnectorError | null = null
@@ -1992,6 +2001,9 @@ export async function autoDetectMappings(deps: {
   const maxDepth = deps.maxDepth ?? 4
   const items = await deps.sampleItems()
   const proposals = new Map<string, PathMapping>()
+  // Each mount is enumerated ONCE per call and memoized; walking inside the item/split loops
+  // blocked the event loop for seconds on a real library. Two items that agree on a Jellyfin
+  // root but disagree on its container mark that root conflicted and propose nothing for it.
 
   for (const item of items) {
     const parts = item.jfPath.split('/').filter(Boolean)
@@ -2184,9 +2196,11 @@ export function createLockout(opts: {
 
 ```ts
 // src/auth/session.ts
-import { createHmac, timingSafeEqual, randomUUID } from 'node:crypto'
+import { createHmac, timingSafeEqual } from 'node:crypto'
 
-export interface SessionPayload { username: string; userId: string; issuedAt: number }
+// isAdministrator is recorded at login so later routes can re-assert the role from the signed
+// payload; requireSession refuses a session whose flag is not exactly true.
+export interface SessionPayload { username: string; userId: string; issuedAt: number; isAdministrator: boolean }
 
 export const SESSION_COOKIE = 'jellymaid_session'
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
@@ -2198,7 +2212,11 @@ export function signSession(payload: SessionPayload, secret: string): string {
 }
 
 export function verifySession(token: string, secret: string, now = Date.now()): SessionPayload | null {
-  const [body, sig] = token.split('.')
+  // EXACTLY two segments: ignoring trailing segments would let unbounded distinct cookies all
+  // verify to the same session.
+  const parts = token.split('.')
+  if (parts.length !== 2) return null
+  const [body, sig] = parts
   if (!body || !sig) return null
   const expected = createHmac('sha256', secret).update(body).digest('base64url')
   const a = Buffer.from(sig)
@@ -2213,7 +2231,6 @@ export function verifySession(token: string, secret: string, now = Date.now()): 
   }
 }
 
-export const newSessionId = () => randomUUID()
 export const SESSION_MAX_AGE_SECONDS = MAX_AGE_MS / 1000
 ```
 
@@ -2335,9 +2352,12 @@ export interface AuthDeps {
   secureCookie: boolean
 }
 
-function clientKey(req: FastifyRequest, username: string): string {
-  return `${username} ${req.ip}`
-}
+// TWO independent lockout dimensions. A single combined key locks neither half of a real
+// attack: distributed guessing at one account never locks the account, and one IP spraying many
+// usernames never locks the IP. Either being locked refuses; a failure records against both; a
+// success resets both. beginAttempt serialises on the user key.
+const userKey = (username: string) => `user:${username}`
+const ipKey = (req: FastifyRequest) => `ip:${req.ip}`
 
 export function registerAuthRoutes(app: FastifyInstance, deps: AuthDeps): void {
   app.post('/api/auth/login', async (req, reply) => {
@@ -2460,7 +2480,7 @@ function testDeps(pingImpl: () => Promise<void>) {
   return {
     config: {
       env: {
-        dataDir: dir, port: 0, trustProxy: false, sessionSecret: 'x'.repeat(32),
+        dataDir: dir, port: 0, trustProxy: 0, sessionSecret: 'x'.repeat(32),
         jellyfin: { url: 'http://jf', apiKey: 'k' },
         qbittorrent: { url: 'http://qb', user: 'u', pass: 'p' },
         radarr: null, sonarr: null,
@@ -2518,7 +2538,7 @@ function app() {
   return buildServer({
     config: {
       env: {
-        dataDir: dir, port: 0, trustProxy: false, sessionSecret: SECRET,
+        dataDir: dir, port: 0, trustProxy: 0, sessionSecret: SECRET,
         jellyfin: { url: 'http://jf', apiKey: 'k' },
         qbittorrent: { url: 'http://qb', user: 'u', pass: 'p' },
         radarr: null, sonarr: null,
@@ -2598,13 +2618,11 @@ export function registerHealthRoutes(
   app: FastifyInstance,
   deps: { db: Db; jellyfin: Pick<JellyfinClient, 'ping'> },
 ): void {
+  // The ping result is cached for a short TTL. /healthz is unauthenticated and shares ONE
+  // rate-limited Jellyfin client with the scan, so uncached probes let an anonymous caller
+  // occupy every concurrency slot and stall an in-progress scan.
   app.get('/healthz', async (_req, reply) => {
-    let jellyfin = 'ok'
-    try {
-      await deps.jellyfin.ping()
-    } catch (err) {
-      jellyfin = (err as { kind?: string }).kind ?? 'unreachable'
-    }
+    const jellyfin = await cachedJellyfinStatus() // see src/api/health.ts
     return reply.send({
       status: jellyfin === 'ok' ? 'ok' : 'degraded',
       schemaVersion: currentSchemaVersion(deps.db),
@@ -2633,10 +2651,10 @@ export function registerPathMapRoutes(
 ): void {
   const guard = { preHandler: requireSession(deps.sessionSecret) }
 
-  const sampleItems = async () => {
-    const { items } = await deps.jellyfin.items({ startIndex: 0, limit: 20 })
-    return items.filter((i) => i.jfPath).map((i) => ({ id: i.id, jfPath: i.jfPath! }))
-  }
+  // 20 items drawn from RANDOM offsets across the whole library (bounded to 5 requests), not
+  // the first page: Jellyfin's default ordering would sample one library and report the other
+  // library's mapping as passing. Only rows that carry a path count towards the target.
+  const sampleItems = async () => { /* see src/api/pathmap.ts */ }
 
   app.get('/api/pathmap', guard, async (_req, reply) =>
     reply.send({ mappings: readFileConfig(deps.dataDir).pathMappings }))
@@ -2698,7 +2716,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     jellyfin: deps.jellyfin,
     sessionSecret: deps.config.env.sessionSecret,
     lockout: createLockout({ maxFailures: 3, windowMs: 5 * 60_000, lockMs: 60 * 60_000 }),
-    secureCookie: deps.config.env.trustProxy,
+    secureCookie: deps.config.env.trustProxy > 0,
   })
   registerPathMapRoutes(app, {
     dataDir: deps.config.env.dataDir,
@@ -2724,7 +2742,7 @@ import { createJellyfinClient } from './connectors/jellyfin.js'
 import { buildServer } from './server.js'
 import { join } from 'node:path'
 
-const logger = createLogger({ level: (process.env.LOG_LEVEL as 'info') ?? 'info' })
+const logger = createLogger({ level: parseLogLevel(process.env.LOG_LEVEL) }) // unknown -> 'info', never debug
 const config = loadConfig(process.env)
 const db = openDb(join(config.env.dataDir, 'jellymaid.db'))
 const jellyfin = createJellyfinClient({

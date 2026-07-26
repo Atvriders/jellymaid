@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { createJellyfinClient } from '../../src/connectors/jellyfin.js'
+import { ConnectorError } from '../../src/connectors/http.js'
 
 function stub(routes: Record<string, unknown>, spy?: (url: string, init?: RequestInit) => void) {
   return (async (url: string | URL, init?: RequestInit) => {
@@ -44,6 +45,32 @@ describe('authenticateByName', () => {
     }, (u) => urls.push(u))
     await createJellyfinClient(opts(f)).authenticateByName('bob', 'pw')
     expect(urls.some((u) => u.includes('/Sessions/Logout'))).toBe(true)
+  })
+
+  it('fails closed with an auth error when the response carries no AccessToken', async () => {
+    // Never reach /Users/Me on an empty token: if Jellyfin ever treated it as "no token" and
+    // fell back to the service API key, /Users/Me would report the API KEY OWNER's
+    // IsAdministrator and every Jellyfin user would be admitted as an admin.
+    const urls: string[] = []
+    const f = stub({
+      '/Users/AuthenticateByName': { User: { Id: 'u1' } },
+      '/Users/Me': { Id: 'owner', Policy: { IsAdministrator: true } },
+      '/Sessions/Logout': {},
+    }, (u) => urls.push(u))
+    const err = await createJellyfinClient(opts(f)).authenticateByName('eve', 'pw').catch((e) => e)
+    expect(err).toBeInstanceOf(ConnectorError)
+    expect((err as ConnectorError).kind).toBe('auth')
+    expect(urls.some((u) => u.includes('/Users/Me'))).toBe(false)
+  })
+
+  it('fails closed on an empty-string AccessToken too', async () => {
+    const f = stub({
+      '/Users/AuthenticateByName': { User: { Id: 'u1' }, AccessToken: '' },
+      '/Users/Me': { Id: 'owner', Policy: { IsAdministrator: true } },
+      '/Sessions/Logout': {},
+    })
+    const err = await createJellyfinClient(opts(f)).authenticateByName('eve', 'pw').catch((e) => e)
+    expect((err as ConnectorError).kind).toBe('auth')
   })
 
   it('reports non-admins as isAdministrator false rather than throwing', async () => {

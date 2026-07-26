@@ -1,17 +1,30 @@
 // src/config/schema.ts
 import { z } from 'zod'
 
+/**
+ * Every path in a mapping is a filesystem ROOT, not a hint. `container` in particular is the
+ * boundary a later plan's delete sweep is forbidden to climb above, so it must be unambiguous:
+ * a relative path would be resolved against `process.cwd()` (whatever that happens to be), and
+ * "/" would put the entire filesystem inside the sweep's permitted area.
+ */
+const absolutePath = z.string().min(1).refine((p) => p.startsWith('/'), {
+  message: 'must be an absolute path starting with /',
+})
+
 export const pathMappingSchema = z.object({
   role: z.enum(['library', 'download']),
-  jellyfin: z.string().min(1).nullable(),
-  container: z.string().min(1),
-  qbit: z.string().min(1).nullable(),
+  jellyfin: absolutePath.nullable(),
+  container: absolutePath,
+  qbit: absolutePath.nullable(),
 }).superRefine((m, ctx) => {
   if (m.role === 'library' && m.jellyfin === null) {
     ctx.addIssue({ code: 'custom', message: 'library mappings require a jellyfin path' })
   }
   if (m.role === 'download' && m.jellyfin !== null) {
     ctx.addIssue({ code: 'custom', message: 'download mappings must set jellyfin to null' })
+  }
+  if (m.container === '/') {
+    ctx.addIssue({ code: 'custom', path: ['container'], message: 'container must not be the filesystem root "/"' })
   }
 })
 
@@ -62,7 +75,13 @@ const arrSchema = z.object({ url: z.string().url(), apiKey: z.string().min(1) })
 export const envConfigSchema = z.object({
   dataDir: z.string().min(1),
   port: z.coerce.number().int().default(8099),
-  trustProxy: z.boolean().default(false),
+  /**
+   * Number of proxy hops in front of this service, NOT a boolean. Fastify treats a number as
+   * "trust N hops from the right", which makes the RIGHTMOST X-Forwarded-For token authoritative.
+   * `true` would trust every proxy and take the LEFTMOST token — a value the caller writes — and
+   * the login lockout keys on req.ip, so an attacker could mint a fresh lockout bucket per request.
+   */
+  trustProxy: z.number().int().min(0).default(0),
   sessionSecret: z.string().min(16),
   jellyfin: z.object({ url: z.string().url(), apiKey: z.string().min(1) }),
   qbittorrent: z.object({ url: z.string().url(), user: z.string().min(1), pass: z.string().min(1) }),

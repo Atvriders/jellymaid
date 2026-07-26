@@ -18,6 +18,9 @@ export interface ServerDeps {
 
 export function buildServer(deps: ServerDeps): FastifyInstance {
   const app = Fastify({
+    // A NUMBER, not a boolean: Fastify trusts that many hops from the right, so req.ip is the
+    // rightmost-but-N X-Forwarded-For token. `true` would take the leftmost — caller-supplied —
+    // token, which would hand the login lockout's key to the attacker.
     trustProxy: deps.config.env.trustProxy,
     bodyLimit: 2 * 1024 * 1024,
     logger: false,
@@ -29,7 +32,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     jellyfin: deps.jellyfin,
     sessionSecret: deps.config.env.sessionSecret,
     lockout: createLockout({ maxFailures: 3, windowMs: 5 * 60_000, lockMs: 60 * 60_000 }),
-    secureCookie: deps.config.env.trustProxy,
+    // Behind any proxy at all, the public edge is assumed to be TLS-terminating.
+    secureCookie: deps.config.env.trustProxy > 0,
   })
   registerPathMapRoutes(app, {
     dataDir: deps.config.env.dataDir,

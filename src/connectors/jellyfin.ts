@@ -1,4 +1,4 @@
-import { HttpClient } from './http.js'
+import { HttpClient, ConnectorError } from './http.js'
 
 export interface JellyfinLibrary { id: string; name: string; collectionType: string | null; locations: string[] }
 
@@ -118,7 +118,14 @@ export function createJellyfinClient(opts: JellyfinClientOptions): JellyfinClien
           body: JSON.stringify({ Username: username, Pw: password }),
         },
       )
-      const token = auth.AccessToken ?? ''
+      // Fail closed on a missing token instead of relying on Jellyfin treating the empty
+      // X-Emby-Token below as "no token". If it ever fell back to the service API key instead,
+      // /Users/Me would report the API KEY OWNER's IsAdministrator and every Jellyfin user
+      // would be admitted as an admin.
+      if (!auth.AccessToken) {
+        throw new ConnectorError('auth', 'jellyfin', 'authentication returned no access token')
+      }
+      const token = auth.AccessToken
       const userId = auth.User?.Id ?? ''
       try {
         const me = await http.request<{ Policy?: { IsAdministrator?: boolean } }>('/Users/Me', {

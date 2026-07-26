@@ -1,7 +1,7 @@
 // src/config/load.ts
 import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { randomBytes } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { envConfigSchema, fileConfigSchema, type AppConfig, type FileConfig } from './schema.js'
 
 export class ConfigError extends Error {
@@ -22,6 +22,14 @@ function requireArr(env: NodeJS.ProcessEnv, prefix: 'RADARR' | 'SONARR', problem
 
 export function configPath(dataDir: string): string {
   return join(dataDir, 'config.json')
+}
+
+/**
+ * Unique PER CALL, not per process: worker threads share a pid, so a `${target}.${pid}.tmp` name
+ * would have two concurrent savers writing the same temp file and renaming a torn copy into place.
+ */
+export function tempConfigPath(dataDir: string): string {
+  return `${configPath(dataDir)}.${process.pid}.${randomUUID()}.tmp`
 }
 
 export function readFileConfig(dataDir: string): FileConfig {
@@ -49,7 +57,7 @@ export function saveConfig(dataDir: string, patch: Partial<FileConfig>): FileCon
   }
   const merged = parsed.data
   const target = configPath(dataDir)
-  const tmp = `${target}.${process.pid}.tmp`
+  const tmp = tempConfigPath(dataDir)
   writeFileSync(tmp, JSON.stringify(merged, null, 2))
   renameSync(tmp, target)
   return merged
@@ -65,12 +73,14 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   }
   const radarr = requireArr(env, 'RADARR', problems)
   const sonarr = requireArr(env, 'SONARR', problems)
+  const trustProxy = parseHopCount(env.TRUST_PROXY, problems)
+  // Every environment problem is reported together, so one restart surfaces all of them.
   if (problems.length) throw new ConfigError(problems)
 
   const parsed = envConfigSchema.safeParse({
     dataDir,
     port: env.PORT ?? 8099,
-    trustProxy: env.TRUST_PROXY === '1' || env.TRUST_PROXY === 'true',
+    trustProxy,
     sessionSecret: env.SESSION_SECRET ?? persistentSecret(dataDir),
     jellyfin: { url: env.JELLYFIN_URL, apiKey: env.JELLYFIN_API_KEY },
     qbittorrent: { url: env.QBIT_URL, user: env.QBIT_USER, pass: env.QBIT_PASS },
@@ -83,11 +93,35 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   return { env: parsed.data, file: readFileConfig(dataDir) }
 }
 
+/**
+ * TRUST_PROXY is a HOP COUNT, but it was historically a boolean, so `true`/`false` are still
+ * accepted and mean 1/0. Anything else that is not an integer is a configuration error rather
+ * than a silent 0: getting this wrong silently means the login lockout keys on a value the
+ * caller controls.
+ */
+function parseHopCount(raw: string | undefined, problems: string[]): number {
+  if (raw === undefined || raw === '') return 0
+  if (raw === 'false') return 0
+  if (raw === 'true') return 1
+  if (!/^\d+$/.test(raw.trim())) {
+    problems.push(`TRUST_PROXY must be a proxy hop count (a non-negative integer), got ${JSON.stringify(raw)}`)
+    return 0
+  }
+  return Number.parseInt(raw.trim(), 10)
+}
+
 /** Session secret survives restarts so logins are not invalidated on every deploy. */
 function persistentSecret(dataDir: string): string {
   const path = join(dataDir, '.session-secret')
-  if (existsSync(path)) return readFileSync(path, 'utf8').trim()
   const secret = randomBytes(32).toString('hex')
-  writeFileSync(path, secret, { mode: 0o600 })
-  return secret
+  try {
+    // 'wx' fails if the file already exists, so the create is atomic. existsSync-then-write
+    // has a window in which a worker thread calling loadConfig concurrently mints a second
+    // secret and the loser silently invalidates every live session.
+    writeFileSync(path, secret, { mode: 0o600, flag: 'wx' })
+    return secret
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
+    return readFileSync(path, 'utf8').trim()
+  }
 }

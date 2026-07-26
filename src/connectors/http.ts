@@ -24,6 +24,24 @@ export interface HttpClientOptions {
   fetchImpl?: typeof fetch
 }
 
+export interface HttpRequestInit extends RequestInit {
+  /**
+   * Opt a non-idempotent request into retrying. Off by default: replaying a POST can double an
+   * effect the server already applied — a timeout in particular is NOT evidence the request did
+   * not land — and in this codebase the POST path covers login (against Jellyfin's own
+   * brute-force counter) and, later, torrent deletion with its data.
+   */
+  retry?: boolean
+}
+
+/** GET/HEAD/PUT/DELETE are idempotent, so replaying one cannot compound an effect. */
+const IDEMPOTENT = new Set(['GET', 'HEAD', 'PUT', 'DELETE'])
+
+function shouldRetry(init: HttpRequestInit): boolean {
+  if (init.retry !== undefined) return init.retry
+  return IDEMPOTENT.has((init.method ?? 'GET').toUpperCase())
+}
+
 /** Serialises work so no more than `concurrency` requests are in flight, with a floor delay between starts. */
 class Gate {
   private active = 0
@@ -60,10 +78,11 @@ export class HttpClient {
     this.fetchImpl = opts.fetchImpl ?? fetch
   }
 
-  async request<T>(path: string, init: RequestInit = {}, parse: 'json' | 'text' | 'none' = 'json'): Promise<T> {
-    const maxRetries = this.opts.maxRetries ?? 3
+  async request<T>(path: string, init: HttpRequestInit = {}, parse: 'json' | 'text' | 'none' = 'json'): Promise<T> {
+    const maxRetries = shouldRetry(init) ? this.opts.maxRetries ?? 3 : 0
     const backoffBase = this.opts.backoffBaseMs ?? 250
     const url = path.startsWith('http') ? path : `${this.opts.baseUrl.replace(/\/$/, '')}${path}`
+    const { retry: _retry, ...fetchInit } = init // `retry` is ours, not fetch's
     let lastError: ConnectorError | null = null
 
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
@@ -72,7 +91,7 @@ export class HttpClient {
       const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs ?? 30_000)
       try {
         const res = await this.fetchImpl(url, {
-          ...init,
+          ...fetchInit,
           signal: controller.signal,
           headers: { ...this.opts.defaultHeaders, ...(init.headers as Record<string, string> | undefined) },
         })

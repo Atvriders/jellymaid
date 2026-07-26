@@ -1,21 +1,25 @@
 import { describe, it, expect } from 'vitest'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import Fastify from 'fastify'
+import cookie from '@fastify/cookie'
 import { buildServer } from '../../src/server.js'
+import { registerPathMapRoutes } from '../../src/api/pathmap.js'
 import { openDb } from '../../src/index/db.js'
 import { createLogger } from '../../src/core/logger.js'
 import { fileConfigSchema } from '../../src/config/schema.js'
 import { signSession } from '../../src/auth/session.js'
+import type { JellyfinItem } from '../../src/connectors/jellyfin.js'
 
 const SECRET = 'y'.repeat(32)
 
-function app() {
+function app(items?: (opts: { startIndex: number; limit: number }) => Promise<{ items: JellyfinItem[]; totalRecordCount: number }>) {
   const dir = mkdtempSync(join(tmpdir(), 'jm-pmapi-'))
   return buildServer({
     config: {
       env: {
-        dataDir: dir, port: 0, trustProxy: false, sessionSecret: SECRET,
+        dataDir: dir, port: 0, trustProxy: 0, sessionSecret: SECRET,
         jellyfin: { url: 'http://jf', apiKey: 'k' },
         qbittorrent: { url: 'http://qb', user: 'u', pass: 'p' },
         radarr: null, sonarr: null,
@@ -25,13 +29,16 @@ function app() {
     db: openDb(join(dir, 'db.sqlite')),
     jellyfin: {
       ping: async () => {},
-      items: async () => ({ items: [], totalRecordCount: 0 }),
+      items: items ?? (async () => ({ items: [], totalRecordCount: 0 })),
     } as never,
     logger: createLogger({ level: 'error', sink: () => {} }),
   })
 }
 
-const authCookie = () => `jellymaid_session=${signSession({ username: 'bob', userId: 'u', issuedAt: Date.now() }, SECRET)}`
+/** A row as Jellyfin returns it; only the fields the sampler reads matter here. */
+const row = (id: string, jfPath: string | null) => ({ id, jfPath }) as JellyfinItem
+
+const authCookie = () => `jellymaid_session=${signSession({ username: 'bob', userId: 'u', issuedAt: Date.now(), isAdministrator: true }, SECRET)}`
 
 describe('/api/pathmap', () => {
   it('requires a session', async () => {
@@ -63,15 +70,142 @@ describe('/api/pathmap', () => {
     expect(get.json().mappings[0].jellyfin).toBe('/media/Movies')
   })
 
+  it('rejects a relative container — it is the root a later delete sweep may not climb above', async () => {
+    const res = await app().inject({
+      method: 'PUT', url: '/api/pathmap', headers: { cookie: authCookie() },
+      payload: { mappings: [{ role: 'library', jellyfin: '/media/Movies', container: 'media', qbit: null }] },
+    })
+    expect(res.statusCode).toBe(400)
+    expect(String(res.json().issues)).toMatch(/absolute/i)
+  })
+
+  it('rejects "/" as a container outright', async () => {
+    const res = await app().inject({
+      method: 'PUT', url: '/api/pathmap', headers: { cookie: authCookie() },
+      payload: { mappings: [{ role: 'library', jellyfin: '/media/Movies', container: '/', qbit: null }] },
+    })
+    expect(res.statusCode).toBe(400)
+    expect(String(res.json().issues)).toMatch(/filesystem root/i)
+  })
+
+  it('rejects relative jellyfin and qbit paths', async () => {
+    const jf = await app().inject({
+      method: 'PUT', url: '/api/pathmap', headers: { cookie: authCookie() },
+      payload: { mappings: [{ role: 'library', jellyfin: 'media/Movies', container: '/mnt/m', qbit: null }] },
+    })
+    expect(jf.statusCode).toBe(400)
+    const qb = await app().inject({
+      method: 'PUT', url: '/api/pathmap', headers: { cookie: authCookie() },
+      payload: { mappings: [{ role: 'download', jellyfin: null, container: '/mnt/d', qbit: 'downloads' }] },
+    })
+    expect(qb.statusCode).toBe(400)
+  })
+
   it('verifies mappings and reports the failures', async () => {
-    const a = app()
+    const a = app(async () => ({
+      items: [row('i1', '/media/Movies/Heat.mkv'), row('i2', '/other/Alien.mkv')],
+      totalRecordCount: 2,
+    }))
     await a.inject({
       method: 'PUT', url: '/api/pathmap', headers: { cookie: authCookie() },
       payload: { mappings: [{ role: 'library', jellyfin: '/media/Movies', container: '/nope', qbit: null }] },
     })
     const res = await a.inject({ method: 'POST', url: '/api/pathmap/verify', headers: { cookie: authCookie() } })
     expect(res.statusCode).toBe(200)
-    expect(res.json()).toHaveProperty('sampled')
-    expect(res.json()).toHaveProperty('failures')
+    expect(res.json()).toMatchObject({ sampled: 2, resolved: 0 })
+    expect(res.json().failures).toEqual([
+      { jellyfinPath: '/media/Movies/Heat.mkv', reason: 'mapped to /nope/Heat.mkv but not found on disk' },
+      { jellyfinPath: '/other/Alien.mkv', reason: 'no mapping covers this path' },
+    ])
+  })
+
+  it('requires a session to verify', async () => {
+    expect((await app().inject({ method: 'POST', url: '/api/pathmap/verify' })).statusCode).toBe(401)
+  })
+})
+
+describe('/api/pathmap/detect', () => {
+  it('requires a session', async () => {
+    const res = await app().inject({
+      method: 'POST', url: '/api/pathmap/detect', payload: { mountRoots: ['/mnt'] },
+    })
+    expect(res.statusCode).toBe(401)
+  })
+
+  it('rejects a body with no mountRoots', async () => {
+    const res = await app().inject({
+      method: 'POST', url: '/api/pathmap/detect', headers: { cookie: authCookie() }, payload: {},
+    })
+    expect(res.statusCode).toBe(400)
+  })
+
+  it('proposes a mapping for a sampled item found under the mount root', async () => {
+    const media = mkdtempSync(join(tmpdir(), 'jm-detect-'))
+    mkdirSync(join(media, 'Movies', 'Heat (1995)'), { recursive: true })
+    writeFileSync(join(media, 'Movies', 'Heat (1995)', 'Heat.mkv'), 'x')
+    const a = app(async () => ({
+      items: [row('i1', '/media/Movies/Heat (1995)/Heat.mkv')],
+      totalRecordCount: 1,
+    }))
+    const res = await a.inject({
+      method: 'POST', url: '/api/pathmap/detect', headers: { cookie: authCookie() },
+      payload: { mountRoots: [media] },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.json().proposed).toEqual([
+      { role: 'library', jellyfin: '/media/Movies', container: join(media, 'Movies'), qbit: null },
+    ])
+  })
+})
+
+describe('item sampling', () => {
+  function sampler(total: number, pathFor: (i: number) => string | null) {
+    const startIndexes: number[] = []
+    const random = (() => { let n = 0; const seq = [0.9, 0.1, 0.5, 0.7, 0.3]; return () => seq[n++ % seq.length]! })()
+    const dir = mkdtempSync(join(tmpdir(), 'jm-sample-'))
+    const fastify = Fastify()
+    fastify.register(cookie)
+    registerPathMapRoutes(fastify, {
+      dataDir: dir,
+      sessionSecret: SECRET,
+      random,
+      jellyfin: {
+        items: async ({ startIndex, limit }) => {
+          startIndexes.push(startIndex)
+          const items = Array.from({ length: Math.min(limit, Math.max(0, total - startIndex)) },
+            (_, k) => row(`i${startIndex + k}`, pathFor(startIndex + k)))
+          return { items, totalRecordCount: total }
+        },
+      },
+    })
+    return { fastify, startIndexes }
+  }
+
+  it('draws from random offsets across the library, not just the first page', async () => {
+    // Jellyfin's default ordering puts one library first, so a first-page-only sample reports
+    // "verification passing" while a second library's mapping is entirely wrong.
+    const { fastify, startIndexes } = sampler(10_000, (i) => `/media/Movies/Film ${i}/Film.mkv`)
+    const res = await fastify.inject({ method: 'POST', url: '/api/pathmap/verify', headers: { cookie: authCookie() } })
+    expect(res.statusCode).toBe(200)
+    expect(startIndexes.length).toBeGreaterThan(1)
+    expect(startIndexes.every((s) => s === 0)).toBe(false)
+    expect(startIndexes.some((s) => s > 1000)).toBe(true)
+  })
+
+  it('caps the request count so a verify can never become a scan', async () => {
+    // Every row is a pathless Series/Season row, so the sample target is never reached.
+    const { fastify, startIndexes } = sampler(10_000, () => null)
+    await fastify.inject({ method: 'POST', url: '/api/pathmap/verify', headers: { cookie: authCookie() } })
+    expect(startIndexes.length).toBeLessThanOrEqual(6) // 1 count probe + at most 5 windows
+  })
+
+  it('only counts rows that actually carry a path towards the sample', async () => {
+    // Half the rows are pathless; the reported sample must contain no phantom entries.
+    const { fastify } = sampler(10_000, (i) => (i % 2 === 0 ? `/media/Movies/Film ${i}/Film.mkv` : null))
+    const res = await fastify.inject({ method: 'POST', url: '/api/pathmap/verify', headers: { cookie: authCookie() } })
+    const body = res.json()
+    expect(body.sampled).toBeGreaterThan(0)
+    expect(body.sampled).toBeLessThanOrEqual(20)
+    expect(body.failures).toHaveLength(body.sampled)
   })
 })

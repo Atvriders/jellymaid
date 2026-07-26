@@ -22,6 +22,13 @@ describe('findingId', () => {
   it('does not collide when subject elements contain spaces', () => {
     expect(findingId('r', ['x', 'y z'])).not.toBe(findingId('r', ['x y', 'z']))
   })
+
+  it('does not collide when the boundary between ruleId and key contains a space', () => {
+    // Same defect as above, one join further out: with a space separator both of these hash
+    // the string "a b c".
+    expect(findingId('a', 'b c')).not.toBe(findingId('a b', 'c'))
+    expect(findingId('dupe.runtime', 'x y')).not.toBe(findingId('dupe.runtime x', 'y'))
+  })
 })
 
 describe('enumerations', () => {

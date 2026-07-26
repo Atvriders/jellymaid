@@ -180,16 +180,36 @@ const MIN_CORROBORATED_SEGMENTS = 2
  * filename alone) still proposes nothing — not enough evidence to guess a root from.
  *
  * Proposes nothing when no candidate satisfies the floor — a wrong mapping is far more dangerous
- * than an absent one.
+ * than an absent one. For the same reason, two sampled items that agree on a Jellyfin root but
+ * disagree on its container produce NO proposal for that root: silently letting the last item win
+ * would emit a mapping that is wrong for at least one of them.
  */
 export async function autoDetectMappings(deps: {
   mountRoots: string[]
   sampleItems: () => Promise<SampledItem[]>
   maxDepth?: number
+  /** Directory enumeration seam; injected in tests to assert each mount is walked exactly once. */
+  walk?: (root: string, maxDepth: number) => string[]
 }): Promise<PathMapping[]> {
   const maxDepth = deps.maxDepth ?? 4
+  const walk = deps.walk ?? walkDirs
   const items = await deps.sampleItems()
   const proposals = new Map<string, PathMapping>()
+  const conflicted = new Set<string>()
+
+  // Each mount is enumerated ONCE per call, not once per item per candidate split. This is a
+  // synchronous recursive readdir of a whole media mount: re-walking it inside the loops blocked
+  // the event loop for seconds on a real library (~1.4s for 2,500 directories, and the walk ran
+  // once per item per split), freezing every other request including an in-progress scan.
+  const dirCache = new Map<string, string[]>()
+  const dirsUnder = (mount: string): string[] => {
+    let dirs = dirCache.get(mount)
+    if (dirs === undefined) {
+      dirs = walk(mount, maxDepth)
+      dirCache.set(mount, dirs)
+    }
+    return dirs
+  }
 
   for (const item of items) {
     const parts = item.jfPath.split('/').filter(Boolean)
@@ -200,7 +220,7 @@ export async function autoDetectMappings(deps: {
     findDeepestRoot: for (let start = maxStart; start >= 1; start -= 1) {
       const suffix = parts.slice(start)
       for (const mount of deps.mountRoots) {
-        for (const candidateDir of walkDirs(mount, maxDepth)) {
+        for (const candidateDir of dirsUnder(mount)) {
           const probe = join(candidateDir, ...suffix)
           if (!existsSync(probe)) continue
           found = {
@@ -210,7 +230,18 @@ export async function autoDetectMappings(deps: {
         }
       }
     }
-    if (found) proposals.set(found.jellyfin!, found)
+    if (!found) continue
+
+    const root = found.jellyfin!
+    const prior = proposals.get(root)
+    if (prior && prior.container !== found.container) {
+      // Two items place the same Jellyfin root in two different containers. At most one can be
+      // right and we cannot tell which, so propose neither and let the operator decide.
+      conflicted.add(root)
+      proposals.delete(root)
+      continue
+    }
+    if (!conflicted.has(root)) proposals.set(root, found)
   }
   return [...proposals.values()]
 }

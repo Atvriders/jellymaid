@@ -24,6 +24,40 @@ describe('HttpClient', () => {
     expect(n).toBe(3)
   })
 
+  it('does NOT retry a POST — a replayed non-idempotent request is worse than a failed one', async () => {
+    const f = vi.fn(async () => new Response('boom', { status: 503 }))
+    const err = (await client(f as unknown as typeof fetch)
+      .request('/a', { method: 'POST' }).catch((e) => e)) as ConnectorError
+    expect(err).toBeInstanceOf(ConnectorError)
+    expect(err.kind).toBe('unreachable')
+    expect(f).toHaveBeenCalledTimes(1)
+  })
+
+  it('does NOT replay a timed-out POST — a timeout is not evidence the request did not land', async () => {
+    const f = vi.fn((_u: string, init?: RequestInit) => new Promise<Response>((_res, rej) => {
+      init?.signal?.addEventListener('abort', () => rej(new DOMException('aborted', 'AbortError')))
+    }))
+    const err = (await client(f as unknown as typeof fetch)
+      .request('/a', { method: 'POST' }).catch((e) => e)) as ConnectorError
+    expect(err.kind).toBe('timeout')
+    expect(f).toHaveBeenCalledTimes(1)
+  })
+
+  it('retries a POST when the caller explicitly opts in', async () => {
+    let n = 0
+    const f = vi.fn(async () => (++n < 2 ? new Response('boom', { status: 503 }) : new Response('{}', { status: 200 })))
+    await expect(client(f as unknown as typeof fetch).request('/a', { method: 'POST', retry: true })).resolves.toEqual({})
+    expect(n).toBe(2)
+  })
+
+  it('still retries the idempotent methods on a 503', async () => {
+    for (const method of [undefined, 'GET', 'HEAD', 'PUT', 'DELETE']) {
+      const f = vi.fn(async () => new Response('boom', { status: 503 }))
+      await client(f as unknown as typeof fetch).request('/a', method ? { method } : {}).catch(() => undefined)
+      expect(f, `method ${method ?? '(default GET)'} should retry`).toHaveBeenCalledTimes(3)
+    }
+  })
+
   it('does NOT retry a 401 — auth failures are permanent', async () => {
     const f = vi.fn(async () => new Response('nope', { status: 401 }))
     const err = (await client(f as unknown as typeof fetch).request('/a').catch((e) => e)) as ConnectorError

@@ -13,25 +13,32 @@ export interface AuthDeps {
   secureCookie: boolean
 }
 
-function clientKey(req: FastifyRequest, username: string): string {
-  return `${username} ${req.ip}`
-}
+/**
+ * TWO independent lockout dimensions, checked and recorded separately.
+ * A single combined `username+ip` key locks neither half of a real attack: distributed guessing
+ * against one account presents a new IP each time and never locks the account, and one IP
+ * spraying many usernames never locks the IP. Either dimension being locked refuses the request;
+ * a failure counts against both; a success clears both.
+ */
+const userKey = (username: string) => `user:${username}`
+const ipKey = (req: FastifyRequest) => `ip:${req.ip}`
 
 export function registerAuthRoutes(app: FastifyInstance, deps: AuthDeps): void {
   app.post('/api/auth/login', async (req, reply) => {
     const parsed = loginSchema.safeParse(req.body)
     if (!parsed.success) return reply.code(400).send({ error: 'username and password are required' })
     const { username, password } = parsed.data
-    const key = clientKey(req, username)
+    const keys = [userKey(username), ipKey(req)]
 
-    // Serialise attempts for this key. Everything from the check to the record must
-    // happen without another request for the same key interleaving, or a burst of
+    // Serialise attempts for this username. Everything from the check to the record must
+    // happen without another request for the same account interleaving, or a burst of
     // concurrent logins all pass the check before any of them records a failure.
-    const release = await deps.lockout.beginAttempt(key)
+    const release = await deps.lockout.beginAttempt(userKey(username))
     try {
-      const lock = deps.lockout.check(key)
-      if (lock.locked) {
-        return reply.code(429).send({ error: 'too many failed attempts', retryAfterMs: lock.retryAfterMs })
+      const locked = keys.map((k) => deps.lockout.check(k)).filter((l) => l.locked)
+      if (locked.length) {
+        const retryAfterMs = Math.max(...locked.map((l) => l.retryAfterMs))
+        return reply.code(429).send({ error: 'too many failed attempts', retryAfterMs })
       }
 
       let result: { userId: string; token: string; isAdministrator: boolean }
@@ -44,16 +51,16 @@ export function registerAuthRoutes(app: FastifyInstance, deps: AuthDeps): void {
         if ((err as { kind?: string }).kind !== 'auth') {
           return reply.code(503).send({ error: 'Jellyfin is unreachable' })
         }
-        deps.lockout.recordFailure(key)
+        for (const k of keys) deps.lockout.recordFailure(k)
         return reply.code(401).send({ error: 'invalid credentials' })
       }
 
       if (!result.isAdministrator) {
-        deps.lockout.recordFailure(key)
+        for (const k of keys) deps.lockout.recordFailure(k)
         return reply.code(403).send({ error: 'a Jellyfin administrator account is required' })
       }
 
-      deps.lockout.reset(key)
+      for (const k of keys) deps.lockout.reset(k)
       return sendSession(reply, username, result.userId)
     } finally {
       release()
@@ -61,7 +68,9 @@ export function registerAuthRoutes(app: FastifyInstance, deps: AuthDeps): void {
   })
 
   function sendSession(reply: FastifyReply, username: string, userId: string) {
-    const token = signSession({ username, userId, issuedAt: Date.now() }, deps.sessionSecret)
+    // isAdministrator is recorded in the session, not just checked once at login, so every
+    // later route can re-assert it instead of trusting that login must have checked.
+    const token = signSession({ username, userId, issuedAt: Date.now(), isAdministrator: true }, deps.sessionSecret)
     reply.setCookie(SESSION_COOKIE, token, {
       httpOnly: true, sameSite: 'lax', secure: deps.secureCookie, path: '/', maxAge: SESSION_MAX_AGE_SECONDS,
     })
@@ -89,7 +98,11 @@ export function readSession(req: FastifyRequest, secret: string) {
 export function requireSession(secret: string) {
   return async (req: FastifyRequest, reply: FastifyReply) => {
     const session = readSession(req, secret)
-    if (!session) return reply.code(401).send({ error: 'not authenticated' })
+    // Re-assert the role from the signed payload rather than trusting that whoever minted this
+    // cookie checked it. A session without the flag — an older or hand-rolled one — is refused.
+    if (!session || session.isAdministrator !== true) {
+      return reply.code(401).send({ error: 'not authenticated' })
+    }
     ;(req as FastifyRequest & { session?: unknown }).session = session
     return undefined
   }
