@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import { createJellyfinClient } from '../../src/connectors/jellyfin.js'
 
 function stub(routes: Record<string, unknown>, spy?: (url: string, init?: RequestInit) => void) {
@@ -110,6 +110,18 @@ describe('items', () => {
     const { items } = await createJellyfinClient(opts(f)).items({ startIndex: 0, limit: 1 })
     expect(items[0]!.sizeBytes).toBeNull()
     expect(items[0]!.hasPrimaryImage).toBe(false)
+  })
+
+  it('maps a Season row\'s IndexNumber to seasonNo, not episodeNo', async () => {
+    const f = stub({ '/Items': { TotalRecordCount: 1, Items: [{ Id: 'se2', Type: 'Season', Name: 'Season 2', IndexNumber: 2 }] } })
+    const { items } = await createJellyfinClient(opts(f)).items({ startIndex: 0, limit: 1 })
+    expect(items[0]).toMatchObject({ seasonNo: 2, episodeNo: null })
+  })
+
+  it('still maps an Episode row\'s ParentIndexNumber/IndexNumber to seasonNo/episodeNo', async () => {
+    const f = stub({ '/Items': { TotalRecordCount: 1, Items: [{ Id: 'ep5', Type: 'Episode', Name: 'Ep 5', ParentIndexNumber: 1, IndexNumber: 5 }] } })
+    const { items } = await createJellyfinClient(opts(f)).items({ startIndex: 0, limit: 1 })
+    expect(items[0]).toMatchObject({ seasonNo: 1, episodeNo: 5 })
   })
 })
 

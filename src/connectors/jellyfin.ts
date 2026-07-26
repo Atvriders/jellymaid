@@ -65,8 +65,11 @@ function normalize(raw: RawItem): JellyfinItem {
     year: raw.ProductionYear ?? null,
     seriesId: raw.SeriesId ?? null,
     seriesName: raw.SeriesName ?? null,
-    seasonNo: raw.ParentIndexNumber ?? null,
-    episodeNo: raw.IndexNumber ?? null,
+    // Season rows carry their own season number in IndexNumber (ParentIndexNumber is unset),
+    // unlike Episode rows where IndexNumber is the episode number and ParentIndexNumber is the
+    // season. Do not "simplify" this back to a single unconditional mapping.
+    seasonNo: raw.Type === 'Season' ? raw.IndexNumber ?? null : raw.ParentIndexNumber ?? null,
+    episodeNo: raw.Type === 'Season' ? null : raw.IndexNumber ?? null,
     providerIds,
     jfPath: raw.Path ?? null,
     sizeBytes: source?.Size ?? null,
