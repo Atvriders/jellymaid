@@ -1,0 +1,46 @@
+import Fastify, { type FastifyInstance } from 'fastify'
+import cookie from '@fastify/cookie'
+import type { AppConfig } from './config/schema.js'
+import type { Db } from './index/db.js'
+import type { JellyfinClient } from './connectors/jellyfin.js'
+import type { Logger } from './core/logger.js'
+import { createLockout } from './auth/lockout.js'
+import { registerAuthRoutes } from './api/auth.js'
+import { registerHealthRoutes } from './api/health.js'
+import { registerPathMapRoutes } from './api/pathmap.js'
+
+export interface ServerDeps {
+  config: AppConfig
+  db: Db
+  jellyfin: JellyfinClient
+  logger: Logger
+}
+
+export function buildServer(deps: ServerDeps): FastifyInstance {
+  const app = Fastify({
+    trustProxy: deps.config.env.trustProxy,
+    bodyLimit: 2 * 1024 * 1024,
+    logger: false,
+  })
+  app.register(cookie)
+
+  registerHealthRoutes(app, { db: deps.db, jellyfin: deps.jellyfin })
+  registerAuthRoutes(app, {
+    jellyfin: deps.jellyfin,
+    sessionSecret: deps.config.env.sessionSecret,
+    lockout: createLockout({ maxFailures: 3, windowMs: 5 * 60_000, lockMs: 60 * 60_000 }),
+    secureCookie: deps.config.env.trustProxy,
+  })
+  registerPathMapRoutes(app, {
+    dataDir: deps.config.env.dataDir,
+    sessionSecret: deps.config.env.sessionSecret,
+    jellyfin: deps.jellyfin,
+  })
+
+  app.setErrorHandler((err, _req, reply) => {
+    deps.logger.error('unhandled route error', { err: (err as Error).message })
+    return reply.code(500).send({ error: 'internal error' })
+  })
+
+  return app
+}
