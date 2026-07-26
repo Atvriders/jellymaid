@@ -1090,7 +1090,7 @@ git commit -m "feat: sqlite index schema and forward-only migrations"
 - Test: `tests/connectors/http.test.ts`
 
 **Interfaces:**
-- Consumes: `logger` (Task 1).
+- Consumes: nothing. (This module deliberately does not log — it has no way to know which of a caller's retries are expected, and a shared client that narrates would drown the scan log. Callers decide what is worth reporting.)
 - Produces: `class HttpClient { constructor(opts: HttpClientOptions); request<T>(path, init?, parse?): Promise<T> }` and `class ConnectorError extends Error { kind: ConnectorErrorKind; service: string; status?: number }` with `ConnectorErrorKind = 'unreachable' | 'auth' | 'rate-limited' | 'bad-response' | 'timeout'`. Every connector in Plans 1–2 is built on this and throws only `ConnectorError`.
 
 - [ ] **Step 1: Write the failing test**
@@ -1223,9 +1223,15 @@ class Gate {
       await new Promise<void>((resolve) => this.queue.push(resolve))
     }
     this.active += 1
-    const wait = this.lastStart + this.minDelayMs - Date.now()
+    // Reserve the start slot SYNCHRONOUSLY, before any await. Computing the wait from
+    // lastStart and only writing it back after sleeping lets every concurrent waiter
+    // read the same stale value, sleep in parallel, and start in the same tick —
+    // silently defeating the rate limit at exactly the concurrency it exists for.
+    const now = Date.now()
+    const startAt = Math.max(now, this.lastStart + this.minDelayMs)
+    this.lastStart = startAt
+    const wait = startAt - now
     if (wait > 0) await sleep(wait)
-    this.lastStart = Date.now()
   }
 
   release(): void {
@@ -1261,14 +1267,23 @@ export class HttpClient {
           signal: controller.signal,
           headers: { ...this.opts.defaultHeaders, ...(init.headers as Record<string, string> | undefined) },
         })
+        // Undici keeps a connection out of the keep-alive pool until its body is
+        // consumed. This client polls qBittorrent and *arr forever and meets 429/5xx
+        // routinely, so every non-success branch discards the body before leaving.
+        const discardBody = () => res.body?.cancel().catch(() => undefined)
+
         if (res.status === 401 || res.status === 403) {
+          await discardBody()
           throw new ConnectorError('auth', this.opts.service, `HTTP ${res.status}`, res.status)
         }
         if (res.status === 429) {
+          await discardBody()
           lastError = new ConnectorError('rate-limited', this.opts.service, 'HTTP 429', 429)
         } else if (res.status >= 500) {
+          await discardBody()
           lastError = new ConnectorError('unreachable', this.opts.service, `HTTP ${res.status}`, res.status)
         } else if (!res.ok) {
+          await discardBody()
           throw new ConnectorError('bad-response', this.opts.service, `HTTP ${res.status}`, res.status)
         } else {
           if (parse === 'none') return undefined as T
