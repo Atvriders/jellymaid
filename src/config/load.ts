@@ -26,7 +26,14 @@ export function configPath(dataDir: string): string {
 
 export function readFileConfig(dataDir: string): FileConfig {
   const path = configPath(dataDir)
-  const raw = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : {}
+  let raw: unknown = {}
+  if (existsSync(path)) {
+    try {
+      raw = JSON.parse(readFileSync(path, 'utf8')) as unknown
+    } catch (err) {
+      throw new ConfigError([`config.json is not valid JSON: ${(err as Error).message}`])
+    }
+  }
   const parsed = fileConfigSchema.safeParse(raw)
   if (!parsed.success) {
     throw new ConfigError(parsed.error.issues.map((i) => `config.json ${i.path.join('.') || '(root)'}: ${i.message}`))
@@ -36,7 +43,11 @@ export function readFileConfig(dataDir: string): FileConfig {
 
 export function saveConfig(dataDir: string, patch: Partial<FileConfig>): FileConfig {
   mkdirSync(dataDir, { recursive: true })
-  const merged = fileConfigSchema.parse({ ...readFileConfig(dataDir), ...patch })
+  const parsed = fileConfigSchema.safeParse({ ...readFileConfig(dataDir), ...patch })
+  if (!parsed.success) {
+    throw new ConfigError(parsed.error.issues.map((i) => `config patch ${i.path.join('.') || '(root)'}: ${i.message}`))
+  }
+  const merged = parsed.data
   const target = configPath(dataDir)
   const tmp = `${target}.${process.pid}.tmp`
   writeFileSync(tmp, JSON.stringify(merged, null, 2))

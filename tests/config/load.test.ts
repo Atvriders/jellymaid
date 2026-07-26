@@ -71,6 +71,14 @@ describe('loadConfig', () => {
     }))
     expect(() => loadConfig(baseEnv())).toThrow(/library/i)
   })
+
+  it('reports malformed config.json as a ConfigError, not a raw SyntaxError', () => {
+    writeFileSync(join(dir, 'config.json'), '{ not valid json')
+    let caught: unknown
+    try { loadConfig(baseEnv()) } catch (e) { caught = e }
+    expect(caught).toBeInstanceOf(ConfigError)
+    expect((caught as ConfigError).message).toMatch(/not valid JSON/)
+  })
 })
 
 describe('saveConfig', () => {
@@ -86,5 +94,11 @@ describe('saveConfig', () => {
     saveConfig(dir, { scanCron: '0 6 * * *' })
     const cfg = loadConfig(baseEnv())
     expect(cfg.file.scanCron).toBe('0 6 * * *')
+  })
+
+  it('rejects an invalid patch as a ConfigError, not a raw ZodError', () => {
+    expect(() => saveConfig(dir, {
+      pathMappings: [{ role: 'library', jellyfin: null, container: '/mnt/m', qbit: null }],
+    } as never)).toThrow(ConfigError)
   })
 })
