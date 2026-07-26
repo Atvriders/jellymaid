@@ -261,6 +261,11 @@ describe('findingId', () => {
     expect(findingId('dupe.provider-id', ['b', 'a'])).toBe(findingId('dupe.provider-id', ['a', 'b']))
   })
 
+  it('does not collide when subject keys contain spaces', () => {
+    // Paths and titles contain spaces; a space-joined key would make these identical.
+    expect(findingId('r', ['x', 'y z'])).not.toBe(findingId('r', ['x y', 'z']))
+  })
+
   it('is a 32-char hex string', () => {
     expect(findingId('fs.empty-folder', '/mnt/media/Movies/Old')).toMatch(/^[0-9a-f]{32}$/)
   })
@@ -363,10 +368,14 @@ export interface PathMapping {
 /**
  * Stable identity for a finding. Must not change across rescans, or dismissals
  * would resurrect. Arrays are sorted so subject ordering cannot perturb the id.
+ *
+ * The array separator is NUL, not a space: subject keys are file paths and titles,
+ * which contain spaces freely. Joining on a space would make ['x', 'y z'] and
+ * ['x y', 'z'] hash identically, silently fusing two unrelated findings.
  */
 export function findingId(ruleId: RuleId, subjectKey: string | string[]): string {
-  const key = Array.isArray(subjectKey) ? [...subjectKey].sort().join(' ') : subjectKey
-  return createHash('sha256').update(`${ruleId} ${key}`).digest('hex').slice(0, 32)
+  const key = Array.isArray(subjectKey) ? [...subjectKey].sort().join('\\0') : subjectKey
+  return createHash('sha256').update(`${ruleId} ${key}`).digest('hex').slice(0, 32)
 }
 ```
 
@@ -2213,7 +2222,7 @@ export interface AuthDeps {
 }
 
 function clientKey(req: FastifyRequest, username: string): string {
-  return `${username} ${req.ip}`
+  return `${username} ${req.ip}`
 }
 
 export function registerAuthRoutes(app: FastifyInstance, deps: AuthDeps): void {
