@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import { z } from 'zod'
 import type { JellyfinClient } from '../connectors/jellyfin.js'
 import type { Lockout } from '../auth/lockout.js'
+import { isPrivateAddress } from '../auth/address.js'
 import { SESSION_COOKIE, SESSION_MAX_AGE_SECONDS, signSession, verifySession } from '../auth/session.js'
 
 const loginSchema = z.object({ username: z.string().min(1), password: z.string() })
@@ -9,7 +10,16 @@ const loginSchema = z.object({ username: z.string().min(1), password: z.string()
 export interface AuthDeps {
   jellyfin: Pick<JellyfinClient, 'authenticateByName'>
   sessionSecret: string
-  lockout: Lockout
+  /** Locks a USERNAME after repeated failures: 3 in 5 minutes → 60 minutes. */
+  userLockout: Lockout
+  /**
+   * Locks a PUBLIC IP address after repeated failures — shorter than the username lock (3 in 5
+   * minutes → 15 minutes), because unlike a username, an address can be shared innocent
+   * infrastructure (NAT, a LAN, a proxy) rather than a single attacker, so a false-positive lock
+   * should clear faster. Never checked or recorded for a private/loopback address — see
+   * isPrivateAddress and its use below.
+   */
+  ipLockout: Lockout
   secureCookie: boolean
 }
 
@@ -28,14 +38,21 @@ export function registerAuthRoutes(app: FastifyInstance, deps: AuthDeps): void {
     const parsed = loginSchema.safeParse(req.body)
     if (!parsed.success) return reply.code(400).send({ error: 'username and password are required' })
     const { username, password } = parsed.data
-    const keys = [userKey(username), ipKey(req)]
+
+    // Skip the IP dimension entirely for a private/loopback address. It is either a LAN client
+    // (low threat — the username dimension still covers it) or a reverse proxy whose real
+    // clients have all collapsed onto one address (TRUST_PROXY unset or too low; see
+    // src/config/load.ts). Locking THAT address is a self-inflicted denial of service against
+    // every caller behind it, not a defence against any of them.
+    const dims: Array<{ lockout: Lockout; key: string }> = [{ lockout: deps.userLockout, key: userKey(username) }]
+    if (!isPrivateAddress(req.ip)) dims.push({ lockout: deps.ipLockout, key: ipKey(req) })
 
     // Serialise attempts for this username. Everything from the check to the record must
     // happen without another request for the same account interleaving, or a burst of
     // concurrent logins all pass the check before any of them records a failure.
-    const release = await deps.lockout.beginAttempt(userKey(username))
+    const release = await deps.userLockout.beginAttempt(userKey(username))
     try {
-      const locked = keys.map((k) => deps.lockout.check(k)).filter((l) => l.locked)
+      const locked = dims.map((d) => d.lockout.check(d.key)).filter((l) => l.locked)
       if (locked.length) {
         const retryAfterMs = Math.max(...locked.map((l) => l.retryAfterMs))
         return reply.code(429).send({ error: 'too many failed attempts', retryAfterMs })
@@ -45,22 +62,23 @@ export function registerAuthRoutes(app: FastifyInstance, deps: AuthDeps): void {
       try {
         result = await deps.jellyfin.authenticateByName(username, password)
       } catch (err) {
-        // ONLY a genuine credential rejection counts against the operator. An
-        // unreachable Jellyfin — or any error we cannot classify — must not consume
-        // an attempt, or an outage locks the operator out of their own cleanup tool.
+        // ONLY a genuine credential rejection counts against the operator. An unreachable
+        // Jellyfin, a malformed response ('bad-response') — or any error we cannot classify —
+        // must not consume an attempt, or an outage (or a Jellyfin-side bug) locks the operator
+        // out of their own cleanup tool.
         if ((err as { kind?: string }).kind !== 'auth') {
           return reply.code(503).send({ error: 'Jellyfin is unreachable' })
         }
-        for (const k of keys) deps.lockout.recordFailure(k)
+        for (const d of dims) d.lockout.recordFailure(d.key)
         return reply.code(401).send({ error: 'invalid credentials' })
       }
 
       if (!result.isAdministrator) {
-        for (const k of keys) deps.lockout.recordFailure(k)
+        for (const d of dims) d.lockout.recordFailure(d.key)
         return reply.code(403).send({ error: 'a Jellyfin administrator account is required' })
       }
 
-      for (const k of keys) deps.lockout.reset(k)
+      for (const d of dims) d.lockout.reset(d.key)
       return sendSession(reply, username, result.userId)
     } finally {
       release()
@@ -84,7 +102,10 @@ export function registerAuthRoutes(app: FastifyInstance, deps: AuthDeps): void {
 
   app.get('/api/auth/me', async (req, reply) => {
     const session = readSession(req, deps.sessionSecret)
-    if (!session) return reply.code(401).send({ error: 'not authenticated' })
+    // Same admin re-assertion as requireSession below: a correctly signed session that does not
+    // carry the flag must not be treated as authenticated here either, or this route becomes the
+    // one place a stale/hand-rolled session cookie is accepted when every mutating route refuses it.
+    if (!session || session.isAdministrator !== true) return reply.code(401).send({ error: 'not authenticated' })
     return reply.send({ username: session.username, userId: session.userId })
   })
 }

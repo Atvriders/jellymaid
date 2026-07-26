@@ -1,4 +1,5 @@
 // src/config/schema.ts
+import { resolve } from 'node:path'
 import { z } from 'zod'
 
 /**
@@ -23,8 +24,17 @@ export const pathMappingSchema = z.object({
   if (m.role === 'download' && m.jellyfin !== null) {
     ctx.addIssue({ code: 'custom', message: 'download mappings must set jellyfin to null' })
   }
-  if (m.container === '/') {
-    ctx.addIssue({ code: 'custom', path: ['container'], message: 'container must not be the filesystem root "/"' })
+  // A merely-textual check against the literal string "/" is not enough: "/..", "//", and
+  // "/mnt/../.." all pass `startsWith('/')` and all NORMALIZE to "/" once resolved, so any of
+  // them would put the entire filesystem inside the sweep's permitted area. Require the path to
+  // already be in normalized form and reject the root either way.
+  const resolvedContainer = resolve(m.container)
+  if (resolvedContainer !== m.container || resolvedContainer === '/') {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['container'],
+      message: 'container must be a normalized absolute path (no ".", "..", or repeated "/") and must not be the filesystem root "/"',
+    })
   }
 })
 

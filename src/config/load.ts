@@ -98,6 +98,14 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
  * accepted and mean 1/0. Anything else that is not an integer is a configuration error rather
  * than a silent 0: getting this wrong silently means the login lockout keys on a value the
  * caller controls.
+ *
+ * Both directions are dangerous, not just under-specifying it. Set it LOWER than the real proxy
+ * count (0, behind a proxy) and every client collapses onto the proxy's own address, so the IP
+ * lockout dimension locks EVERYONE at once after a few failed logins from any stranger. Set it
+ * HIGHER than the real count and Fastify trusts an X-Forwarded-For token the CALLER wrote,
+ * letting an attacker forge whatever "client IP" they like — picking a fresh lockout bucket
+ * per request, or framing another address for one. It must equal the actual number of proxies
+ * in front of this service, exactly — not a safety margin in either direction.
  */
 function parseHopCount(raw: string | undefined, problems: string[]): number {
   if (raw === undefined || raw === '') return 0
@@ -113,15 +121,24 @@ function parseHopCount(raw: string | undefined, problems: string[]): number {
 /** Session secret survives restarts so logins are not invalidated on every deploy. */
 function persistentSecret(dataDir: string): string {
   const path = join(dataDir, '.session-secret')
+  // A pre-existing file wins outright — nothing to mint or write.
+  if (existsSync(path)) return readFileSync(path, 'utf8').trim()
   const secret = randomBytes(32).toString('hex')
+  // Unique per call, the same way tempConfigPath is: a pid-only name would have two concurrent
+  // loaders (which share a pid across worker threads) write the same temp file.
+  const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`
   try {
-    // 'wx' fails if the file already exists, so the create is atomic. existsSync-then-write
-    // has a window in which a worker thread calling loadConfig concurrently mints a second
-    // secret and the loser silently invalidates every live session.
-    writeFileSync(path, secret, { mode: 0o600, flag: 'wx' })
+    // Write the FULL secret to a private temp file, then rename it into place. A concurrent
+    // reader of `path` can now only ever observe "absent" or "fully written" — never the
+    // empty/partial content that create-then-write ('wx') could expose in the window between
+    // the create and the write completing.
+    writeFileSync(tmp, secret, { mode: 0o600 })
+    renameSync(tmp, path)
     return secret
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
+    // Another loader's write-then-rename won the race between our existsSync check and ours;
+    // theirs is now the file on disk, and it is authoritative.
     return readFileSync(path, 'utf8').trim()
   }
 }

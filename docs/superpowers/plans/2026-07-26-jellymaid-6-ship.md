@@ -305,7 +305,10 @@ services:
       SONARR_URL: "http://192.168.1.100:8989"
       SONARR_API_KEY: "${SONARR_API_KEY}"
       TZ: "America/Winnipeg"
-      TRUST_PROXY: "0"
+      # Must equal the number of proxies actually in front of this service — behind a single
+      # Cloudflare tunnel that is 1. Setting it HIGHER than the real count lets a caller forge
+      # X-Forwarded-For and reinstate the login-lockout bypass this setting exists to close.
+      TRUST_PROXY: "1"
     volumes:
       # REQUIRED: index, config, audit log and trash manifest live here.
       - ./data:/data
@@ -514,7 +517,7 @@ It must cover, in this order:
 6. **The four guards** — table with defaults (`minRatio 1.0`, `minSeedTimeDays 14`, protect lists empty), which are overridable and which are not.
 7. **Trash** — small non-torrent files only, `trash.maxBytes` 1 GB, `trash.retentionDays` 30.
 8. **Scanning** — `SCAN_CRON` default `0 3 * * *`, opt-in hashing per root, what "not evaluated" means.
-9. **Troubleshooting** — path map verification failures, qBittorrent unreachable blocking deletes by design, resuming an interrupted scan.
+9. **Troubleshooting** — path map verification failures, qBittorrent unreachable blocking deletes by design, resuming an interrupted scan, and `TRUST_PROXY`: it must equal the number of proxies actually in front of Jellymaid (1 behind a single Cloudflare tunnel) — set it too low and the per-IP login lockout locks every caller at once behind the collapsed proxy address; set it too high and a caller can forge `X-Forwarded-For` to defeat that same lockout.
 
 - [ ] **Step 4: First-run verification against the real stack**
 

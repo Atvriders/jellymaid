@@ -17,10 +17,13 @@ export interface Lockout {
 }
 
 /**
- * Full sweeps run at most once every this many check/recordFailure calls. Keys are derived from
- * unauthenticated input (one dimension is the client IP), so entries must not accumulate for the
- * life of the process — but sweeping the whole map on every call would make each unauthenticated
- * request cost O(all keys). Sweeping every N calls bounds it to amortised O(1) per call.
+ * Full sweeps run at most once every this many check/recordFailure calls. sweep() itself costs
+ * O(|locks| + |failures|), so the real amortised cost per call is O(size / 64), not O(1) — but
+ * it stays bounded in practice: once a key locks, check() reports it locked and the caller
+ * returns before ever calling recordFailure() again for that key (see registerAuthRoutes), so a
+ * locked source stops creating new entries. The map's size is therefore bounded by how many
+ * distinct keys arrive within one 64-call sweep interval, not by the process's entire
+ * unauthenticated request history.
  */
 const SWEEP_EVERY = 64
 

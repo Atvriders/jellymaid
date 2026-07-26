@@ -6,13 +6,17 @@ import { registerAuthRoutes, requireSession } from '../../src/api/auth.js'
 import { createLockout } from '../../src/auth/lockout.js'
 import { SESSION_COOKIE, signSession } from '../../src/auth/session.js'
 
-function build(authenticate: (u: string, p: string) => Promise<{ userId: string; token: string; isAdministrator: boolean }>) {
+function build(
+  authenticate: (u: string, p: string) => Promise<{ userId: string; token: string; isAdministrator: boolean }>,
+  opts?: { userLockout?: import('../../src/auth/lockout.js').Lockout; ipLockout?: import('../../src/auth/lockout.js').Lockout },
+) {
   const app = Fastify()
   app.register(cookie)
   registerAuthRoutes(app, {
     jellyfin: { authenticateByName: authenticate } as never,
     sessionSecret: 'a-very-long-test-secret',
-    lockout: createLockout({ maxFailures: 3, windowMs: 300_000, lockMs: 3_600_000 }),
+    userLockout: opts?.userLockout ?? createLockout({ maxFailures: 3, windowMs: 300_000, lockMs: 3_600_000 }),
+    ipLockout: opts?.ipLockout ?? createLockout({ maxFailures: 3, windowMs: 300_000, lockMs: 900_000 }),
     secureCookie: false,
   })
   return app
@@ -65,6 +69,18 @@ describe('POST /api/auth/login', () => {
     }
   })
 
+  it('does NOT consume an attempt when Jellyfin returns a malformed authentication response', async () => {
+    // A missing/empty AccessToken is classified 'bad-response' by the connector (see
+    // src/connectors/jellyfin.ts), not 'auth': it is not evidence the credentials were wrong,
+    // so — like 'unreachable' above — it must not count against the lockout either.
+    const err = Object.assign(new Error('no token'), { kind: 'bad-response', name: 'ConnectorError' })
+    const app = build(async () => { throw err })
+    for (let i = 0; i < 5; i += 1) {
+      const r = await app.inject({ method: 'POST', url: '/api/auth/login', payload: { username: 'bob', password: 'x' } })
+      expect(r.statusCode).toBe(503)
+    }
+  })
+
   it('serializes concurrent attempts for the same key so a burst cannot bypass the lockout', async () => {
     let calls = 0
     const app = build(async () => {
@@ -97,7 +113,30 @@ describe('POST /api/auth/login', () => {
     expect(res.statusCode).toBe(429)
   })
 
-  it('locks the IP after three failures spread across three different usernames', async () => {
+  it('locks the IP after three failures spread across three different usernames, for a PUBLIC address', async () => {
+    // 203.0.113.0/24 (TEST-NET-3) is not in any of the private/loopback ranges isPrivateAddress
+    // checks, so it is "public" for the purposes of the IP lockout dimension — same convention
+    // tests/auth/lockout.test.ts already uses for its documentation-range addresses.
+    const app = build(async () => { throw Object.assign(new Error('bad'), { kind: 'auth', name: 'ConnectorError' }) })
+    for (const username of ['alice', 'bob', 'carol'] as const) {
+      const r = await app.inject({
+        method: 'POST', url: '/api/auth/login', remoteAddress: '203.0.113.9',
+        payload: { username, password: 'x' },
+      })
+      expect(r.statusCode).toBe(401)
+    }
+    // A username the lockout has never seen still must not get a free guess from this IP.
+    const res = await app.inject({
+      method: 'POST', url: '/api/auth/login', remoteAddress: '203.0.113.9',
+      payload: { username: 'dave', password: 'x' },
+    })
+    expect(res.statusCode).toBe(429)
+  })
+
+  it('does NOT lock a different username from a PRIVATE address after three failures there', async () => {
+    // 10.0.0.0/8 is private: it is either a LAN client (the username dimension still applies)
+    // or a reverse proxy whose real clients have all collapsed onto this address — either way,
+    // locking the address itself must not become a remote unauthenticated shutdown of login.
     const app = build(async () => { throw Object.assign(new Error('bad'), { kind: 'auth', name: 'ConnectorError' }) })
     for (const username of ['alice', 'bob', 'carol'] as const) {
       const r = await app.inject({
@@ -106,31 +145,71 @@ describe('POST /api/auth/login', () => {
       })
       expect(r.statusCode).toBe(401)
     }
-    // A username the lockout has never seen still must not get a free guess from this IP.
     const res = await app.inject({
       method: 'POST', url: '/api/auth/login', remoteAddress: '10.9.9.9',
       payload: { username: 'dave', password: 'x' },
     })
-    expect(res.statusCode).toBe(429)
+    expect(res.statusCode).toBe(401)
+  })
+
+  it('the IP dimension unlocks after 15 minutes while the 60-minute username dimension is still held', async () => {
+    let t = 0
+    const now = () => t
+    const app = Fastify()
+    app.register(cookie)
+    registerAuthRoutes(app, {
+      jellyfin: { authenticateByName: async () => { throw Object.assign(new Error('bad'), { kind: 'auth', name: 'ConnectorError' }) } } as never,
+      sessionSecret: 'a-very-long-test-secret',
+      userLockout: createLockout({ maxFailures: 3, windowMs: 5 * 60_000, lockMs: 60 * 60_000, now }),
+      ipLockout: createLockout({ maxFailures: 3, windowMs: 5 * 60_000, lockMs: 15 * 60_000, now }),
+      secureCookie: false,
+    })
+    const PUBLIC_IP = '203.0.113.44'
+
+    // Three failures for 'tick' from PUBLIC_IP lock both dimensions.
+    for (let i = 0; i < 3; i += 1) {
+      await app.inject({ method: 'POST', url: '/api/auth/login', remoteAddress: PUBLIC_IP, payload: { username: 'tick', password: 'x' } })
+    }
+    // IP dimension: a fresh username from the same address is refused.
+    expect((await app.inject({
+      method: 'POST', url: '/api/auth/login', remoteAddress: PUBLIC_IP, payload: { username: 'fresh1', password: 'x' },
+    })).statusCode).toBe(429)
+    // Username dimension: the same username from a fresh address is refused too.
+    expect((await app.inject({
+      method: 'POST', url: '/api/auth/login', remoteAddress: '198.51.100.9', payload: { username: 'tick', password: 'x' },
+    })).statusCode).toBe(429)
+
+    t = 15 * 60_000 + 1
+    // The IP lock has expired: a fresh username from PUBLIC_IP is now admitted past the IP
+    // check — it still fails on invalid credentials (401), but is no longer refused pre-emptively (429).
+    expect((await app.inject({
+      method: 'POST', url: '/api/auth/login', remoteAddress: PUBLIC_IP, payload: { username: 'fresh2', password: 'x' },
+    })).statusCode).toBe(401)
+    // The username lock has NOT expired: 'tick' is still refused from any address.
+    expect((await app.inject({
+      method: 'POST', url: '/api/auth/login', remoteAddress: '198.51.100.10', payload: { username: 'tick', password: 'x' },
+    })).statusCode).toBe(429)
   })
 
   it('a successful login clears both the username and the IP counters', async () => {
+    // A PUBLIC address, so the IP dimension is actually in play and this test exercises both
+    // counters rather than only the username one.
     let admitted = false
     const app = build(async () => {
       if (admitted) return { userId: 'u1', token: 'T', isAdministrator: true }
       throw Object.assign(new Error('bad'), { kind: 'auth', name: 'ConnectorError' })
     })
     for (let i = 0; i < 2; i += 1) {
-      await app.inject({ method: 'POST', url: '/api/auth/login', remoteAddress: '10.5.5.5', payload: { username: 'bob', password: 'x' } })
+      await app.inject({ method: 'POST', url: '/api/auth/login', remoteAddress: '203.0.113.5', payload: { username: 'bob', password: 'x' } })
     }
     admitted = true
-    const ok = await app.inject({ method: 'POST', url: '/api/auth/login', remoteAddress: '10.5.5.5', payload: { username: 'bob', password: 'pw' } })
+    const ok = await app.inject({ method: 'POST', url: '/api/auth/login', remoteAddress: '203.0.113.5', payload: { username: 'bob', password: 'pw' } })
     expect(ok.statusCode).toBe(200)
 
     admitted = false
     // Both counters were reset, so three more failures are needed before the lock returns.
     for (let i = 0; i < 2; i += 1) {
-      const r = await app.inject({ method: 'POST', url: '/api/auth/login', remoteAddress: '10.5.5.5', payload: { username: 'bob', password: 'x' } })
+      const r = await app.inject({ method: 'POST', url: '/api/auth/login', remoteAddress: '203.0.113.5', payload: { username: 'bob', password: 'x' } })
       expect(r.statusCode).toBe(401)
     }
   })
@@ -162,6 +241,15 @@ describe('GET /api/auth/me', () => {
       method: 'GET', url: '/api/auth/me',
       headers: { cookie: `${SESSION_COOKIE}=eyJhIjoxfQ.forged` },
     })
+    expect(res.statusCode).toBe(401)
+  })
+
+  it('rejects a correctly signed session that does NOT carry the admin flag', async () => {
+    // Every requireSession route returns 401 for this; /api/auth/me must not be a hole that
+    // admits a non-admin (or hand-rolled) session with a 200.
+    const app = build(admin)
+    const token = signSession({ username: 'bob', userId: 'u1', issuedAt: Date.now() } as never, 'a-very-long-test-secret')
+    const res = await app.inject({ method: 'GET', url: '/api/auth/me', headers: { cookie: `${SESSION_COOKIE}=${token}` } })
     expect(res.statusCode).toBe(401)
   })
 })

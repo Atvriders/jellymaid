@@ -121,9 +121,13 @@ export function createJellyfinClient(opts: JellyfinClientOptions): JellyfinClien
       // Fail closed on a missing token instead of relying on Jellyfin treating the empty
       // X-Emby-Token below as "no token". If it ever fell back to the service API key instead,
       // /Users/Me would report the API KEY OWNER's IsAdministrator and every Jellyfin user
-      // would be admitted as an admin.
+      // would be admitted as an admin. Classified 'bad-response', NOT 'auth': this is a
+      // malformed reply, not evidence the credentials were wrong, so src/api/auth.ts's login
+      // route must fail closed (never proceed to /Users/Me) WITHOUT counting it against the
+      // caller's lockout — a malfunctioning Jellyfin must not lock operators out of their own
+      // cleanup tool.
       if (!auth.AccessToken) {
-        throw new ConnectorError('auth', 'jellyfin', 'authentication returned no access token')
+        throw new ConnectorError('bad-response', 'jellyfin', 'authentication returned no access token')
       }
       const token = auth.AccessToken
       const userId = auth.User?.Id ?? ''

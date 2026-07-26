@@ -31,7 +31,14 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   registerAuthRoutes(app, {
     jellyfin: deps.jellyfin,
     sessionSecret: deps.config.env.sessionSecret,
-    lockout: createLockout({ maxFailures: 3, windowMs: 5 * 60_000, lockMs: 60 * 60_000 }),
+    // Two independent lockout instances with different durations, not one shared duration
+    // parameterised per key: the username dimension protects a single credential and can afford
+    // a long lock (60 minutes); the IP dimension can catch shared infrastructure rather than
+    // only the culprit, so a false-positive lock recovers faster (15 minutes). See
+    // isPrivateAddress in src/api/auth.ts for why the IP dimension is skipped altogether behind
+    // a misconfigured or absent reverse proxy.
+    userLockout: createLockout({ maxFailures: 3, windowMs: 5 * 60_000, lockMs: 60 * 60_000 }),
+    ipLockout: createLockout({ maxFailures: 3, windowMs: 5 * 60_000, lockMs: 15 * 60_000 }),
     // Behind any proxy at all, the public edge is assumed to be TLS-terminating.
     secureCookie: deps.config.env.trustProxy > 0,
   })

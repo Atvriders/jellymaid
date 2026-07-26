@@ -104,6 +104,21 @@ describe('loadConfig', () => {
     expect(withMappings({ role: 'download', jellyfin: null, container: '/mnt/d', qbit: 'downloads' })).toThrow(/absolute/i)
   })
 
+  it('rejects a container that is textually absolute but NORMALIZES to the filesystem root', () => {
+    // The root guard used to be a plain `container === '/'` string comparison, while `absolutePath`
+    // only checks `startsWith('/')`. "/..", "//", and "/mnt/../.." all pass that check and then
+    // resolve to "/" — putting the entire filesystem inside a later plan's delete-sweep boundary.
+    const withMappings = (container: string) => {
+      writeFileSync(join(dir, 'config.json'), JSON.stringify({
+        pathMappings: [{ role: 'library', jellyfin: '/media/M', container, qbit: null }],
+      }))
+      return () => loadConfig(baseEnv())
+    }
+    expect(withMappings('/..')).toThrow(/filesystem root/i)
+    expect(withMappings('//')).toThrow(/filesystem root/i)
+    expect(withMappings('/mnt/../..')).toThrow(/filesystem root/i)
+  })
+
   it('reuses an existing .session-secret rather than minting a second one', () => {
     const first = loadConfig(baseEnv()).env.sessionSecret
     const second = loadConfig(baseEnv()).env.sessionSecret
@@ -117,6 +132,18 @@ describe('loadConfig', () => {
     writeFileSync(join(dir, '.session-secret'), preexisting)
     expect(loadConfig(baseEnv()).env.sessionSecret).toBe(preexisting)
     expect(readFileSync(join(dir, '.session-secret'), 'utf8')).toBe(preexisting)
+  })
+
+  it('writes .session-secret via a temp file plus rename, leaving nothing behind', () => {
+    // A plain create-then-write ('wx') is not atomic to a concurrent reader: the loser of the
+    // race could read an empty or torn file mid-write. Writing the full secret to a temp file
+    // and renaming it into place closes that window entirely — a reader only ever sees "absent"
+    // or "fully written".
+    loadConfig(baseEnv())
+    const entries = readdirSync(dir)
+    expect(entries).toContain('.session-secret')
+    expect(entries.filter((f) => f.includes('.session-secret.') && f.endsWith('.tmp'))).toEqual([])
+    expect(readFileSync(join(dir, '.session-secret'), 'utf8').trim().length).toBeGreaterThanOrEqual(16)
   })
 
   it('reports malformed config.json as a ConfigError, not a raw SyntaxError', () => {

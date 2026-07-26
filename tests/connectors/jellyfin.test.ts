@@ -47,10 +47,12 @@ describe('authenticateByName', () => {
     expect(urls.some((u) => u.includes('/Sessions/Logout'))).toBe(true)
   })
 
-  it('fails closed with an auth error when the response carries no AccessToken', async () => {
+  it('fails closed with a bad-response error (NOT auth) when the response carries no AccessToken', async () => {
     // Never reach /Users/Me on an empty token: if Jellyfin ever treated it as "no token" and
     // fell back to the service API key, /Users/Me would report the API KEY OWNER's
     // IsAdministrator and every Jellyfin user would be admitted as an admin.
+    // Classified 'bad-response', not 'auth': this is a malformed reply, not a credential
+    // rejection, so src/api/auth.ts's login route must not consume a lockout attempt for it.
     const urls: string[] = []
     const f = stub({
       '/Users/AuthenticateByName': { User: { Id: 'u1' } },
@@ -59,7 +61,7 @@ describe('authenticateByName', () => {
     }, (u) => urls.push(u))
     const err = await createJellyfinClient(opts(f)).authenticateByName('eve', 'pw').catch((e) => e)
     expect(err).toBeInstanceOf(ConnectorError)
-    expect((err as ConnectorError).kind).toBe('auth')
+    expect((err as ConnectorError).kind).toBe('bad-response')
     expect(urls.some((u) => u.includes('/Users/Me'))).toBe(false)
   })
 
@@ -70,7 +72,7 @@ describe('authenticateByName', () => {
       '/Sessions/Logout': {},
     })
     const err = await createJellyfinClient(opts(f)).authenticateByName('eve', 'pw').catch((e) => e)
-    expect((err as ConnectorError).kind).toBe('auth')
+    expect((err as ConnectorError).kind).toBe('bad-response')
   })
 
   it('reports non-admins as isAdministrator false rather than throwing', async () => {
