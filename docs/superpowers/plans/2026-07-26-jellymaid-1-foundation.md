@@ -1844,11 +1844,36 @@ Expected: FAIL — module not found.
 
 ```ts
 // src/fs/pathmap.ts
-import { existsSync, readdirSync, statSync } from 'node:fs'
-import { join, posix, resolve, sep } from 'node:path'
+import { existsSync, lstatSync, readdirSync, realpathSync, statSync } from 'node:fs'
+import { basename, dirname, join, resolve, sep } from 'node:path'
 import type { PathMapping } from '../core/types.js'
 
 const strip = (p: string) => (p.length > 1 && p.endsWith('/') ? p.slice(0, -1) : p)
+
+/**
+ * Resolves symlinks as far as the filesystem allows, then appends whatever tail does
+ * not exist yet. Returns null when the truth cannot be established — a dangling
+ * symlink, EACCES, ELOOP — so callers can fail closed rather than trust a lexical guess.
+ */
+function resolveReal(p: string): string | null {
+  let current = resolve(p)
+  const remainder: string[] = []
+  for (;;) {
+    try {
+      const real = realpathSync(current)
+      return remainder.length ? join(real, ...[...remainder].reverse()) : real
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return null
+      try {
+        if (lstatSync(current).isSymbolicLink()) return null   // dangling symlink
+      } catch { /* genuinely absent — keep walking up */ }
+      const parent = dirname(current)
+      if (parent === current) return null
+      remainder.push(basename(current))
+      current = parent
+    }
+  }
+}
 
 function underPrefix(path: string, prefix: string): boolean {
   const p = strip(path)
@@ -1896,9 +1921,16 @@ export function createPathMap(mappings: PathMapping[]): PathMap {
     libraryRoots: () => mappings.filter((m) => m.role === 'library'),
     downloadRoots: () => mappings.filter((m) => m.role === 'download'),
     isWithinRoot(containerPath, root) {
-      // resolve() collapses ".." so a traversal cannot escape the root.
-      const target = resolve(containerPath)
-      const base = resolve(root.container)
+      // resolve() alone is purely lexical, so a symlink planted inside the root escapes it.
+      // resolveReal() walks down to the deepest EXISTING ancestor, realpaths that, and
+      // re-appends the not-yet-existing remainder. It returns null — and this returns
+      // false — for a dangling symlink, EACCES, or ELOOP. Fail closed: refusing a
+      // legitimate delete is recoverable, deleting outside the library is not.
+      //
+      // Inherently time-of-check-to-time-of-use: a true result is not a lasting guarantee.
+      const target = resolveReal(containerPath)
+      const base = resolveReal(root.container)
+      if (target === null || base === null) return false
       return target === base || target.startsWith(base.endsWith(sep) ? base : `${base}${sep}`)
     },
     all: () => mappings,
@@ -1937,10 +1969,21 @@ export async function verifyMappings(deps: {
 }
 
 /**
- * Proposes mappings by taking sampled Jellyfin paths and searching the mounts for the
- * deepest suffix that exists. Proposes nothing when nothing matches — a wrong mapping
- * is far more dangerous than an absent one.
+ * Proposes mappings by taking sampled Jellyfin paths and searching the mounts for a
+ * matching suffix. Proposes nothing when nothing matches — a wrong mapping is far more
+ * dangerous than an absent one.
+ *
+ * Two rules keep it honest without crippling it:
+ *   - a match must corroborate at least MIN_CORROBORATED_SEGMENTS trailing path
+ *     segments, so a bare filename collision cannot mint a mapping;
+ *   - per sampled item only the DEEPEST matching Jellyfin root is kept, since several
+ *     nested roots can all match the same file and the most specific one over-claims least.
+ * There is deliberately NO floor on root depth: a single-bind-mount layout like
+ * `/movies/Heat (1995)/Heat.mkv` is the common Docker/Unraid shape and must resolve.
+ * A truly flat library (`/movies/Heat.mkv`) proposes nothing — one filename is not
+ * enough corroboration to bet a delete on.
  */
+const MIN_CORROBORATED_SEGMENTS = 2
 export async function autoDetectMappings(deps: {
   mountRoots: string[]
   sampleItems: () => Promise<SampledItem[]>
@@ -1952,22 +1995,22 @@ export async function autoDetectMappings(deps: {
 
   for (const item of items) {
     const parts = item.jfPath.split('/').filter(Boolean)
+    let best: PathMapping | null = null
+    let bestDepth = -1
     for (const mount of deps.mountRoots) {
       for (const candidateDir of walkDirs(mount, maxDepth)) {
-        // Try progressively shorter suffixes of the Jellyfin path under this candidate.
-        for (let start = 0; start < parts.length; start += 1) {
+        for (let start = 1; start <= parts.length - MIN_CORROBORATED_SEGMENTS; start += 1) {
           const suffix = parts.slice(start)
-          const probe = join(candidateDir, ...suffix)
-          if (!existsSync(probe)) continue
+          if (!existsSync(join(candidateDir, ...suffix))) continue
           const jellyfinRoot = `/${parts.slice(0, start).join('/')}`
-          if (jellyfinRoot === '/') continue
-          proposals.set(jellyfinRoot, {
-            role: 'library', jellyfin: jellyfinRoot, container: candidateDir, qbit: null,
-          })
-          break
+          if (start > bestDepth) {
+            bestDepth = start
+            best = { role: 'library', jellyfin: jellyfinRoot, container: candidateDir, qbit: null }
+          }
         }
       }
     }
+    if (best?.jellyfin) proposals.set(best.jellyfin, best)
   }
   return [...proposals.values()]
 }
