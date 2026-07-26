@@ -1,20 +1,52 @@
-import { existsSync, readdirSync, realpathSync, statSync } from 'node:fs'
-import { join, resolve, sep } from 'node:path'
+import { existsSync, lstatSync, readdirSync, realpathSync, statSync } from 'node:fs'
+import { basename, dirname, join, resolve, sep } from 'node:path'
 import type { PathMapping } from '../core/types.js'
 
 const strip = (p: string) => (p.length > 1 && p.endsWith('/') ? p.slice(0, -1) : p)
 
 /**
- * Resolves symlinks when the path exists, so a symlink planted inside a root cannot be used
- * to point back out of it. `resolve()` alone is purely lexical and cannot see symlinks — it
- * would treat `<root>/link -> /etc` as staying under `<root>`. Falls back to lexical `resolve`
- * (still ".."-safe) for paths that do not exist yet.
+ * Resolves symlinks in every existing ancestor of `p`, then re-appends whatever trailing
+ * segments do not exist yet, lexically. `resolve()` alone is purely lexical and cannot see
+ * symlinks — it would treat `<root>/link -> /etc` (or `<root>/link -> /nonexistent`) as staying
+ * under `<root>`. Walks upward from `p` looking for the deepest ancestor `realpathSync` can
+ * resolve; everything below that ancestor is collected and reappended in its original order.
+ *
+ * Fails CLOSED (returns `null`) rather than guessing, on:
+ *  - any `realpathSync` failure that is not "this exact path doesn't exist yet" (EACCES, ELOOP, …);
+ *  - a dangling symlink (the entry itself exists per `lstatSync`, but `realpathSync` still could
+ *    not resolve it — most commonly because its target does not exist). This is the same
+ *    attacker-planted-symlink escape as a symlink to a real outside path, just pointed at a
+ *    missing target instead, so it gets the same answer;
+ *  - reaching the filesystem root without ever finding an existing ancestor.
+ * Only genuinely nonexistent-so-far path components (no entry at all, `lstatSync` itself throws
+ * ENOENT) are treated as "not created yet" and walked past.
  */
-function resolveReal(p: string): string {
-  try {
-    return realpathSync(p)
-  } catch {
-    return resolve(p)
+function resolveReal(p: string): string | null {
+  let current = resolve(p)
+  const remainder: string[] = []
+  for (;;) {
+    try {
+      const real = realpathSync(current)
+      return remainder.length === 0 ? real : join(real, ...[...remainder].reverse())
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return null // EACCES, ELOOP, … — fail closed
+
+      try {
+        lstatSync(current)
+        // The entry exists (as a symlink or otherwise) yet realpath could not resolve it — most
+        // commonly a dangling symlink. Fail closed rather than guess at what it would point to.
+        return null
+      } catch (lstatErr) {
+        if ((lstatErr as NodeJS.ErrnoException).code !== 'ENOENT') return null
+        // current genuinely does not exist yet — the normal case while probing a path that has
+        // not been created. Record it and keep resolving one level up.
+      }
+
+      const parent = dirname(current)
+      if (parent === current) return null // hit the filesystem root without an existing ancestor
+      remainder.push(basename(current))
+      current = parent
+    }
   }
 }
 
@@ -45,6 +77,19 @@ export function createPathMap(mappings: PathMapping[]): PathMap {
   const byContainer = [...mappings].sort((a, b) => b.container.length - a.container.length)
   const byQbit = [...mappings].filter((m) => m.qbit).sort((a, b) => b.qbit!.length - a.qbit!.length)
 
+  // A root's own resolution is repeated across many isWithinRoot calls (e.g. Plan 4's sweep
+  // checks the same root against every ancestor directory it walks upward through), so it is
+  // cached here rather than re-resolved via realpathSync on every call.
+  const rootRealCache = new Map<string, string | null>()
+  function resolveRootReal(container: string): string | null {
+    let cached = rootRealCache.get(container)
+    if (cached === undefined) {
+      cached = resolveReal(container)
+      rootRealCache.set(container, cached)
+    }
+    return cached
+  }
+
   return {
     toContainer(jellyfinPath) {
       const m = byJf.find((x) => underPrefix(jellyfinPath, x.jellyfin!))
@@ -63,9 +108,15 @@ export function createPathMap(mappings: PathMapping[]): PathMap {
     },
     libraryRoots: () => mappings.filter((m) => m.role === 'library'),
     downloadRoots: () => mappings.filter((m) => m.role === 'download'),
+    // Note: like any filesystem check, this is inherently time-of-check-to-time-of-use — a
+    // symlink (or the target directory itself) can change immediately after this returns.
+    // A caller must not treat a `true` result as a lasting guarantee; it only reflects a single
+    // point in time, so re-check immediately before acting on it if the action is destructive.
     isWithinRoot(containerPath, root) {
       const target = resolveReal(containerPath)
-      const base = resolveReal(root.container)
+      if (target === null) return false // unresolvable / dangling symlink — fail closed
+      const base = resolveRootReal(root.container)
+      if (base === null) return false
       return target === base || target.startsWith(base.endsWith(sep) ? base : `${base}${sep}`)
     },
     all: () => mappings,
@@ -103,18 +154,33 @@ export async function verifyMappings(deps: {
   return { sampled: items.length, resolved, failures }
 }
 
+/** At least this many trailing path segments must be corroborated on disk before a candidate
+ * directory counts as evidence — a single matching filename is not enough (it could be any file
+ * with that name), but a matching directory-plus-filename pair is. */
+const MIN_CORROBORATED_SEGMENTS = 2
+
 /**
- * Proposes mappings by taking sampled Jellyfin paths and searching the mounts for a
- * directory whose contents corroborate a suffix of the path. Two floors keep a lone
- * coincidence from becoming a proposal:
- *  - the Jellyfin root must keep at least two path segments (e.g. `/media/Movies`), so
- *    we never propose a bare mount point like `/media`, which could span several
- *    unrelated libraries with different real mappings;
- *  - at least two trailing segments must be corroborated on disk, so a lone matching
- *    filename (or a movie's own item folder) is never mistaken for a library root.
- * The first candidate directory that satisfies both floors wins; nothing else is tried
- * for that item. Proposes nothing when no candidate satisfies both — a wrong mapping is
- * far more dangerous than an absent one.
+ * Proposes mappings by taking sampled Jellyfin paths and searching the mounts for a directory
+ * whose contents corroborate a suffix of the path. The only floor is
+ * `MIN_CORROBORATED_SEGMENTS`: there is deliberately no floor on how many segments remain in the
+ * Jellyfin root. A single bind-mounted library — Jellyfin sees `/movies/Heat (1995)/Heat.mkv`
+ * with `/movies` itself as the mount, a 1-segment root — is this project's most common real
+ * deployment shape (single-bind-mount Docker/Unraid setups); requiring a 2+-segment root would
+ * silently propose nothing for it.
+ *
+ * Because every real ancestor directory of a sampled file trivially corroborates *some* suffix
+ * (the whole point of it being a real ancestor), multiple candidate splits are always "valid" in
+ * isolation. This resolves the ambiguity by always preferring the DEEPEST (longest) possible
+ * Jellyfin root: splits are tried longest-root-first (across every mount and candidate
+ * directory) and the first one satisfied wins, so shallower/coarser roots for the same item are
+ * never even considered once a deeper one matches.
+ *
+ * Known limit, by design: a truly flat layout with fewer than `MIN_CORROBORATED_SEGMENTS`
+ * segments below the root (e.g. `/movies/Heat.mkv`, where corroboration would rest on the bare
+ * filename alone) still proposes nothing — not enough evidence to guess a root from.
+ *
+ * Proposes nothing when no candidate satisfies the floor — a wrong mapping is far more dangerous
+ * than an absent one.
  */
 export async function autoDetectMappings(deps: {
   mountRoots: string[]
@@ -127,26 +193,22 @@ export async function autoDetectMappings(deps: {
 
   for (const item of items) {
     const parts = item.jfPath.split('/').filter(Boolean)
-    const minStart = 2
-    const maxStart = parts.length - 2
-    if (minStart > maxStart) continue
+    const maxStart = parts.length - MIN_CORROBORATED_SEGMENTS
+    if (maxStart < 1) continue // not enough segments to keep both a root and the corroboration floor
 
     let found: PathMapping | undefined
-    for (const mount of deps.mountRoots) {
-      for (const candidateDir of walkDirs(mount, maxDepth)) {
-        // Prefer the longest corroborated suffix (smallest start) within the allowed range.
-        for (let start = minStart; start <= maxStart; start += 1) {
-          const suffix = parts.slice(start)
+    findDeepestRoot: for (let start = maxStart; start >= 1; start -= 1) {
+      const suffix = parts.slice(start)
+      for (const mount of deps.mountRoots) {
+        for (const candidateDir of walkDirs(mount, maxDepth)) {
           const probe = join(candidateDir, ...suffix)
           if (!existsSync(probe)) continue
           found = {
             role: 'library', jellyfin: `/${parts.slice(0, start).join('/')}`, container: candidateDir, qbit: null,
           }
-          break
+          break findDeepestRoot
         }
-        if (found) break
       }
-      if (found) break
     }
     if (found) proposals.set(found.jellyfin!, found)
   }

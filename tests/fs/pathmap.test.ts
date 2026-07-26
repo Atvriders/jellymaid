@@ -68,6 +68,34 @@ describe('createPathMap', () => {
   })
 })
 
+describe('isWithinRoot — resolution edge cases', () => {
+  it('fails closed on a dangling symlink inside the root (target does not exist at all)', () => {
+    const base = mkdtempSync(join(tmpdir(), 'jm-pm-dangling-'))
+    const libRoot: PathMapping = { role: 'library', jellyfin: '/media/Movies', container: join(base, 'Movies'), qbit: null }
+    mkdirSync(libRoot.container, { recursive: true })
+    symlinkSync(join(base, 'does-not-exist-anywhere'), join(libRoot.container, 'dangling-escape'))
+    const m = createPathMap([libRoot])
+    expect(m.isWithinRoot(join(libRoot.container, 'dangling-escape'), libRoot)).toBe(false)
+  })
+
+  it('treats a plain not-yet-existing path under a real root as within it', () => {
+    const base = mkdtempSync(join(tmpdir(), 'jm-pm-future-'))
+    const libRoot: PathMapping = { role: 'library', jellyfin: '/media/TV', container: join(base, 'TV'), qbit: null }
+    mkdirSync(libRoot.container, { recursive: true })
+    const m = createPathMap([libRoot])
+    expect(m.isWithinRoot(join(libRoot.container, 'Show', 'Season 01', 'new.mkv'), libRoot)).toBe(true)
+  })
+
+  it('confirms an ordinary existing file under the root is within it', () => {
+    const base = mkdtempSync(join(tmpdir(), 'jm-pm-real-'))
+    const libRoot: PathMapping = { role: 'library', jellyfin: '/media/Movies', container: join(base, 'Movies'), qbit: null }
+    mkdirSync(libRoot.container, { recursive: true })
+    writeFileSync(join(libRoot.container, 'Heat.mkv'), 'x')
+    const m = createPathMap([libRoot])
+    expect(m.isWithinRoot(join(libRoot.container, 'Heat.mkv'), libRoot)).toBe(true)
+  })
+})
+
 describe('verifyMappings', () => {
   let dir: string
   beforeEach(() => {
@@ -125,5 +153,18 @@ describe('autoDetectMappings', () => {
       sampleItems: async () => [{ id: 'i1', jfPath: '/media/Movies/Nope.mkv' }],
     })
     expect(proposed).toEqual([])
+  })
+
+  it('proposes a 1-segment root for a single-bind-mount layout, the most common real deployment shape', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jm-ad3-'))
+    mkdirSync(join(dir, 'Heat (1995)'), { recursive: true })
+    writeFileSync(join(dir, 'Heat (1995)', 'Heat.mkv'), 'x')
+    const proposed = await autoDetectMappings({
+      mountRoots: [dir],
+      sampleItems: async () => [{ id: 'i1', jfPath: '/movies/Heat (1995)/Heat.mkv' }],
+    })
+    expect(proposed).toEqual([
+      { role: 'library', jellyfin: '/movies', container: dir, qbit: null },
+    ])
   })
 })
