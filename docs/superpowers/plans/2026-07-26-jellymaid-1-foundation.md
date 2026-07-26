@@ -482,6 +482,12 @@ describe('loadConfig', () => {
     }))
     expect(() => loadConfig(baseEnv())).toThrow(/library/i)
   })
+
+  it('reports malformed JSON as a ConfigError, not a raw SyntaxError', () => {
+    writeFileSync(join(dir, 'config.json'), '{ not valid json')
+    expect(() => loadConfig(baseEnv())).toThrow(ConfigError)
+    expect(() => loadConfig(baseEnv())).toThrow(/not valid JSON/)
+  })
 })
 
 describe('saveConfig', () => {
@@ -497,6 +503,12 @@ describe('saveConfig', () => {
     saveConfig(dir, { scanCron: '0 6 * * *' })
     const cfg = loadConfig(baseEnv())
     expect(cfg.file.scanCron).toBe('0 6 * * *')
+  })
+
+  it('throws ConfigError, not a raw ZodError, on an invalid patch', () => {
+    expect(() => saveConfig(dir, {
+      pathMappings: [{ role: 'library', jellyfin: null, container: '/mnt/m', qbit: null }],
+    } as never)).toThrow(ConfigError)
   })
 })
 ```
@@ -616,7 +628,16 @@ export function configPath(dataDir: string): string {
 
 export function readFileConfig(dataDir: string): FileConfig {
   const path = configPath(dataDir)
-  const raw = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : {}
+  let raw: unknown = {}
+  if (existsSync(path)) {
+    // A hand-edited or truncated config.json must surface as ConfigError like every
+    // other config problem — never as a raw SyntaxError from the JSON parser.
+    try {
+      raw = JSON.parse(readFileSync(path, 'utf8')) as unknown
+    } catch (err) {
+      throw new ConfigError([`config.json is not valid JSON: ${(err as Error).message}`])
+    }
+  }
   const parsed = fileConfigSchema.safeParse(raw)
   if (!parsed.success) {
     throw new ConfigError(parsed.error.issues.map((i) => `config.json ${i.path.join('.') || '(root)'}: ${i.message}`))
@@ -626,7 +647,13 @@ export function readFileConfig(dataDir: string): FileConfig {
 
 export function saveConfig(dataDir: string, patch: Partial<FileConfig>): FileConfig {
   mkdirSync(dataDir, { recursive: true })
-  const merged = fileConfigSchema.parse({ ...readFileConfig(dataDir), ...patch })
+  // safeParse, not parse: an invalid patch must throw the same ConfigError shape a
+  // caller already handles, or a settings route renders a 500 where it means 400.
+  const candidate = fileConfigSchema.safeParse({ ...readFileConfig(dataDir), ...patch })
+  if (!candidate.success) {
+    throw new ConfigError(candidate.error.issues.map((i) => `config patch ${i.path.join('.') || '(root)'}: ${i.message}`))
+  }
+  const merged = candidate.data
   const target = configPath(dataDir)
   const tmp = `${target}.${process.pid}.tmp`
   writeFileSync(tmp, JSON.stringify(merged, null, 2))
