@@ -18,6 +18,10 @@ describe('findingId', () => {
   it('is a 32-char hex string', () => {
     expect(findingId('fs.empty-folder', '/mnt/media/Movies/Old')).toMatch(/^[0-9a-f]{32}$/)
   })
+
+  it('does not collide when subject elements contain spaces', () => {
+    expect(findingId('r', ['x', 'y z'])).not.toBe(findingId('r', ['x y', 'z']))
+  })
 })
 
 describe('enumerations', () => {
