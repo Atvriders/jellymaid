@@ -1562,8 +1562,10 @@ function normalize(raw: RawItem): JellyfinItem {
     year: raw.ProductionYear ?? null,
     seriesId: raw.SeriesId ?? null,
     seriesName: raw.SeriesName ?? null,
-    seasonNo: raw.ParentIndexNumber ?? null,
-    episodeNo: raw.IndexNumber ?? null,
+    // Jellyfin puts a Season's own number in IndexNumber and leaves ParentIndexNumber
+    // unset, so the Episode mapping would record "Season 1" as episode 1 of no season.
+    seasonNo: raw.Type === 'Season' ? raw.IndexNumber ?? null : raw.ParentIndexNumber ?? null,
+    episodeNo: raw.Type === 'Season' ? null : raw.IndexNumber ?? null,
     providerIds,
     jfPath: raw.Path ?? null,
     sizeBytes: source?.Size ?? null,
