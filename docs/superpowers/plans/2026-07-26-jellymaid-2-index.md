@@ -18,7 +18,8 @@ Copied verbatim from `docs/superpowers/specs/2026-07-26-jellymaid-design.md`. Ev
 - Rate-limit defaults: Jellyfin 4 concurrent / 50 ms · qBittorrent 2 / 100 ms · \*arr 2 / 100 ms.
 - Quick-hash is **opt-in per library root**, never global; cache key `(dev, inode, mtime, size)`.
 - `role: "download"` roots are walked for inodes but never scanned for orphan media.
-- Scan retention: the current and previous scan only; older scan rows pruned on completion.
+- The index holds ONE live snapshot. Snapshot rows are upserted by natural key, and **each phase must delete rows still carrying a prior `scan_id` when it completes** — otherwise a file that vanished lingers forever and `fs.orphan-media` / `fs.missing-file` report on ghosts. `scans` rows themselves are metadata; the last two are retained.
+- `fs_entries.dev`, `.inode` and `.nlink` are **nullable with no default**. Unknown is NULL, never 0 or 1: `(0,0)` would collide with every other unstattable row on the correlation index, and `nlink = 1` is indistinguishable from "only link, deleting reclaims the full size" — the exact input Plan 4's hardlink guard trusts. The walker must write NULL when it cannot stat.
 - TypeScript strict, no `any`. Commit after every task.
 
 ## Prerequisites

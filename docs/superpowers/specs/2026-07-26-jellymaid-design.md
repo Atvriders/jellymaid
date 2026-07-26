@@ -199,8 +199,16 @@ Indexes: `fs_entries(dev, inode)`, `fs_entries(parent_path)`, `fs_entries(librar
 `jellyfin_items(container_path)`, `jellyfin_items(series_id, season_no, episode_no)`,
 `torrent_files(dev, inode)`, `findings(class, status)`, `plan_actions(plan_id, seq)`.
 
-**Snapshot retention:** the current scan and the previous scan are kept (enables "new since last
-scan" and diffing); older scan rows are pruned on completion.
+**Snapshot retention:** the index holds exactly one live snapshot — the current one. Snapshot rows
+are keyed by their natural key (item id, container path) and upserted in place, so a scan replaces
+the previous picture rather than accumulating beside it. Each phase deletes rows left carrying a
+prior `scan_id` when it finishes, so a file that disappeared does not linger.
+
+"New since last scan" comes from `findings.firstSeen`/`lastSeen`, which already track exactly that
+across rescans and survive reconciliation. Keeping two full snapshots was considered and dropped:
+it would force every rule query in every later slice to filter by `scan_id` to avoid seeing both
+scans at once, in exchange for a capability the findings table already provides. `scans` rows
+themselves are cheap metadata and the last two are retained for history.
 
 ---
 
