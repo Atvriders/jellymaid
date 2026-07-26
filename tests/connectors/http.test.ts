@@ -74,4 +74,28 @@ describe('HttpClient', () => {
     const err = (await client(f as unknown as typeof fetch, { maxRetries: 0 }).request('/a').catch((e) => e)) as ConnectorError
     expect(err.kind).toBe('timeout')
   })
+
+  it("parse: 'none' returns undefined and does not throw on an empty 200 body", async () => {
+    const f = vi.fn(async () => new Response('', { status: 200 }))
+    await expect(client(f as unknown as typeof fetch).request('/a', {}, 'none')).resolves.toBeUndefined()
+  })
+
+  it("parse: 'text' returns the raw body string", async () => {
+    const f = vi.fn(async () => new Response('hello world', { status: 200 }))
+    await expect(client(f as unknown as typeof fetch).request('/a', {}, 'text')).resolves.toBe('hello world')
+  })
+
+  it('honours minDelayMs between every request start, even under concurrency > 1', async () => {
+    const starts: number[] = []
+    const f = vi.fn(async () => {
+      starts.push(Date.now())
+      return new Response('{}', { status: 200 })
+    })
+    const c = client(f as unknown as typeof fetch, { concurrency: 2, minDelayMs: 20 })
+    await Promise.all(Array.from({ length: 4 }, () => c.request('/a')))
+    const sorted = [...starts].sort((a, b) => a - b)
+    for (let i = 1; i < sorted.length; i += 1) {
+      expect(sorted[i]! - sorted[i - 1]!).toBeGreaterThanOrEqual(15)
+    }
+  })
 })

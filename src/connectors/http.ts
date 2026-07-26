@@ -36,9 +36,11 @@ class Gate {
       await new Promise<void>((resolve) => this.queue.push(resolve))
     }
     this.active += 1
-    const wait = this.lastStart + this.minDelayMs - Date.now()
+    const now = Date.now()
+    const startAt = Math.max(now, this.lastStart + this.minDelayMs)
+    this.lastStart = startAt // reserved synchronously, before any await, so concurrent acquires don't race on a stale value
+    const wait = startAt - now
     if (wait > 0) await sleep(wait)
-    this.lastStart = Date.now()
   }
 
   release(): void {
@@ -75,13 +77,17 @@ export class HttpClient {
           headers: { ...this.opts.defaultHeaders, ...(init.headers as Record<string, string> | undefined) },
         })
         if (res.status === 401 || res.status === 403) {
+          await res.body?.cancel().catch(() => undefined)
           throw new ConnectorError('auth', this.opts.service, `HTTP ${res.status}`, res.status)
         }
         if (res.status === 429) {
+          await res.body?.cancel().catch(() => undefined)
           lastError = new ConnectorError('rate-limited', this.opts.service, 'HTTP 429', 429)
         } else if (res.status >= 500) {
+          await res.body?.cancel().catch(() => undefined)
           lastError = new ConnectorError('unreachable', this.opts.service, `HTTP ${res.status}`, res.status)
         } else if (!res.ok) {
+          await res.body?.cancel().catch(() => undefined)
           throw new ConnectorError('bad-response', this.opts.service, `HTTP ${res.status}`, res.status)
         } else {
           if (parse === 'none') return undefined as T
