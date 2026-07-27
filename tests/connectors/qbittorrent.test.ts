@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { createQbitClient } from '../../src/connectors/qbittorrent.js'
+import { ConnectorError } from '../../src/connectors/http.js'
 
 function stub(routes: Record<string, unknown>, spy?: (url: string, init?: RequestInit) => void) {
   return (async (url: string | URL, init?: RequestInit) => {
@@ -58,6 +59,42 @@ describe('torrents', () => {
     expect(t.isPrivate).toBe(false)
   })
 
+  it('treats a resolvable tracker host that is on neither the private flag nor the private-host list as public', async () => {
+    // No explicit `private` field, and 'tracker.example.org' is not in the configured
+    // privateTrackerHosts list — pins the fail-safe boundary from the other side: a host we
+    // CAN resolve and simply haven't flagged is a determination (public), not "undeterminable".
+    const raw = [{ ...RAW[0], tracker: 'http://tracker.example.org/announce' }]
+    const t = (await client(stub({ '/torrents/info': raw })).torrents())[0]!
+    expect(t.isPrivate).toBe(false)
+  })
+
+  it('captures the SID cookie from login and sends it back as the Cookie header on later calls', async () => {
+    const headersSeen: Array<Record<string, string> | undefined> = []
+    const f = (async (url: string | URL, init?: RequestInit) => {
+      const u = String(url)
+      headersSeen.push(init?.headers as Record<string, string> | undefined)
+      if (u.includes('/auth/login')) {
+        return new Response('Ok.', { status: 200, headers: { 'set-cookie': 'SID=xyz789; path=/; HttpOnly' } })
+      }
+      return new Response(JSON.stringify(RAW), { status: 200 })
+    }) as unknown as typeof fetch
+    await client(f).torrents()
+    const [loginHeaders, infoHeaders] = headersSeen
+    expect(loginHeaders?.Cookie).toBeUndefined() // the login request itself must not send a stale cookie
+    expect(infoHeaders?.Cookie).toBe('SID=xyz789') // attributes like path/HttpOnly are stripped
+  })
+
+  it('throws bad-response when login succeeds but returns no SID cookie', async () => {
+    const f = (async (url: string | URL) => {
+      const u = String(url)
+      if (u.includes('/auth/login')) return new Response('Ok.', { status: 200 }) // no set-cookie at all
+      return new Response(JSON.stringify(RAW), { status: 200 })
+    }) as unknown as typeof fetch
+    const err = (await client(f).torrents().catch((e) => e)) as ConnectorError
+    expect(err).toBeInstanceOf(ConnectorError)
+    expect(err.kind).toBe('bad-response')
+  })
+
   it('logs in once and reuses the SID cookie', async () => {
     const urls: string[] = []
     const c = client(stub({ '/torrents/info': RAW }, (u) => urls.push(u)))
@@ -65,17 +102,29 @@ describe('torrents', () => {
     expect(urls.filter((u) => u.includes('/auth/login'))).toHaveLength(1)
   })
 
-  it('re-logins after a 403 and retries the call', async () => {
+  it('re-logins after a 403 and retries the call with the NEW SID, never the stale one', async () => {
     let logins = 0; let infoCalls = 0
-    const f = (async (url: string | URL) => {
+    const loginCookiesSeen: Array<string | undefined> = []
+    const infoCookiesSeen: Array<string | undefined> = []
+    const f = (async (url: string | URL, init?: RequestInit) => {
       const u = String(url)
-      if (u.includes('/auth/login')) { logins += 1; return new Response('Ok.', { status: 200, headers: { 'set-cookie': 'SID=z' } }) }
+      const cookie = (init?.headers as Record<string, string> | undefined)?.Cookie
+      if (u.includes('/auth/login')) {
+        logins += 1
+        loginCookiesSeen.push(cookie)
+        // Each login mints a DIFFERENT session id, so a bug that resent the stale cookie or
+        // reused the first session after re-login would be visible below.
+        return new Response('Ok.', { status: 200, headers: { 'set-cookie': `SID=session${logins}` } })
+      }
       infoCalls += 1
+      infoCookiesSeen.push(cookie)
       return infoCalls === 1 ? new Response('', { status: 403 }) : new Response(JSON.stringify(RAW), { status: 200 })
     }) as unknown as typeof fetch
     const t = await client(f).torrents()
     expect(logins).toBe(2)
     expect(t).toHaveLength(1)
+    expect(loginCookiesSeen).toEqual([undefined, undefined]) // neither login sends a Cookie header
+    expect(infoCookiesSeen).toEqual(['SID=session1', 'SID=session2']) // the retry carries the fresh SID
   })
 })
 

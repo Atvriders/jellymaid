@@ -119,6 +119,25 @@ describe('HttpClient', () => {
     await expect(client(f as unknown as typeof fetch).request('/a', {}, 'text')).resolves.toBe('hello world')
   })
 
+  it('invokes onResponse with the real Response before any status branching', async () => {
+    const f = vi.fn(async () => new Response('{"ok":1}', { status: 200, headers: { 'x-test': 'yes' } }))
+    let seen: Response | null = null
+    await client(f as unknown as typeof fetch).request('/a', { onResponse: (res) => { seen = res } })
+    expect(seen).not.toBeNull()
+    expect(seen!.status).toBe(200)
+    expect(seen!.headers.get('x-test')).toBe('yes')
+  })
+
+  it('does not forward onResponse to fetchImpl', async () => {
+    let sawOnResponse = false
+    const f = vi.fn(async (_u: string, init?: RequestInit) => {
+      sawOnResponse = 'onResponse' in (init ?? {})
+      return new Response('{}', { status: 200 })
+    })
+    await client(f as unknown as typeof fetch).request('/a', { onResponse: () => undefined })
+    expect(sawOnResponse).toBe(false)
+  })
+
   it('honours minDelayMs between every request start, even under concurrency > 1', async () => {
     const starts: number[] = []
     const f = vi.fn(async () => {

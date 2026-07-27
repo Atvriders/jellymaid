@@ -32,6 +32,12 @@ export interface HttpRequestInit extends RequestInit {
    * brute-force counter) and, later, torrent deletion with its data.
    */
   retry?: boolean
+  /**
+   * Observe the raw Response as soon as fetch resolves, before status branching or body
+   * consumption. Exists so a caller can read response headers (e.g. `set-cookie`) that
+   * `request()`'s parsed return value otherwise discards. Must not consume the body.
+   */
+  onResponse?: (res: Response) => void
 }
 
 /** GET/HEAD/PUT/DELETE are idempotent, so replaying one cannot compound an effect. */
@@ -82,7 +88,7 @@ export class HttpClient {
     const maxRetries = shouldRetry(init) ? this.opts.maxRetries ?? 3 : 0
     const backoffBase = this.opts.backoffBaseMs ?? 250
     const url = path.startsWith('http') ? path : `${this.opts.baseUrl.replace(/\/$/, '')}${path}`
-    const { retry: _retry, ...fetchInit } = init // `retry` is ours, not fetch's
+    const { retry: _retry, onResponse, ...fetchInit } = init // `retry`/`onResponse` are ours, not fetch's
     let lastError: ConnectorError | null = null
 
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
@@ -95,6 +101,7 @@ export class HttpClient {
           signal: controller.signal,
           headers: { ...this.opts.defaultHeaders, ...(init.headers as Record<string, string> | undefined) },
         })
+        onResponse?.(res)
         if (res.status === 401 || res.status === 403) {
           await res.body?.cancel().catch(() => undefined)
           throw new ConnectorError('auth', this.opts.service, `HTTP ${res.status}`, res.status)

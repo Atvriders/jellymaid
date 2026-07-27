@@ -39,6 +39,16 @@ function hostOf(tracker: string | undefined): string | null {
   try { return new URL(tracker).hostname } catch { return null }
 }
 
+/**
+ * Pulls the `SID=<value>` name=value pair out of a `set-cookie` header, dropping attributes
+ * like `path=/` or `HttpOnly`. Returns null if no SID cookie is present.
+ */
+function extractSid(setCookie: string | null): string | null {
+  if (!setCookie) return null
+  const match = /(?:^|[,;\s])SID=([^;,]+)/.exec(setCookie)
+  return match ? `SID=${match[1]}` : null
+}
+
 export interface QbitClient {
   torrents(): Promise<Torrent[]>
   files(hash: string): Promise<TorrentFile[]>
@@ -62,13 +72,22 @@ export function createQbitClient(opts: QbitClientOptions): QbitClient {
 
   async function login(): Promise<void> {
     const body = new URLSearchParams({ username: opts.user, password: opts.pass }).toString()
+    let capturedSid: string | null = null
     const raw = await http.request<string>('/api/v2/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded', Referer: opts.url },
       body,
+      // Reads the raw Response the moment it resolves — the only place the real SID is
+      // available. request()'s parsed 'text' return value discards headers entirely, and
+      // credentials: 'include' is a browser-fetch concept that undici does not implement, so
+      // without this the session cookie would silently never be sent again.
+      onResponse: (res) => { capturedSid = extractSid(res.headers.get('set-cookie')) },
     }, 'text')
     if (!raw.includes('Ok')) throw new ConnectorError('auth', 'qbittorrent', 'login rejected')
-    sid = 'authenticated'
+    if (!capturedSid) {
+      throw new ConnectorError('bad-response', 'qbittorrent', 'login succeeded but returned no SID cookie')
+    }
+    sid = capturedSid
   }
 
   /** qBittorrent expires sessions silently; a 403 means "log in again", not "wrong password". */
@@ -87,7 +106,12 @@ export function createQbitClient(opts: QbitClientOptions): QbitClient {
   }
 
   function withCookie(init: RequestInit): RequestInit {
-    return { ...init, credentials: 'include', headers: { ...(init.headers as Record<string, string>), Referer: opts.url } }
+    const headers: Record<string, string> = { ...(init.headers as Record<string, string>), Referer: opts.url }
+    // The actual session mechanism: qBittorrent authenticates via this cookie, not Referer.
+    // credentials: 'include' is kept for environments that do honour it, but undici (Node's
+    // fetch) does not, so this explicit header is load-bearing.
+    if (sid) headers.Cookie = sid
+    return { ...init, credentials: 'include', headers }
   }
 
   function isPrivate(raw: RawTorrent, host: string | null): boolean {
