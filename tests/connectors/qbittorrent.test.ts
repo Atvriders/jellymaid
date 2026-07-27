@@ -40,32 +40,39 @@ describe('torrents', () => {
   it('uses the private flag when the qBittorrent version reports it', async () => {
     const t = (await client(stub({ '/torrents/info': [{ ...RAW[0], private: true }] })).torrents())[0]!
     expect(t.isPrivate).toBe(true)
+    expect(t.privacySource).toBe('flag')
   })
 
   it('falls back to the configured private-host list', async () => {
     const t = (await client(stub({ '/torrents/info': RAW }), ['tracker.private.example']).torrents())[0]!
     expect(t.isPrivate).toBe(true)
+    expect(t.privacySource).toBe('host-list')
   })
 
   it('treats unknown privacy as private — fail safe', async () => {
     const raw = [{ ...RAW[0], tracker: '' }]
     const t = (await client(stub({ '/torrents/info': raw })).torrents())[0]!
     expect(t.isPrivate).toBe(true)
+    expect(t.privacySource).toBe('undetermined')
   })
 
-  it('treats a known public tracker as public', async () => {
+  it('treats a known public tracker as public — the explicit flag is trusted in both directions', async () => {
     const raw = [{ ...RAW[0], tracker: 'http://tracker.opentrackr.org:1337/announce', private: false }]
     const t = (await client(stub({ '/torrents/info': raw })).torrents())[0]!
     expect(t.isPrivate).toBe(false)
+    expect(t.privacySource).toBe('flag')
   })
 
-  it('treats a resolvable tracker host that is on neither the private flag nor the private-host list as public', async () => {
+  it('fails closed on a resolvable tracker host that is on neither the private flag nor the private-host list', async () => {
     // No explicit `private` field, and 'tracker.example.org' is not in the configured
-    // privateTrackerHosts list — pins the fail-safe boundary from the other side: a host we
-    // CAN resolve and simply haven't flagged is a determination (public), not "undeterminable".
+    // privateTrackerHosts list. Neither signal establishes anything, so this must be
+    // undetermined -> private, NOT public. Getting this backwards would silently drop the
+    // ratio guard on private torrents whose tracker just hasn't been added to the list yet,
+    // or on any torrent from a qBittorrent old enough not to report `private` at all.
     const raw = [{ ...RAW[0], tracker: 'http://tracker.example.org/announce' }]
     const t = (await client(stub({ '/torrents/info': raw })).torrents())[0]!
-    expect(t.isPrivate).toBe(false)
+    expect(t.isPrivate).toBe(true)
+    expect(t.privacySource).toBe('undetermined')
   })
 
   it('captures the SID cookie from login and sends it back as the Cookie header on later calls', async () => {
@@ -82,6 +89,34 @@ describe('torrents', () => {
     const [loginHeaders, infoHeaders] = headersSeen
     expect(loginHeaders?.Cookie).toBeUndefined() // the login request itself must not send a stale cookie
     expect(infoHeaders?.Cookie).toBe('SID=xyz789') // attributes like path/HttpOnly are stripped
+  })
+
+  it('extracts SID from a set-cookie header that joins multiple cookies, as undici does for repeated headers', async () => {
+    const headersSeen: Array<Record<string, string> | undefined> = []
+    const f = (async (url: string | URL, init?: RequestInit) => {
+      const u = String(url)
+      headersSeen.push(init?.headers as Record<string, string> | undefined)
+      if (u.includes('/auth/login')) {
+        return new Response('Ok.', { status: 200, headers: { 'set-cookie': 'other=1; path=/, SID=abc; path=/' } })
+      }
+      return new Response(JSON.stringify(RAW), { status: 200 })
+    }) as unknown as typeof fetch
+    await client(f).torrents()
+    expect(headersSeen[1]?.Cookie).toBe('SID=abc')
+  })
+
+  it('trims trailing whitespace from the captured SID value', async () => {
+    const headersSeen: Array<Record<string, string> | undefined> = []
+    const f = (async (url: string | URL, init?: RequestInit) => {
+      const u = String(url)
+      headersSeen.push(init?.headers as Record<string, string> | undefined)
+      if (u.includes('/auth/login')) {
+        return new Response('Ok.', { status: 200, headers: { 'set-cookie': 'SID=abc ; path=/' } })
+      }
+      return new Response(JSON.stringify(RAW), { status: 200 })
+    }) as unknown as typeof fetch
+    await client(f).torrents()
+    expect(headersSeen[1]?.Cookie).toBe('SID=abc')
   })
 
   it('throws bad-response when login succeeds but returns no SID cookie', async () => {

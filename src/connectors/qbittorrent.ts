@@ -1,5 +1,16 @@
 import { HttpClient, ConnectorError } from './http.js'
 
+/**
+ * How `isPrivate` was decided:
+ *  - 'flag': the qBittorrent version reported the `private` field explicitly (trusted either way).
+ *  - 'host-list': no explicit field, but the tracker host matched the configured private-host list.
+ *  - 'undetermined': neither signal was available. Forced to isPrivate: true (fail safe) — this
+ *    is the case a later guard should surface to the operator ("add this tracker to
+ *    privateTrackerHosts or upgrade qBittorrent"), since it silently over-applies the ratio
+ *    guard rather than under-applying it.
+ */
+export type PrivacySource = 'flag' | 'host-list' | 'undetermined'
+
 export interface Torrent {
   hash: string
   name: string
@@ -11,6 +22,7 @@ export interface Torrent {
   ratio: number
   seedingTimeSeconds: number
   isPrivate: boolean
+  privacySource: PrivacySource
   trackerHost: string | null
   sizeBytes: number
   progress: number
@@ -46,7 +58,8 @@ function hostOf(tracker: string | undefined): string | null {
 function extractSid(setCookie: string | null): string | null {
   if (!setCookie) return null
   const match = /(?:^|[,;\s])SID=([^;,]+)/.exec(setCookie)
-  return match ? `SID=${match[1]}` : null
+  const value = match?.[1]
+  return value !== undefined ? `SID=${value.trim()}` : null
 }
 
 export interface QbitClient {
@@ -114,11 +127,19 @@ export function createQbitClient(opts: QbitClientOptions): QbitClient {
     return { ...init, credentials: 'include', headers }
   }
 
-  function isPrivate(raw: RawTorrent, host: string | null): boolean {
-    if (typeof raw.private === 'boolean') return raw.private
-    if (host && privateHosts.has(host.toLowerCase())) return true
-    if (!host) return true // undeterminable → treat as private
-    return false
+  /**
+   * Fail-closed precedence: an explicit `private` field is trusted in BOTH directions (it's
+   * authoritative). Absent that, a host-list match proves private. Absent BOTH — no explicit
+   * field and no list match — privacy is undetermined, and undetermined must mean private:
+   * older qBittorrent versions don't report `private` at all, and `privateTrackerHosts` is a
+   * human-maintained list that will always lag reality. Treating "not on the list" as proof of
+   * "public" would silently drop the ratio guard on exactly the private torrents it exists to
+   * protect. A blocked delete is recoverable; a hit-and-run on a private tracker is not.
+   */
+  function classifyPrivacy(raw: RawTorrent, host: string | null): { isPrivate: boolean; privacySource: PrivacySource } {
+    if (typeof raw.private === 'boolean') return { isPrivate: raw.private, privacySource: 'flag' }
+    if (host && privateHosts.has(host.toLowerCase())) return { isPrivate: true, privacySource: 'host-list' }
+    return { isPrivate: true, privacySource: 'undetermined' }
   }
 
   return {
@@ -126,6 +147,7 @@ export function createQbitClient(opts: QbitClientOptions): QbitClient {
       const raw = await call<RawTorrent[]>('/api/v2/torrents/info')
       return raw.map((t) => {
         const trackerHost = hostOf(t.tracker)
+        const { isPrivate, privacySource } = classifyPrivacy(t, trackerHost)
         return {
           hash: t.hash,
           name: t.name ?? '',
@@ -136,7 +158,8 @@ export function createQbitClient(opts: QbitClientOptions): QbitClient {
           state: t.state ?? 'unknown',
           ratio: t.ratio ?? 0,
           seedingTimeSeconds: t.seeding_time ?? 0,
-          isPrivate: isPrivate(t, trackerHost),
+          isPrivate,
+          privacySource,
           trackerHost,
           sizeBytes: t.size ?? 0,
           progress: t.progress ?? 0,
