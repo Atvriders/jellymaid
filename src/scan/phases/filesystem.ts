@@ -17,21 +17,32 @@ export const filesystemPhase: Phase = {
 
     const done = new Set((ctx.cursor.completedRoots as string[] | undefined) ?? [])
     const errors: Array<{ path: string; reason: string }> = []
+    // Root-level open failures only (mount down, deleted, permissions) — not subtree errors.
+    // Used to tell "every root failed outright" from "every root walked, some imperfectly".
+    const rootOpenFailures: Array<{ path: string; reason: string }> = []
     let written = 0
     let stale = 0
+    let sweepSkipped = 0
+    let anyRootWalked = false
 
     for (const root of roots) {
       if (done.has(root.container)) continue
       if (ctx.signal.aborted) return { status: 'cancelled', counts: { entries: written } }
       const shouldHash = hashedRoots.has(root.container) && ctx.deps.hasher !== null
 
-      // Set when the root's own top-level directory could never be opened at all (mount down,
+      // Any error during this root's walk — top-level or a subtree partway through — means this
+      // pass did not see the whole root. A stale row under an unread subtree is not a proven
+      // ghost, only an unobserved one; sweeping it would tell every filesystem rule the file
+      // vanished, and "missing" is an input to a delete decision. Stale rows are the safer
+      // failure: the executor already treats a finding for a vanished path as already-gone.
+      let rootHadErrors = false
+      // Narrower: the root's own top-level directory could never be opened at all (mount down,
       // permissions, deleted). Distinct from a deep subdirectory failing partway through: that
-      // still leaves us knowing the root existed, so its remaining rows are swept as usual. An
-      // unopenable root tells us nothing — treating "we saw nothing" as "there is nothing" would
-      // wipe this root's entire prior index and tell every filesystem rule every file in it just
-      // vanished, when in fact we just failed to look.
-      let rootUnreachable = false
+      // still leaves us knowing the root existed. An unopenable root tells us nothing — treating
+      // "we saw nothing" as "there is nothing" would wipe this root's entire prior index and
+      // tell every filesystem rule every file in it just vanished, when in fact we just failed
+      // to look. Also feeds whether the PHASE can claim it walked anything at all.
+      let rootOpenFailed = false
 
       try {
         for await (const batch of walkRoot({
@@ -41,7 +52,11 @@ export const filesystemPhase: Phase = {
           signal: ctx.signal,
           onError: (e) => {
             errors.push(e)
-            if (e.path === root.container) rootUnreachable = true
+            rootHadErrors = true
+            if (e.path === root.container) {
+              rootOpenFailed = true
+              rootOpenFailures.push(e)
+            }
           },
         })) {
           const rows: unknown[][] = []
@@ -68,11 +83,19 @@ export const filesystemPhase: Phase = {
           ctx.progress(written, null)
         }
       } catch (err) {
-        errors.push({ path: root.container, reason: describeError(err) })
-        rootUnreachable = true
+        const failure = { path: root.container, reason: describeError(err) }
+        errors.push(failure)
+        rootHadErrors = true
+        rootOpenFailed = true
+        rootOpenFailures.push(failure)
       }
 
-      if (rootUnreachable) {
+      if (!rootOpenFailed) anyRootWalked = true
+
+      if (rootHadErrors) {
+        // Do not sweep: some part of this root was not actually observed this pass, so its
+        // remaining prior-scan rows are not proven gone. Recorded, not silently dropped.
+        sweepSkipped += 1
         done.add(root.container)
         ctx.saveCursor({ completedRoots: [...done] })
         continue
@@ -89,6 +112,15 @@ export const filesystemPhase: Phase = {
       done.add(root.container)
       ctx.saveCursor({ completedRoots: [...done] })
     }
-    return { status: 'completed', counts: { entries: written, stale, errors: errors.length } }
+
+    if (!anyRootWalked && errors.length) {
+      // Every configured root failed before it could even be opened — this is a total
+      // filesystem-connectivity failure disguised as "nothing found" unless it says so. Name
+      // every failed root so an operator knows which mount is down.
+      const reason = `every configured root failed to open: ${rootOpenFailures.map((f) => `${f.path} (${f.reason})`).join('; ')}`
+      return { status: 'skipped', reason, counts: { entries: written, stale, errors: errors.length, sweepSkipped } }
+    }
+
+    return { status: 'completed', counts: { entries: written, stale, errors: errors.length, sweepSkipped } }
   },
 }

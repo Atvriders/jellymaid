@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { openDb, type Db } from '../../src/index/db.js'
@@ -138,7 +138,7 @@ describe('filesystemPhase', () => {
     expect(res.reason).toMatch(/no path mappings/i)
   })
 
-  it('does not sweep a root that could not be opened at all', async () => {
+  it('reports skipped, with a reason naming the root, when every configured root fails to open', async () => {
     const missing = join(dir, 'does-not-exist')
     db.prepare(`INSERT INTO fs_entries (container_path, scan_id, parent_path, name, is_dir, library_root, root_role)
                 VALUES (?,?,?,?,?,?,?)`).run(join(missing, 'Old.mkv'), 0, missing, 'Old.mkv', 0, missing, 'library')
@@ -146,11 +146,48 @@ describe('filesystemPhase', () => {
       pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: missing, qbit: null }]),
     })
     const res = await filesystemPhase.run(c)
-    expect(res.status).toBe('completed')
-    expect(res.counts.errors).toBeGreaterThan(0)
+    // A totally unreachable filesystem is a connector failure, not "nothing found" — the same
+    // property arrPhase already honours when every configured instance fails.
+    expect(res.status).toBe('skipped')
+    expect(res.reason).toContain(missing)
     // The root itself could never be opened — an unreadable root is not an empty one. Sweeping
     // here would have deleted the prior row and told every filesystem rule the file vanished.
     expect(db.prepare('SELECT COUNT(*) c FROM fs_entries').get()).toEqual({ c: 1 })
+  })
+
+  it('does not sweep a root when a subtree inside it could not be read', async () => {
+    const root = join(dir, 'lib')
+    const locked = join(root, 'locked')
+    mkdirSync(locked)
+    writeFileSync(join(locked, 'Ghost.mkv'), 'x')
+    chmodSync(locked, 0o000)
+    // A stale row from a prior scan, under the READABLE part of the root — a file that may or
+    // may not still exist, but this pass cannot tell, because 'locked' errored elsewhere in the
+    // same root.
+    const staleFile = join(root, 'Heat', 'OldVersion.mkv')
+    db.prepare(`INSERT INTO fs_entries (container_path, scan_id, parent_path, name, is_dir, library_root, root_role)
+                VALUES (?,?,?,?,?,?,?)`).run(staleFile, 0, join(root, 'Heat'), 'OldVersion.mkv', 0, root, 'library')
+    try {
+      const c = ctx({
+        pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }]),
+      })
+      const res = await filesystemPhase.run(c)
+      // The root itself opened fine and Heat.mkv was seen, so this is not a total failure.
+      expect(res.status).toBe('completed')
+      expect(res.counts.errors).toBeGreaterThan(0)
+      expect(res.counts.sweepSkipped).toBeGreaterThan(0)
+      // The stale row survives: sweeping it would have been the dangerous direction of the bug
+      // — a live file reported as missing, which is an input to a delete decision.
+      const stale = db.prepare('SELECT scan_id FROM fs_entries WHERE container_path = ?').get(staleFile) as { scan_id: number } | undefined
+      expect(stale).toBeDefined()
+      expect(stale!.scan_id).toBe(0)
+      // The genuinely readable file was still refreshed normally under the current scan.
+      const fresh = db.prepare('SELECT scan_id FROM fs_entries WHERE container_path = ?')
+        .get(join(root, 'Heat', 'Heat.mkv')) as { scan_id: number }
+      expect(fresh.scan_id).toBe(1)
+    } finally {
+      chmodSync(locked, 0o755)
+    }
   })
 })
 
