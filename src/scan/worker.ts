@@ -7,7 +7,7 @@ import { createHasher } from '../fs/hasher.js'
 import { createJellyfinClient } from '../connectors/jellyfin.js'
 import { createQbitClient } from '../connectors/qbittorrent.js'
 import { createRadarrClient, createSonarrClient } from '../connectors/arr.js'
-import { runScan, pruneOldScans } from './orchestrator.js'
+import { runScan, pruneOldScans, failRunningScan } from './orchestrator.js'
 import { createLogger, parseLogLevel, type Logger } from '../core/logger.js'
 import type { Phase, ScanDeps } from './phases/types.js'
 
@@ -100,10 +100,9 @@ export async function runWorkerScan(opts: {
     opts.post({ type: 'error', payload: message })
     // `runScan` already marks the row failed/cancelled/completed on every path it controls; this
     // only fires for a throw from `buildDeps()`, before runScan ever sees the row. The
-    // `AND status='running'` guard makes this a no-op — never a stomp — on any row runScan
-    // already finalised.
-    opts.db.prepare("UPDATE scans SET status='failed', finished_at=?, error=? WHERE id=? AND status='running'")
-      .run(new Date().toISOString(), message, opts.scanId)
+    // `AND status='running'` guard inside failRunningScan makes this a no-op — never a stomp —
+    // on any row runScan already finalised.
+    failRunningScan(opts.db, opts.scanId, message)
   } finally {
     // Retention has exactly one owner — the worker, once a scan has actually finished, any
     // outcome. See pruneOldScans's doc comment in src/scan/orchestrator.ts.

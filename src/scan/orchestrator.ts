@@ -32,6 +32,29 @@ export function latestScan(db: Db): ScanRow | null {
   return (db.prepare('SELECT * FROM scans ORDER BY id DESC LIMIT 1').get() as ScanRow | undefined) ?? null
 }
 
+/**
+ * The safety net every "something went wrong outside runScan's own bookkeeping" path shares (the
+ * worker's catch, the runner's worker-exit handler). The `AND status='running'` guard is what
+ * makes it safe to call unconditionally: on the ordinary path the row is already terminal, so
+ * this matches zero rows rather than stomping a real outcome. Returns rows changed.
+ */
+export function failRunningScan(db: Db, scanId: number, error: string): number {
+  return db.prepare("UPDATE scans SET status='failed', finished_at=?, error=? WHERE id=? AND status='running'")
+    .run(new Date().toISOString(), error, scanId).changes
+}
+
+/**
+ * Boot-time reconciliation. The runner covers a worker that dies; nothing covers the PROCESS
+ * dying — a container restart mid-scan leaves `scans.status='running'` forever while
+ * `isRunning()` correctly reports false, so the UI shows a scan that will never finish and
+ * `latestScan` never reports a usable outcome. Nothing can still be running at startup, by
+ * definition: the scan worker is a thread of this process. Returns rows reconciled.
+ */
+export function reconcileInterruptedScans(db: Db): number {
+  return db.prepare("UPDATE scans SET status='failed', finished_at=?, error=? WHERE status='running'")
+    .run(new Date().toISOString(), 'the process restarted while this scan was running').changes
+}
+
 export function pruneOldScans(db: Db, keep = 2): number {
   const info = db.prepare(
     'DELETE FROM scans WHERE id NOT IN (SELECT id FROM scans ORDER BY id DESC LIMIT ?)',

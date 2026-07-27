@@ -37,16 +37,28 @@ describe('radarr', () => {
       '/api/v3/movie': [{ id: 5, title: 'Heat', monitored: true, path: '/movies/Heat', movieFile: { path: '/movies/Heat/Heat.mkv' } }],
     }, (u, init) => { if (u.includes('/movie/5')) { method = init!.method!; body = JSON.parse(String(init!.body)) } })
     const res = await createRadarrClient(base(f)).unmonitorByPath('/movies/Heat/Heat.mkv')
-    expect(res).toEqual({ unmonitored: true, recordId: 5 })
+    expect(res).toEqual({ outcome: 'unmonitored', recordId: 5 })
     expect(method).toBe('PUT')
     expect(body.monitored).toBe(false)
     expect(body.id).toBe(5)
   })
 
-  it('reports not-found rather than throwing when the path is unknown', async () => {
+  it('reports not-managed — a complete inventory that genuinely lacks the path', async () => {
     const f = stub({ '/api/v3/movie': [] })
     await expect(createRadarrClient(base(f)).unmonitorByPath('/nope.mkv'))
-      .resolves.toEqual({ unmonitored: false, recordId: null })
+      .resolves.toEqual({ outcome: 'not-managed', recordId: null })
+  })
+
+  it('reports lookup-failed — not not-managed — when the inventory fetch itself fails', async () => {
+    // The executor is fail-closed: an unmonitor that did not happen must skip the delete. If a
+    // failed lookup returned the same value as "not managed here", it would read as "nothing to
+    // unmonitor, proceed" and Radarr would re-download the file that was just deleted.
+    const f = (async () => new Response('nope', { status: 500 })) as unknown as typeof fetch
+    const problems: string[] = []
+    const res = await createRadarrClient({ ...base(f), onProblem: (m) => problems.push(m) })
+      .unmonitorByPath('/movies/Heat/Heat.mkv')
+    expect(res).toEqual({ outcome: 'lookup-failed', recordId: null })
+    expect(problems).toHaveLength(1)
   })
 })
 
@@ -71,19 +83,63 @@ describe('sonarr', () => {
       '/api/v3/episode': [{ id: 500, seriesId: 9, episodeFileId: 77, monitored: true, title: 'Pilot' }],
     }, (u, init) => { if (u.includes('/episode/monitor')) { url = u; body = JSON.parse(String(init!.body)) } })
     const res = await createSonarrClient(base(f)).unmonitorByPath('/tv/Show/S01E01.mkv')
-    expect(res.unmonitored).toBe(true)
+    expect(res.outcome).toBe('unmonitored')
     expect(url).toContain('/api/v3/episode/monitor')
     expect(body).toEqual({ episodeIds: [500], monitored: false })
   })
 
-  it('reports not-found rather than throwing when the path is unknown', async () => {
+  it('reports not-managed when a complete inventory genuinely lacks the path', async () => {
     const f = stub({
       '/api/v3/series': [{ id: 9, title: 'Show', monitored: true, path: '/tv/Show' }],
       '/api/v3/episodefile': [{ id: 77, seriesId: 9, path: '/tv/Show/S01E01.mkv' }],
       '/api/v3/episode': [{ id: 500, seriesId: 9, episodeFileId: 77, monitored: true, title: 'Pilot' }],
     })
     await expect(createSonarrClient(base(f)).unmonitorByPath('/nope.mkv'))
-      .resolves.toEqual({ unmonitored: false, recordId: null })
+      .resolves.toEqual({ outcome: 'not-managed', recordId: null })
+  })
+
+  it('reports lookup-failed when the path is absent from a PARTIAL inventory', async () => {
+    // Series 9 was skipped, so "not in the list" means only "not in the part of the list I could
+    // read". The file may well live in series 9 and still be monitored — deleting it on the
+    // strength of this lookup is how Sonarr immediately re-downloads it.
+    const f = (async (url: string | URL) => {
+      const u = String(url)
+      if (u.includes('/api/v3/series')) {
+        return new Response(JSON.stringify([
+          { id: 9, title: 'Broken', monitored: true, path: '/tv/Broken' },
+          { id: 10, title: 'Show', monitored: true, path: '/tv/Show' },
+        ]), { status: 200 })
+      }
+      if (u.includes('seriesId=9')) return new Response('boom', { status: 400 })
+      if (u.includes('/api/v3/episodefile')) {
+        return new Response(JSON.stringify([{ id: 77, seriesId: 10, path: '/tv/Show/S01E01.mkv' }]), { status: 200 })
+      }
+      return new Response(JSON.stringify([{ id: 500, seriesId: 10, episodeFileId: 77, monitored: true, title: 'Pilot' }]), { status: 200 })
+    }) as unknown as typeof fetch
+    await expect(createSonarrClient(base(f)).unmonitorByPath('/tv/Broken/S01E01.mkv'))
+      .resolves.toEqual({ outcome: 'lookup-failed', recordId: null })
+    // The same partial inventory still resolves a path it DID read, rather than failing closed
+    // for the whole library.
+    await expect(createSonarrClient(base(f)).unmonitorByPath('/tv/Show/S01E01.mkv'))
+      .resolves.toMatchObject({ outcome: 'unmonitored' })
+  })
+
+  it('reports lookup-failed when the series list itself is unreachable', async () => {
+    const f = (async () => new Response('down', { status: 503 })) as unknown as typeof fetch
+    await expect(createSonarrClient(base(f)).unmonitorByPath('/tv/Show/S01E01.mkv'))
+      .resolves.toEqual({ outcome: 'lookup-failed', recordId: null })
+  })
+
+  it('reports lookup-failed for a managed file whose episode cannot be resolved', async () => {
+    // The file IS Sonarr-managed, but no episode row points at it, so there is nothing to
+    // unmonitor. That is "could not act", not "nothing to do".
+    const f = stub({
+      '/api/v3/series': [{ id: 9, title: 'Show', monitored: true, path: '/tv/Show' }],
+      '/api/v3/episodefile': [{ id: 77, seriesId: 9, path: '/tv/Show/S01E01.mkv' }],
+      '/api/v3/episode': [],
+    })
+    await expect(createSonarrClient(base(f)).unmonitorByPath('/tv/Show/S01E01.mkv'))
+      .resolves.toEqual({ outcome: 'lookup-failed', recordId: null })
   })
 
   it('isolates a per-series failure, reports it via onProblem, and still returns unrelated records', async () => {

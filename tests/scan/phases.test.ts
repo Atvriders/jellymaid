@@ -14,12 +14,16 @@ import type { PhaseContext } from '../../src/scan/phases/types.js'
 let db: Db
 let dir: string
 
-function ctx(deps: Partial<PhaseContext['deps']>, cursor: Record<string, unknown> = {}): PhaseContext {
+function ctx(
+  deps: Partial<PhaseContext['deps']>,
+  cursor: Record<string, unknown> = {},
+  over: Partial<Pick<PhaseContext, 'signal' | 'saveCursor' | 'progress'>> = {},
+): PhaseContext {
   let saved = cursor
   return {
-    db, scanId: 1, cursor: saved, signal: new AbortController().signal,
-    saveCursor: (c) => { saved = c },
-    progress: () => {},
+    db, scanId: 1, cursor: saved, signal: over.signal ?? new AbortController().signal,
+    saveCursor: over.saveCursor ?? ((c) => { saved = c }),
+    progress: over.progress ?? (() => {}),
     deps: {
       config: fileConfigSchema.parse({}),
       pathMap: createPathMap([]),
@@ -94,6 +98,73 @@ describe('jellyfinPhase', () => {
     }
     await jellyfinPhase.run(ctx({ jellyfin: jf as never }, { startIndex: 2 }))
     expect(seen[0]).toBe(2)
+  })
+
+  /** Mirrors what an earlier scan left behind, so a sweep is observable in both directions. */
+  const seedPriorItem = (id = 'old') => {
+    db.prepare(`INSERT INTO jellyfin_items (id, scan_id, type, name, jf_path, container_path)
+                VALUES (?,?,?,?,?,?)`).run(id, 0, 'Movie', 'Old', '/media/Movies/Old.mkv', '/mnt/m/Old.mkv')
+  }
+
+  it('does not sweep — and reports skipped — when the first page comes back empty but the library reports items', async () => {
+    // What a restarting or mid-library-scan Jellyfin does: reachable, honest about its total,
+    // but not yet serving items. Sweeping here erases the whole snapshot and makes every media
+    // file on disk read as an orphan.
+    seedPriorItem()
+    const jf = {
+      virtualFolders: async () => [],
+      items: async () => ({ totalRecordCount: 50_000, items: [] }),
+    }
+    const res = await jellyfinPhase.run(ctx({ jellyfin: jf as never }))
+    expect(res.status).toBe('skipped')
+    expect(res.reason).toMatch(/0 of 50000/)
+    expect(db.prepare('SELECT COUNT(*) c FROM jellyfin_items').get()).toEqual({ c: 1 })
+    expect(res.counts.stale ?? 0).toBe(0)
+  })
+
+  it('does not sweep when the pager stops short of totalRecordCount', async () => {
+    seedPriorItem()
+    let call = 0
+    const jf = {
+      virtualFolders: async () => [],
+      items: async () => {
+        call += 1
+        return call === 1
+          ? { totalRecordCount: 10, items: [{
+              id: 'a', type: 'Movie', name: 'A', sortName: null, year: null, seriesId: null,
+              seriesName: null, seasonNo: null, episodeNo: null, providerIds: {}, jfPath: null,
+              sizeBytes: null, runtimeTicks: null, container: null, videoCodec: null, audioCodec: null,
+              audioChannels: null, width: null, height: null, bitrate: null, hasPrimaryImage: false,
+              dateCreated: null, mediaSourceId: null,
+            }] }
+          : { totalRecordCount: 10, items: [] }
+      },
+    }
+    const res = await jellyfinPhase.run(ctx({ jellyfin: jf as never }))
+    expect(res.status).toBe('skipped')
+    expect(res.reason).toMatch(/1 of 10/)
+    // The one item it did return is still indexed; the prior snapshot is left intact alongside it.
+    expect(db.prepare('SELECT COUNT(*) c FROM jellyfin_items').get()).toEqual({ c: 2 })
+  })
+
+  it('counts items whose path no mapping covers, rather than leaving a silent NULL', async () => {
+    // A NULL container_path is indistinguishable from a Series/Season row that never had a path.
+    // Plans 3-4 need to tell a degraded index from an empty one.
+    const res = await jellyfinPhase.run(ctx({
+      jellyfin: pages(2) as never,
+      pathMap: createPathMap([{ role: 'library', jellyfin: '/somewhere-else', container: '/mnt/x', qbit: null }]),
+    }))
+    expect(res.counts.unmapped).toBe(2)
+    expect(db.prepare('SELECT COUNT(*) c FROM jellyfin_items WHERE container_path IS NULL').get()).toEqual({ c: 2 })
+  })
+
+  it('sweeps prior-scan rows only once the whole library has actually been fetched', async () => {
+    seedPriorItem()
+    const res = await jellyfinPhase.run(ctx({ jellyfin: pages(3) as never }))
+    expect(res.status).toBe('completed')
+    expect(res.counts.stale).toBe(1)
+    expect(db.prepare('SELECT COUNT(*) c FROM jellyfin_items WHERE scan_id = 1').get()).toEqual({ c: 3 })
+    expect(db.prepare("SELECT COUNT(*) c FROM jellyfin_items WHERE id = 'old'").get()).toEqual({ c: 0 })
   })
 })
 
@@ -189,6 +260,133 @@ describe('filesystemPhase', () => {
       chmodSync(locked, 0o755)
     }
   })
+
+  it('cancels without sweeping, and without marking the root complete, when the walk is aborted partway', async () => {
+    // The walker terminates NORMALLY on abort — it breaks and flushes its trailing batch rather
+    // than throwing — so a cancelled walk looks exactly like a finished one to the `for await`
+    // that drives it. Without an explicit post-walk abort check, the sweep runs against a
+    // half-seen root and erases every file the walk never reached, and the root is then recorded
+    // as completed so a resume never repairs it.
+    const root = join(dir, 'big')
+    mkdirSync(root)
+    const paths: string[] = []
+    for (let i = 0; i < 1200; i += 1) {
+      const p = join(root, `f${String(i).padStart(4, '0')}.mkv`)
+      writeFileSync(p, 'x')
+      paths.push(p)
+    }
+    // Every one of those files was already indexed by a previous scan.
+    const seed = db.prepare(`INSERT INTO fs_entries (container_path, scan_id, parent_path, name, ext, is_dir, library_root, root_role)
+                             VALUES (?,?,?,?,?,?,?,?)`)
+    db.transaction(() => { for (const p of paths) seed.run(p, 0, root, p.split('/').pop()!, '.mkv', 0, root, 'library') })()
+
+    const controller = new AbortController()
+    const saves: Array<Record<string, unknown>> = []
+    const c = ctx(
+      { pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }]) },
+      {},
+      {
+        signal: controller.signal,
+        saveCursor: (s) => { saves.push(s) },
+        // The phase batches at 1000 entries, so this fires with the root only partly walked.
+        progress: (done) => { if (done >= 1000) controller.abort() },
+      },
+    )
+    const res = await filesystemPhase.run(c)
+
+    expect(res.status).toBe('cancelled')
+    // Nothing was swept: every previously indexed file is still described by the index, including
+    // the ~200 the cancelled walk never reached.
+    expect((db.prepare('SELECT COUNT(*) c FROM fs_entries').get() as { c: number }).c).toBe(1200)
+    expect((db.prepare('SELECT COUNT(*) c FROM fs_entries WHERE scan_id = 0').get() as { c: number }).c)
+      .toBeGreaterThan(0)
+    // And the half-walked root must NOT be recorded as done, or a resume would skip it forever.
+    const completed = saves.flatMap((s) => (s.completedRoots as string[] | undefined) ?? [])
+    expect(completed).not.toContain(root)
+  })
+
+  it('sweeps exactly the rows a clean walk did not see, and nothing outside that root', async () => {
+    const root = join(dir, 'lib')
+    const otherRoot = join(dir, 'other')
+    const keep = join(otherRoot, 'Keep.mkv')
+    mkdirSync(otherRoot)
+    writeFileSync(keep, 'x')
+    const ghost = join(root, 'Heat', 'Deleted.mkv')
+    const insert = db.prepare(`INSERT INTO fs_entries (container_path, scan_id, parent_path, name, is_dir, library_root, root_role)
+                               VALUES (?,?,?,?,?,?,?)`)
+    // A file that genuinely vanished since the last scan …
+    insert.run(ghost, 0, join(root, 'Heat'), 'Deleted.mkv', 0, root, 'library')
+    // … and a still-present file under a DIFFERENT configured root.
+    insert.run(keep, 0, otherRoot, 'Keep.mkv', 0, otherRoot, 'library')
+
+    const res = await filesystemPhase.run(ctx({
+      pathMap: createPathMap([
+        { role: 'library', jellyfin: '/media', container: root, qbit: null },
+        { role: 'library', jellyfin: '/other', container: otherRoot, qbit: null },
+      ]),
+    }))
+
+    expect(res.status).toBe('completed')
+    // Exactly one row swept: the ghost. Not the other root's row, not the live files.
+    expect(res.counts.stale).toBe(1)
+    expect(db.prepare('SELECT COUNT(*) c FROM fs_entries WHERE container_path = ?').get(ghost)).toEqual({ c: 0 })
+    expect(db.prepare('SELECT scan_id FROM fs_entries WHERE container_path = ?').get(keep)).toEqual({ scan_id: 1 })
+    expect(db.prepare('SELECT COUNT(*) c FROM fs_entries WHERE container_path = ?')
+      .get(join(root, 'Heat', 'Heat.mkv'))).toEqual({ c: 1 })
+  })
+
+  it('drops rows belonging to a mapping that has since been removed from the config', async () => {
+    // The per-root sweep is scoped `WHERE library_root = ?` and only runs for roots still in the
+    // config, so nothing else can ever reach these rows: they would describe a mount that may no
+    // longer be attached, indefinitely.
+    const root = join(dir, 'lib')
+    const removed = join(dir, 'was-mapped')
+    db.prepare(`INSERT INTO fs_entries (container_path, scan_id, parent_path, name, is_dir, library_root, root_role)
+                VALUES (?,?,?,?,?,?,?)`).run(join(removed, 'Old.mkv'), 0, removed, 'Old.mkv', 0, removed, 'library')
+
+    const res = await filesystemPhase.run(ctx({
+      pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }]),
+    }))
+    expect(res.status).toBe('completed')
+    expect(res.counts.pruned).toBe(1)
+    expect(db.prepare('SELECT COUNT(*) c FROM fs_entries WHERE library_root = ?').get(removed)).toEqual({ c: 0 })
+  })
+
+  it('keeps rows for an unconfigured root when any configured root failed — unreadable is not removed', async () => {
+    // With a root erroring, "this mapping was removed" and "this mapping is temporarily
+    // unreadable" are indistinguishable, and in the second case these rows are the live index
+    // for a mount that is merely down.
+    const missing = join(dir, 'does-not-exist')
+    const removed = join(dir, 'was-mapped')
+    const insert = db.prepare(`INSERT INTO fs_entries (container_path, scan_id, parent_path, name, is_dir, library_root, root_role)
+                               VALUES (?,?,?,?,?,?,?)`)
+    insert.run(join(removed, 'Old.mkv'), 0, removed, 'Old.mkv', 0, removed, 'library')
+
+    const res = await filesystemPhase.run(ctx({
+      pathMap: createPathMap([
+        { role: 'library', jellyfin: '/media', container: join(dir, 'lib'), qbit: null },
+        { role: 'library', jellyfin: '/down', container: missing, qbit: null },
+      ]),
+    }))
+    expect(res.counts.pruned).toBe(0)
+    expect(db.prepare('SELECT COUNT(*) c FROM fs_entries WHERE library_root = ?').get(removed)).toEqual({ c: 1 })
+  })
+
+  it('does not prune on a resumed pass that skipped an already-completed root', async () => {
+    const root = join(dir, 'lib')
+    const removed = join(dir, 'was-mapped')
+    db.prepare(`INSERT INTO fs_entries (container_path, scan_id, parent_path, name, is_dir, library_root, root_role)
+                VALUES (?,?,?,?,?,?,?)`).run(join(removed, 'Old.mkv'), 0, removed, 'Old.mkv', 0, removed, 'library')
+
+    // The cursor says this root is already done, so this pass never observes it and cannot
+    // vouch for how cleanly the earlier attempt walked it.
+    const res = await filesystemPhase.run(ctx(
+      { pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }]) },
+      { completedRoots: [root] },
+    ))
+    expect(res.counts.pruned).toBe(0)
+    expect(db.prepare('SELECT COUNT(*) c FROM fs_entries WHERE library_root = ?').get(removed)).toEqual({ c: 1 })
+  })
 })
 
 describe('qbittorrentPhase', () => {
@@ -219,6 +417,100 @@ describe('qbittorrentPhase', () => {
     const res = await qbittorrentPhase.run(c)
     expect(res.status).toBe('skipped')
   })
+
+  const torrent = (hash: string, over: Record<string, unknown> = {}) => ({
+    hash, name: hash, savePath: '/downloads', contentPath: `/downloads/${hash}`,
+    category: null, tags: [], state: 'downloading', ratio: 1, seedingTimeSeconds: 1,
+    isPrivate: false, trackerHost: 'x', sizeBytes: 1, progress: 0.5, ...over,
+  })
+
+  const seedTorrentRow = (hash: string) => {
+    db.prepare("INSERT INTO torrents (hash, fetched_at, name, state) VALUES (?, 'long-ago', ?, 'stalledUP')").run(hash, hash)
+    db.prepare('INSERT INTO torrent_files (hash, file_index, rel_path) VALUES (?,?,?)').run(hash, 0, 'a.mkv')
+  }
+
+  it('does not sweep when cancelled mid-iteration', async () => {
+    // The rows this pass never reached are unobserved, not gone. Sweeping them takes the
+    // cross-seed correlation with them, which is what a later delete guard reads.
+    seedTorrentRow('OLD')
+    const controller = new AbortController()
+    const c = ctx({
+      pathMap: createPathMap([{ role: 'download', jellyfin: null, container: join(dir, 'dl'), qbit: '/downloads' }]),
+      qbittorrent: {
+        torrents: async () => [torrent('H1'), torrent('H2')],
+        files: async () => { controller.abort(); return [] },
+      } as never,
+    }, {}, { signal: controller.signal })
+
+    const res = await qbittorrentPhase.run(c)
+    expect(res.status).toBe('cancelled')
+    // H1 was written before the abort; OLD survives untouched because nothing was swept.
+    expect(db.prepare("SELECT COUNT(*) c FROM torrents WHERE hash = 'OLD'").get()).toEqual({ c: 1 })
+    expect(db.prepare("SELECT COUNT(*) c FROM torrent_files WHERE hash = 'OLD'").get()).toEqual({ c: 1 })
+  })
+
+  it('sweeps torrents that vanished once a full pass completes', async () => {
+    seedTorrentRow('OLD')
+    const c = ctx({
+      pathMap: createPathMap([{ role: 'download', jellyfin: null, container: join(dir, 'dl'), qbit: '/downloads' }]),
+      qbittorrent: { torrents: async () => [torrent('H1')], files: async () => [] } as never,
+    })
+    const res = await qbittorrentPhase.run(c)
+    expect(res.status).toBe('completed')
+    expect(res.counts.stale).toBe(1)
+    expect(db.prepare("SELECT COUNT(*) c FROM torrents WHERE hash = 'OLD'").get()).toEqual({ c: 0 })
+    expect(db.prepare("SELECT COUNT(*) c FROM torrent_files WHERE hash = 'OLD'").get()).toEqual({ c: 0 })
+  })
+
+  it('records a files fetch failure in files_error and leaves state verbatim', async () => {
+    // state is what Plan 4's guard.protected matches against a set of busy states, blocking with
+    // no override. A decorated string ("downloading (files unavailable: …)") fails that
+    // membership test, so the guard would open — and only ever when qBittorrent is flaky.
+    const c = ctx({
+      qbittorrent: {
+        torrents: async () => [torrent('H1', { state: 'downloading' })],
+        files: async () => { throw Object.assign(new Error('timeout'), { kind: 'timeout' }) },
+      } as never,
+    })
+    await qbittorrentPhase.run(c)
+    const row = db.prepare('SELECT state, files_error FROM torrents WHERE hash = ?').get('H1') as
+      { state: string; files_error: string | null }
+    expect(row.state).toBe('downloading')
+    expect(row.files_error).toMatch(/timeout/)
+  })
+
+  it('replaces a torrent file list rather than merging it, so a shrunken torrent keeps no phantom links', async () => {
+    // A leftover (hash → dev, inode) row makes a confirmed cross-seed expand a delete onto a
+    // torrent that no longer holds the file.
+    const c1 = ctx({
+      qbittorrent: {
+        torrents: async () => [torrent('H1')],
+        files: async () => [{ index: 0, relPath: 'a.mkv', sizeBytes: 1 }, { index: 1, relPath: 'b.mkv', sizeBytes: 1 }],
+      } as never,
+    })
+    await qbittorrentPhase.run(c1)
+    expect(db.prepare('SELECT COUNT(*) c FROM torrent_files WHERE hash = ?').get('H1')).toEqual({ c: 2 })
+
+    const c2 = ctx({
+      qbittorrent: {
+        torrents: async () => [torrent('H1')],
+        files: async () => [{ index: 0, relPath: 'a.mkv', sizeBytes: 1 }],
+      } as never,
+    })
+    await qbittorrentPhase.run(c2)
+    const rows = db.prepare('SELECT rel_path FROM torrent_files WHERE hash = ?').all('H1') as Array<{ rel_path: string }>
+    expect(rows.map((r) => r.rel_path)).toEqual(['a.mkv'])
+  })
+
+  it('counts paths it could not translate instead of leaving a silent NULL', async () => {
+    const c = ctx({
+      pathMap: createPathMap([]), // no mapping covers /downloads at all
+      qbittorrent: { torrents: async () => [torrent('H1')], files: async () => [] } as never,
+    })
+    const res = await qbittorrentPhase.run(c)
+    // Once for contentPath, once for savePath — both untranslatable.
+    expect(res.counts.unmapped).toBe(2)
+  })
 })
 
 describe('arrPhase', () => {
@@ -236,5 +528,21 @@ describe('arrPhase', () => {
     const res = await arrPhase.run(c)
     expect(res.status).toBe('completed')
     expect(db.prepare('SELECT COUNT(*) c FROM arr_records').get()).toEqual({ c: 2 })
+  })
+
+  it('writes NULL — not the raw *arr path — when the path cannot be translated, and counts it', async () => {
+    // container_path is the join key to fs_entries and jellyfin_items. An *arr-side path parked
+    // in it looks authoritative and joins to nothing, so the record silently stops describing
+    // the file it names.
+    const c = ctx({
+      pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: '/mnt/m', qbit: null }]),
+      radarr: { inventory: async () => [{ kind: 'radarr', instance: 'radarr', remoteId: 1, title: 'Heat', arrPath: '/movies/Heat.mkv', monitored: true, seriesId: null, episodeId: null, episodeFileId: null }] } as never,
+    })
+    const res = await arrPhase.run(c)
+    expect(res.counts.unmapped).toBe(1)
+    const row = db.prepare('SELECT arr_path, container_path FROM arr_records').get() as
+      { arr_path: string; container_path: string | null }
+    expect(row.arr_path).toBe('/movies/Heat.mkv')
+    expect(row.container_path).toBeNull()
   })
 })

@@ -3,7 +3,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { openDb, type Db } from '../../src/index/db.js'
-import { runScan, latestScan, pruneOldScans } from '../../src/scan/orchestrator.js'
+import { runScan, latestScan, pruneOldScans, reconcileInterruptedScans, failRunningScan } from '../../src/scan/orchestrator.js'
 import { createPathMap } from '../../src/fs/pathmap.js'
 import { fileConfigSchema } from '../../src/config/schema.js'
 import type { Phase } from '../../src/scan/phases/types.js'
@@ -98,6 +98,38 @@ describe('runScan', () => {
       phases: [fakePhase('jellyfin', async (ctx) => { ctx.progress(5, 10); return { status: 'completed', counts: {} } })],
     })
     expect(seen).toContainEqual({ phase: 'jellyfin', done: 5 })
+  })
+})
+
+describe('reconcileInterruptedScans', () => {
+  // The runner's safety net covers a worker dying inside a live process. Nothing covered the
+  // process itself dying: a container restart mid-scan left scans.status='running' forever, while
+  // isRunning() correctly reported false — a scan that can never finish and never fails.
+  it('fails a scan still marked running at startup, and says why', () => {
+    db.prepare("INSERT INTO scans (id, started_at, status) VALUES (1, 't', 'running')").run()
+    expect(reconcileInterruptedScans(db)).toBe(1)
+    const row = db.prepare('SELECT status, error, finished_at FROM scans WHERE id = 1').get() as
+      { status: string; error: string; finished_at: string | null }
+    expect(row.status).toBe('failed')
+    expect(row.error).toMatch(/restart/i)
+    expect(row.finished_at).toBeTruthy()
+  })
+
+  it('leaves scans that already reached a terminal state alone', () => {
+    db.prepare("INSERT INTO scans (id, started_at, finished_at, status) VALUES (1, 't', 't', 'completed')").run()
+    db.prepare("INSERT INTO scans (id, started_at, finished_at, status) VALUES (2, 't', 't', 'cancelled')").run()
+    expect(reconcileInterruptedScans(db)).toBe(0)
+    const statuses = (db.prepare('SELECT status FROM scans ORDER BY id').all() as Array<{ status: string }>)
+      .map((r) => r.status)
+    expect(statuses).toEqual(['completed', 'cancelled'])
+  })
+})
+
+describe('failRunningScan', () => {
+  it('only ever touches a row still marked running', () => {
+    db.prepare("INSERT INTO scans (id, started_at, finished_at, status) VALUES (1, 't', 't', 'completed')").run()
+    expect(failRunningScan(db, 1, 'should not apply')).toBe(0)
+    expect(db.prepare('SELECT status FROM scans WHERE id = 1').get()).toEqual({ status: 'completed' })
   })
 })
 

@@ -16,10 +16,11 @@ export const arrPhase: Phase = {
     ) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
 
     let written = 0
+    let unmapped = 0
     const problems: string[] = []
 
     for (const [label, client] of clients) {
-      if (ctx.signal.aborted) return { status: 'cancelled', counts: { records: written } }
+      if (ctx.signal.aborted) return { status: 'cancelled', counts: { records: written, unmapped } }
       let records
       try {
         records = await client.inventory()
@@ -32,9 +33,16 @@ export const arrPhase: Phase = {
         // in it is gone. Scoped to the instance so one *arr being down cannot wipe the other.
         ctx.db.prepare('DELETE FROM arr_records WHERE kind = ? AND instance = ?').run(label, label)
         for (const r of records) {
+          // NULL, never the raw *arr path as a stand-in. `container_path` is what joins these
+          // records to fs_entries and jellyfin_items; an *arr-side path written into it looks
+          // authoritative and joins to nothing, so the record silently stops matching the file it
+          // describes. NULL says "not translatable", which is the truth, and the tally below says
+          // how often — so a degraded map is distinguishable from an *arr with nothing in it.
+          const containerPath = r.arrPath ? ctx.deps.pathMap.toContainer(r.arrPath) : null
+          if (r.arrPath && containerPath === null) unmapped += 1
           insert.run(
             `${r.kind}:${r.instance}:${r.remoteId}`, r.kind, r.instance, r.remoteId, r.title,
-            r.arrPath, r.arrPath ? ctx.deps.pathMap.toContainer(r.arrPath) ?? r.arrPath : null,
+            r.arrPath, containerPath,
             r.monitored ? 1 : 0, r.seriesId, r.episodeId, r.episodeFileId,
           )
           written += 1
@@ -44,8 +52,8 @@ export const arrPhase: Phase = {
     }
 
     if (problems.length === clients.length) {
-      return { status: 'skipped', reason: problems.join('; '), counts: { records: written } }
+      return { status: 'skipped', reason: problems.join('; '), counts: { records: written, unmapped } }
     }
-    return { status: 'completed', counts: { records: written } }
+    return { status: 'completed', counts: { records: written, unmapped } }
   },
 }

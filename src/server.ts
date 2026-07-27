@@ -51,10 +51,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     jellyfin: deps.jellyfin,
     db: deps.db,
   })
+  // No `db` here: the path-map verification gate lives in the runner (src/scan/verification.ts),
+  // so the scheduled scan is covered by it too. This route only maps its refusal to a 412.
   registerScanRoutes(app, {
     runner: deps.scanRunner,
     sessionSecret: deps.config.env.sessionSecret,
-    db: deps.db,
   })
 
   app.setErrorHandler((err, _req, reply) => {

@@ -1,7 +1,9 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { mkdtempSync, writeFileSync, linkSync, statSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, linkSync, statSync, readFileSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import Database from 'better-sqlite3'
 import { openDb, currentSchemaVersion, type Db } from '../../src/index/db.js'
 
 const insertEntry = (db: Db, path: string) => {
@@ -118,6 +120,54 @@ describe('openDb', () => {
     first.close()
     const second = openDb(path)
     expect(currentSchemaVersion(second)).toBe(v)
+  })
+})
+
+describe('migrations', () => {
+  const MIGRATIONS_DIR = fileURLToPath(new URL('../../src/index/migrations/', import.meta.url))
+  const files = () => readdirSync(MIGRATIONS_DIR).filter((f) => f.endsWith('.sql'))
+
+  it('names every migration so that lexicographic order IS numeric order', () => {
+    // migrate() sorts filenames as strings and parses the version from the first three
+    // characters. A file named `01_x.sql` or `2_x.sql` would both mis-sort and mis-parse.
+    const names = files()
+    expect(names.length).toBeGreaterThan(1) // ordering is only meaningfully tested with several
+    for (const name of names) expect(name).toMatch(/^\d{3}_.+\.sql$/)
+    const lexicographic = [...names].sort()
+    const numeric = [...names].sort((a, b) => Number(a.slice(0, 3)) - Number(b.slice(0, 3)))
+    expect(lexicographic).toEqual(numeric)
+    // Two migrations may never claim the same version — one of them would be silently skipped.
+    const versions = names.map((n) => Number(n.slice(0, 3)))
+    expect(new Set(versions).size).toBe(versions.length)
+  })
+
+  it('applies migrations in numeric order, and applies only the ones a database is missing', () => {
+    // A database created before 002 shipped: schema at 001, with a row already in it. Opening it
+    // must apply 002 ON TOP (not re-run 001, which would throw "table already exists") and must
+    // not lose the row.
+    const path = join(dir, 'legacy.db')
+    const legacy = new Database(path)
+    legacy.exec(readFileSync(join(MIGRATIONS_DIR, '001_init.sql'), 'utf8'))
+    legacy.pragma('user_version = 1')
+    legacy.prepare("INSERT INTO torrents (hash, fetched_at, name, state) VALUES ('H1', 't', 'n', 'downloading')").run()
+    legacy.close()
+
+    const upgraded = openDb(path)
+    const highest = Math.max(...files().map((f) => Number(f.slice(0, 3))))
+    expect(currentSchemaVersion(upgraded)).toBe(highest)
+    const cols = (upgraded.prepare('PRAGMA table_info(torrents)').all() as Array<{ name: string }>).map((c) => c.name)
+    expect(cols).toContain('files_error')
+    const row = upgraded.prepare("SELECT hash, state, files_error FROM torrents WHERE hash = 'H1'").get() as
+      { hash: string; state: string; files_error: string | null }
+    expect(row.state).toBe('downloading')
+    expect(row.files_error).toBeNull()
+    upgraded.close()
+
+    // And reopening applies nothing further — no version bump, no second ALTER TABLE (which
+    // would fail outright with "duplicate column name").
+    const reopened = openDb(path)
+    expect(currentSchemaVersion(reopened)).toBe(highest)
+    expect((reopened.prepare("SELECT COUNT(*) c FROM torrents").get() as { c: number }).c).toBe(1)
   })
 
   it('round-trips a finding row', () => {

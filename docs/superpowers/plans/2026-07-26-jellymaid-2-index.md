@@ -1509,6 +1509,12 @@ export const filesystemPhase: Phase = {
       // Sweep this root's ghosts: rows written by an earlier scan that this pass did not
       // see are files that no longer exist. Leaving them makes fs.orphan-media and
       // fs.missing-file report on paths that are gone.
+      //
+      // But ONLY when the walk of this root was clean. If any part of it errored — an
+      // unopenable root, or one locked subdirectory partway down — the files under the
+      // part we could not read still exist, and sweeping their rows would make healthy
+      // files look missing. Stale rows are the safer failure: at worst they name a path
+      // that no longer exists, which the executor already treats as already-gone.
       const swept = ctx.db.prepare(
         'DELETE FROM fs_entries WHERE library_root = ? AND scan_id != ?',
       ).run(root.container, ctx.scanId).changes

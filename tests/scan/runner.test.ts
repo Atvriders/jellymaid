@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { openDb, type Db } from '../../src/index/db.js'
 import { createScanRunner } from '../../src/scan/runner.js'
+import { createScheduler } from '../../src/scan/scheduler.js'
 
 let db: Db
 let dbPath: string
@@ -28,7 +29,17 @@ function fakeWorker(body: string): URL {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
+/** Mirrors what POST /api/pathmap/verify persists. */
+function setVerification(report: { sampled: number; resolved: number; failures: unknown[] }) {
+  db.prepare("INSERT OR REPLACE INTO kv (key, value_json) VALUES ('pathmap.lastVerification', ?)")
+    .run(JSON.stringify({ ...report, at: new Date().toISOString() }))
+}
+
+const clean = () => setVerification({ sampled: 20, resolved: 20, failures: [] })
+
 describe('createScanRunner', () => {
+  beforeEach(() => { clean() })
+
   it('refuses to start a second scan while one is already running', () => {
     // Blocks the worker thread synchronously for a fixed window with no timers/handles, so it
     // exits on its own once the window elapses — no message-based cancellation needed for this
@@ -41,7 +52,7 @@ describe('createScanRunner', () => {
     expect(runner.isRunning()).toBe(true)
 
     const second = runner.start()
-    expect(second).toEqual({ error: 'a scan is already running' })
+    expect(second).toEqual({ error: 'a scan is already running', reason: 'busy' })
 
     // Only one row was ever inserted — the refused second start() must not have written its own.
     expect((db.prepare('SELECT COUNT(*) c FROM scans').get() as { c: number }).c).toBe(1)
@@ -73,6 +84,26 @@ describe('createScanRunner', () => {
     expect(runner.isRunning()).toBe(false)
   })
 
+  it('releases the mutex even when the post-exit bookkeeping throws', async () => {
+    // finish() runs inside an EventEmitter callback. A throwing UPDATE must not leave `worker`
+    // set (every future scan refused for the life of the process) and must not escape as an
+    // uncaught exception from an 'error'/'exit' handler, which would kill the whole server.
+    const workerUrl = fakeWorker(`Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50)`)
+    const exploding = {
+      prepare: (sql: string) => {
+        if (sql.startsWith('UPDATE scans')) throw new Error('database is locked')
+        return db.prepare(sql)
+      },
+    } as unknown as Db
+    const runner = createScanRunner({ db: exploding, dbPath, env: {}, workerUrl })
+    // The gate reads through the same handle, so seed it before swapping in the exploding one.
+    expect('scanId' in runner.start()).toBe(true)
+    await sleep(400)
+    expect(runner.isRunning()).toBe(false)
+    expect('scanId' in runner.start()).toBe(true)
+    await sleep(400)
+  })
+
   it('cancel() returns false when nothing is running', () => {
     const runner = createScanRunner({ db, dbPath, env: {}, workerUrl: fakeWorker('') })
     expect(runner.cancel()).toBe(false)
@@ -96,5 +127,70 @@ describe('createScanRunner', () => {
     expect(runner.cancel()).toBe(true)
     await sleep(300)
     expect(runner.isRunning()).toBe(false)
+  })
+})
+
+describe('createScanRunner — path-map verification gate', () => {
+  // Spec §11: a scan must not run against an unverified path map. The gate lives here rather
+  // than in the HTTP route because the nightly scheduled scan — the default and dominant path —
+  // calls start() directly and never touches Fastify.
+  const runner = () => createScanRunner({
+    db, dbPath, env: {}, workerUrl: fakeWorker(`Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50)`),
+  })
+
+  it('refuses, and spawns nothing, when verification has never been run', () => {
+    const result = runner().start()
+    expect(result).toEqual({ error: expect.stringMatching(/verif/i), reason: 'unverified' })
+    // A refused start leaves no trace: no scans row, so no half-started scan to reconcile later.
+    expect((db.prepare('SELECT COUNT(*) c FROM scans').get() as { c: number }).c).toBe(0)
+  })
+
+  it('refuses when the last verification had failures', () => {
+    setVerification({ sampled: 20, resolved: 12, failures: [{ jellyfinPath: '/media/x.mkv', reason: 'no mapping' }] })
+    expect(runner().start()).toMatchObject({ reason: 'unverified' })
+  })
+
+  it('refuses a verification that sampled nothing at all', () => {
+    // verifyMappings returns {sampled: 0, resolved: 0, failures: []} when sampleItems() yields
+    // nothing. Every other clause reads that as a clean pass. It is not one — nothing was
+    // checked — and "couldn't check" must never score as "checked and clean" at this gate.
+    setVerification({ sampled: 0, resolved: 0, failures: [] })
+    const result = runner().start()
+    expect(result).toMatchObject({ reason: 'unverified' })
+    expect((result as { error: string }).error).toMatch(/sampled 0/i)
+  })
+
+  it('starts when the last verification was clean', async () => {
+    clean()
+    expect('scanId' in runner().start()).toBe(true)
+    await sleep(400)
+  })
+
+  it('starts anyway when the operator explicitly forces it', async () => {
+    setVerification({ sampled: 20, resolved: 0, failures: [{ jellyfinPath: '/x', reason: 'nope' }] })
+    expect('scanId' in runner().start({ force: true })).toBe(true)
+    await sleep(400)
+  })
+
+  it('gates the scheduled path too — a scheduler tick with a failing verification runs no scan', async () => {
+    // The nightly scan is the dominant path and gets NO bypass: createScheduler calls
+    // runner.start() with no options, so `force` is not something it can even express.
+    setVerification({ sampled: 20, resolved: 1, failures: [{ jellyfinPath: '/x', reason: 'nope' }] })
+    const r = runner()
+    const skipped: string[] = []
+    const scheduler = createScheduler({
+      cron: '* * * * *',
+      isRunning: () => r.isRunning(),
+      now: () => new Date('2026-07-26T03:00:01Z'),
+      run: async () => {
+        const result = r.start()
+        if ('error' in result) skipped.push(result.error)
+      },
+    })
+    expect(await scheduler.tick()).toBe('ran')
+    expect(skipped).toHaveLength(1)
+    expect(skipped[0]).toMatch(/verif/i)
+    expect(r.isRunning()).toBe(false)
+    expect((db.prepare('SELECT COUNT(*) c FROM scans').get() as { c: number }).c).toBe(0)
   })
 })

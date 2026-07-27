@@ -39,6 +39,25 @@ describe('scheduler', () => {
     expect(run).toHaveBeenCalledTimes(1)
   })
 
+  it('routes a throwing run() to onError instead of leaving an unhandled rejection on the timer', async () => {
+    // `void this.tick()` turned any throw from run() into an unhandled promise rejection on an
+    // interval timer, which Node escalates to a process crash — the whole server dying over one
+    // missed scheduled scan.
+    const errors: unknown[] = []
+    const s = createScheduler({
+      cron: '* * * * *',
+      run: async () => { throw new Error('start exploded') },
+      isRunning: () => false,
+      now: () => new Date('2026-07-26T03:00:01Z'),
+      onError: (err) => errors.push(err),
+    })
+    s.start(1)
+    await new Promise((r) => setTimeout(r, 60))
+    s.stop()
+    expect(errors.length).toBeGreaterThan(0)
+    expect((errors[0] as Error).message).toBe('start exploded')
+  })
+
   it('rejects an invalid cron expression at construction', () => {
     expect(() => createScheduler({ cron: 'not a cron', run: async () => {}, isRunning: () => false }))
       .toThrow(/cron/i)

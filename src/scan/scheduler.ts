@@ -12,6 +12,12 @@ export function createScheduler(opts: {
   run: () => Promise<void>
   isRunning: () => boolean
   now?: () => Date
+  /**
+   * Where a throw from a timer-driven tick goes. Without it, `void this.tick()` turns any
+   * failure inside `run()` into an unhandled promise rejection on an interval timer — which Node
+   * escalates to a process crash, taking the whole server down over one missed scheduled scan.
+   */
+  onError?: (err: unknown) => void
 }): Scheduler {
   const now = opts.now ?? (() => new Date())
 
@@ -66,7 +72,9 @@ export function createScheduler(opts: {
     },
     start(intervalMs = 30_000) {
       if (timer) return
-      timer = setInterval(() => { void this.tick() }, intervalMs)
+      timer = setInterval(() => {
+        this.tick().catch((err) => opts.onError?.(err))
+      }, intervalMs)
       timer.unref?.()
     },
     stop() { if (timer) { clearInterval(timer); timer = null } },

@@ -24,10 +24,15 @@ export const filesystemPhase: Phase = {
     let stale = 0
     let sweepSkipped = 0
     let anyRootWalked = false
+    // True only while EVERY configured root has been fully observed by THIS pass. A root skipped
+    // because a resume cursor already lists it counts as unobserved here: this pass cannot vouch
+    // for how cleanly the earlier attempt walked it. Gates the removed-mapping prune below, which
+    // is the one delete in this phase that is not scoped to a single root.
+    let everyRootObserved = true
 
     for (const root of roots) {
-      if (done.has(root.container)) continue
-      if (ctx.signal.aborted) return { status: 'cancelled', counts: { entries: written } }
+      if (done.has(root.container)) { everyRootObserved = false; continue }
+      if (ctx.signal.aborted) return { status: 'cancelled', counts: { entries: written, stale, errors: errors.length, sweepSkipped } }
       const shouldHash = hashedRoots.has(root.container) && ctx.deps.hasher !== null
 
       // Any error during this root's walk — top-level or a subtree partway through — means this
@@ -92,10 +97,27 @@ export const filesystemPhase: Phase = {
 
       if (!rootOpenFailed) anyRootWalked = true
 
-      if (rootHadErrors) {
-        // Do not sweep: some part of this root was not actually observed this pass, so its
-        // remaining prior-scan rows are not proven gone. Recorded, not silently dropped.
+      // THE licence to delete anything under this root. A sweep is only ever justified by a
+      // COMPLETE observation: the walk must have both run to completion and errored nowhere.
+      // Either half missing means the rows this pass did not rewrite are unobserved, not gone —
+      // and "gone" is an input to a delete decision in Plans 3-4.
+      //
+      // Cancellation needs its own term here because walkRoot terminates NORMALLY on abort (it
+      // breaks out of its loops and flushes the trailing batch; see src/fs/walker.ts), so the
+      // `for await` above exits exactly as it does on a finished walk. Without this check a
+      // cancelled scan would sweep everything the walk never reached.
+      const sweepLicensed = !rootHadErrors && !ctx.signal.aborted
+
+      if (!sweepLicensed) {
+        // Recorded, not silently dropped.
         sweepSkipped += 1
+        everyRootObserved = false
+        if (ctx.signal.aborted) {
+          // Deliberately NOT added to completedRoots: a half-walked root must be walked again
+          // from the start on resume, or it would be treated as fully observed — and swept —
+          // forever after, on the strength of a walk that only ever saw part of it.
+          return { status: 'cancelled', counts: { entries: written, stale, errors: errors.length, sweepSkipped } }
+        }
         done.add(root.container)
         ctx.saveCursor({ completedRoots: [...done] })
         continue
@@ -113,14 +135,33 @@ export const filesystemPhase: Phase = {
       ctx.saveCursor({ completedRoots: [...done] })
     }
 
+    // Rows left behind by a mapping that has since been REMOVED from the config. The per-root
+    // sweep above is scoped `WHERE library_root = ?` and only runs for roots still configured, so
+    // nothing else can ever reach them: they would describe a mount that may no longer even be
+    // attached, with a dead scan_id, indefinitely.
+    //
+    // Only safe once every configured root has been walked cleanly in this pass. Short of that we
+    // cannot tell "this mapping was removed" from "this mapping is temporarily unreadable" — and
+    // in the second case these rows are the live index for a mount that is merely down.
+    let pruned = 0
+    if (everyRootObserved) {
+      const configured = roots.map((r) => r.container)
+      const placeholders = configured.map(() => '?').join(',')
+      // library_root IS NULL is included deliberately: such a row belongs to no root, so no
+      // per-root sweep can ever reach it either.
+      pruned = ctx.db.prepare(
+        `DELETE FROM fs_entries WHERE library_root IS NULL OR library_root NOT IN (${placeholders})`,
+      ).run(...configured).changes
+    }
+
     if (!anyRootWalked && errors.length) {
       // Every configured root failed before it could even be opened — this is a total
       // filesystem-connectivity failure disguised as "nothing found" unless it says so. Name
       // every failed root so an operator knows which mount is down.
       const reason = `every configured root failed to open: ${rootOpenFailures.map((f) => `${f.path} (${f.reason})`).join('; ')}`
-      return { status: 'skipped', reason, counts: { entries: written, stale, errors: errors.length, sweepSkipped } }
+      return { status: 'skipped', reason, counts: { entries: written, stale, errors: errors.length, sweepSkipped, pruned } }
     }
 
-    return { status: 'completed', counts: { entries: written, stale, errors: errors.length, sweepSkipped } }
+    return { status: 'completed', counts: { entries: written, stale, errors: errors.length, sweepSkipped, pruned } }
   },
 }
