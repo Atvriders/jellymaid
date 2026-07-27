@@ -74,18 +74,23 @@ export async function* walkRoot(opts: WalkOptions): AsyncGenerator<FsEntry[]> {
           // row with unknown stat rather than skipping: a missing row reads as "this file
           // is gone", which would make the filesystem rules report on a healthy file.
           opts.onError?.({ path: full, reason: (err as Error).message })
+          const unknownExt = extname(dirent.name).toLowerCase() || null
           batch.push({
             containerPath: full,
             parentPath: current,
             name: dirent.name,
-            ext: extname(dirent.name).toLowerCase() || null,
+            ext: unknownExt,
             isDir: false,
             sizeBytes: 0,
             mtime: 0,
             dev: null,
             inode: null,
             nlink: null,
-            isMedia: false,
+            // The extension comes from the dirent name, not the failed lstat, so it is known
+            // even here. The row exists so an unreadable file does not read as "gone" to the
+            // filesystem rules; hardcoding isMedia false would silently drop it from every
+            // media-scoped rule anyway — exactly the failure the NULL-row design prevents.
+            isMedia: unknownExt !== null && media.has(unknownExt),
             libraryRoot: opts.root.container,
             rootRole: opts.root.role,
           })

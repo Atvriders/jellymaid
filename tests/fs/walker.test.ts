@@ -105,6 +105,24 @@ describe('walkRoot', () => {
     expect(row.nlink).toBeNull()
   })
 
+  it('flags an unstattable entry as media when its extension matches, despite the failed lstat', async () => {
+    // The row exists precisely so the file does not read as "gone" — it must not also drop out
+    // of every media-scoped rule just because the extension check happens on the error path.
+    const entries = await collect(libraryRoot(dir), {
+      onError: () => {},
+      lstatImpl: async (p: string) => {
+        if (String(p).endsWith('Heat.mkv')) throw Object.assign(new Error('EACCES'), { code: 'EACCES' })
+        return (await import('node:fs/promises')).lstat(String(p))
+      },
+    })
+    const row = entries.find((e) => e.name === 'Heat.mkv')!
+    expect(row).toBeDefined()
+    expect(row.isMedia).toBe(true)
+    expect(row.dev).toBeNull()
+    expect(row.inode).toBeNull()
+    expect(row.nlink).toBeNull()
+  })
+
   it('records an unreadable directory instead of aborting the walk', async () => {
     const locked = join(dir, 'locked')
     mkdirSync(locked)
