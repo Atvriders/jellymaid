@@ -1,4 +1,4 @@
-# Carry-forward from Plan 1
+# Carry-forward from Plans 1–2
 
 Findings that were deliberately deferred during Plan 1's task loop and its whole-branch review,
 kept here because the scratch workspace that recorded them is gone. Each says which slice should
@@ -17,6 +17,18 @@ close it. Nothing here is a known-broken behaviour today; they are traps set for
 | `/api/pathmap/detect` accepts any `mountRoots`, including `/` — one blocking `readdirSync` walk of the whole filesystem to depth 4. Admin-only, so a foot-gun rather than an attack path. | `src/api/pathmap.ts` | Plan 2 (when that route is next touched) |
 | There is no operator unlock for the login lockout — no endpoint, no file, no env escape. The username dimension holds for 60 minutes. | `src/auth/lockout.ts` | Plan 5 or 6 |
 | Sessions cannot be revoked: a captured cookie is a valid 7-day bearer token, and a demoted admin keeps authority until it expires. The signed payload now carries `isAdministrator`, which is what later routes assert, but there is no server-side kill switch. | `src/auth/session.ts` | Plan 6 |
+
+## Added by Plan 2 — must be closed by a specific slice
+
+| Item | Where | Close in |
+|---|---|---|
+| **The index-side twin of the `unmonitorByPath` three-state fix is still open.** `client.inventory()` returns a *partial* Sonarr inventory when a per-series fetch fails, and the phase then does a wholesale `DELETE FROM arr_records WHERE kind = ? AND instance = ?` and rewrites only what it got. A flaky series therefore erases its files' rows, so Plan 4 reading the INDEX (rather than calling `unmonitorByPath`) sees "no \*arr record" and reads it as not-managed — the delete proceeds without unmonitoring and the \*arr re-downloads. `load()` already computes a `complete` flag; it just is not plumbed out through `inventory()`. | `src/connectors/arr.ts`, `src/scan/phases/arr.ts:33` | **Before Plan 4 executes** |
+| **Plan 4's document still shows the old `{ unmonitored, recordId }` return shape** at two places; the connector now returns `{ outcome: 'unmonitored' \| 'not-managed' \| 'lookup-failed'; recordId }`. If Plan 4's test doubles are cast, the mismatch compiles silently and `outcome` reads `undefined` — which fails closed, so the risk is a confusing skip rather than a wrong delete. | `docs/…-4-actions.md` | Plan 4, first task |
+| **A fourth unmonitor failure path exists**: the unmonitor `PUT` itself throwing. That is fail-closed only if the executor wraps the call. State it in Plan 4's contract. | `src/connectors/arr.ts` | Plan 4 |
+| **Jellyfin's sweep licence is measured by resume-inclusive `startIndex`, not rows written.** If items are removed from Jellyfin *below* the cursor offset between a cancel and a resume, the shifted-down items are observed by neither attempt, `startIndex >= total` still holds, and their rows are swept. Cheap fix: persist `total` in the cursor and refuse the sweep when the current `total` is lower than the recorded one. (The same paging skew exists within a single uninterrupted pass, so this is a tightening, not a regression.) | `src/scan/phases/jellyfin.ts` | Plan 3 |
+| **`quick_hash IS NULL` conflates three states** — hashing off for the root, unstattable, and hash threw. SQLite's `GROUP BY` treats NULLs as *equal*, so a naive `dupe.identical-file` grouping would cluster every unhashed same-size file as an exact duplicate. Filter on `quick_hash IS NOT NULL` explicitly. | `src/rules/dupes/` | **Plan 3** |
+| A synchronous throw from `new Worker(...)` leaves the just-inserted `scans` row at `running` with no worker; healed only by the boot reconcile. | `src/scan/runner.ts` | Plan 6 |
+| `/healthz` still reports only Jellyfin though four connectors now exist. | `src/api/health.ts` | Plan 6 (already in its Task 1) |
 
 ## Known limits, accepted
 
