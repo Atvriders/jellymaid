@@ -151,4 +151,50 @@ describe('HttpClient', () => {
       expect(sorted[i]! - sorted[i - 1]!).toBeGreaterThanOrEqual(15)
     }
   })
+
+  describe('caller-supplied signal (cancellation)', () => {
+    it('fails immediately with kind cancelled and never calls fetch when the signal is already aborted', async () => {
+      const controller = new AbortController()
+      controller.abort()
+      const f = vi.fn(async () => new Response('{}', { status: 200 }))
+      const err = (await client(f as unknown as typeof fetch, { signal: controller.signal })
+        .request('/a').catch((e) => e)) as ConnectorError
+      expect(err).toBeInstanceOf(ConnectorError)
+      expect(err.kind).toBe('cancelled')
+      expect(f).not.toHaveBeenCalled()
+    })
+
+    it('rejects with kind cancelled when the caller aborts a request already in flight', async () => {
+      const controller = new AbortController()
+      const f = vi.fn((_u: string, init?: RequestInit) => new Promise<Response>((_res, rej) => {
+        init?.signal?.addEventListener('abort', () => rej(new DOMException('aborted', 'AbortError')))
+      }))
+      const promise = client(f as unknown as typeof fetch, { signal: controller.signal, maxRetries: 2 }).request('/a')
+      queueMicrotask(() => controller.abort())
+      const err = (await promise.catch((e) => e)) as ConnectorError
+      expect(err.kind).toBe('cancelled')
+    })
+
+    it('does NOT retry once the caller cancels, even for an idempotent method with retries configured', async () => {
+      const controller = new AbortController()
+      const f = vi.fn((_u: string, init?: RequestInit) => new Promise<Response>((_res, rej) => {
+        init?.signal?.addEventListener('abort', () => rej(new DOMException('aborted', 'AbortError')))
+      }))
+      const promise = client(f as unknown as typeof fetch, { signal: controller.signal, maxRetries: 2 }).request('/a')
+      queueMicrotask(() => controller.abort())
+      await promise.catch(() => undefined)
+      expect(f).toHaveBeenCalledTimes(1)
+    })
+
+    it('still classifies the internal per-request timeout as timeout, not cancelled, when a client signal is present but not aborted', async () => {
+      const controller = new AbortController()
+      const f = vi.fn((_u: string, init?: RequestInit) => new Promise<Response>((_res, rej) => {
+        init?.signal?.addEventListener('abort', () => rej(new DOMException('aborted', 'AbortError')))
+      }))
+      const err = (await client(f as unknown as typeof fetch, { signal: controller.signal, maxRetries: 0 })
+        .request('/a').catch((e) => e)) as ConnectorError
+      expect(err.kind).toBe('timeout')
+      expect(controller.signal.aborted).toBe(false)
+    })
+  })
 })

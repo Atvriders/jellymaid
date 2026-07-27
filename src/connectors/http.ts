@@ -1,4 +1,4 @@
-export type ConnectorErrorKind = 'unreachable' | 'auth' | 'rate-limited' | 'bad-response' | 'timeout'
+export type ConnectorErrorKind = 'unreachable' | 'auth' | 'rate-limited' | 'bad-response' | 'timeout' | 'cancelled'
 
 export class ConnectorError extends Error {
   constructor(
@@ -22,6 +22,14 @@ export interface HttpClientOptions {
   timeoutMs?: number
   defaultHeaders?: Record<string, string>
   fetchImpl?: typeof fetch
+  /**
+   * One signal for the client's whole lifetime — held by the caller (the scan worker, for the
+   * life of a scan), not created per-request. Aborting it interrupts whichever request is
+   * currently in flight and fails every request made afterwards immediately, without spending a
+   * retry: cancellation is a caller decision, not evidence the target is unreachable, and
+   * retrying a request the operator told to stop would defeat the point of cancelling.
+   */
+  signal?: AbortSignal
 }
 
 export interface HttpRequestInit extends RequestInit {
@@ -92,9 +100,17 @@ export class HttpClient {
     let lastError: ConnectorError | null = null
 
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+      // Checked before every attempt — the first, and again after each retry's backoff sleep —
+      // so a caller cancellation is honoured without ever calling fetch once the caller has
+      // said stop, and without spending one of the request's retries on a dead cause.
+      if (this.opts.signal?.aborted) {
+        throw new ConnectorError('cancelled', this.opts.service, 'request was cancelled')
+      }
       await this.gate.acquire()
       const controller = new AbortController()
       const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs ?? 30_000)
+      const onCallerAbort = () => controller.abort()
+      this.opts.signal?.addEventListener('abort', onCallerAbort)
       try {
         const res = await this.fetchImpl(url, {
           ...fetchInit,
@@ -130,12 +146,20 @@ export class HttpClient {
           if (err.kind === 'auth' || err.kind === 'bad-response') throw err
           lastError = err
         } else if ((err as Error).name === 'AbortError') {
+          // Our own per-attempt deadline and the caller's signal both abort the same internal
+          // AbortController, so they surface identically as AbortError here — the caller
+          // signal's aborted flag is what tells apart "the operator cancelled" (not retried)
+          // from "the deadline elapsed" (retried, same as any other transient failure).
+          if (this.opts.signal?.aborted) {
+            throw new ConnectorError('cancelled', this.opts.service, 'request was cancelled')
+          }
           lastError = new ConnectorError('timeout', this.opts.service, `no response in ${this.opts.timeoutMs ?? 30_000}ms`)
         } else {
           lastError = new ConnectorError('unreachable', this.opts.service, (err as Error).message)
         }
       } finally {
         clearTimeout(timer)
+        this.opts.signal?.removeEventListener('abort', onCallerAbort)
         this.gate.release()
       }
       if (attempt < maxRetries) await sleep(backoffBase * 2 ** attempt)
