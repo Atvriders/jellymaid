@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { mkdtempSync, writeFileSync, statSync, rmSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, statSync, rmSync, truncateSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { openDb } from '../../src/index/db.js'
@@ -64,14 +64,20 @@ describe('quickHash', () => {
 
   it('produces a different digest when a short read occurs than a full read of the same declared size', async () => {
     const a = join(dir, 'a.mkv')
-    writeFileSync(a, 'x'.repeat(5000))
+    writeFileSync(a, 'x'.repeat(10000))
     const db = openDb(join(dir, 'db.sqlite'))
     const h = createHasher(db)
+    // Hash the 10000-byte file with correct declared size
     const fullKey = statOf(a)
+    expect(fullKey.size).toBe(10000)
     const fullHash = await h.quickHash(a, fullKey)
-    // Hash again with declared size larger than actual — the read comes up short
-    const shortKey = { ...fullKey, size: 10000 }
+    // Truncate the file to 5000 bytes on disk, but keep declared size as 10000
+    // This forces the read to come up short (5000 vs 10000 declared)
+    truncateSync(a, 5000)
+    // Use different mtime/ctime to avoid cache hit
+    const shortKey = { ...fullKey, size: 10000, mtime: fullKey.mtime + 1, ctime: fullKey.ctime + 1 }
     const shortHash = await h.quickHash(a, shortKey)
+    // Short read (5000 actual bytes, 10000 declared) should produce different digest than full read
     expect(shortHash).not.toBe(fullHash)
   })
 
@@ -85,9 +91,37 @@ describe('quickHash', () => {
     // Delete and rewrite with different content, then hash with original stat but different ctime
     rmSync(a)
     writeFileSync(a, 'w'.repeat(1000))
-    const stat2 = statOf(a)
     const second = await h.quickHash(a, { ...stat1, ctime: stat1.ctime + 1 })
     // Different ctime means cache miss; recompute with new content produces different hash
     expect(second).not.toBe(first)
+  })
+
+  it('upgrades old 4-column schema to 5-column schema with ctime', async () => {
+    const a = join(dir, 'a.mkv')
+    writeFileSync(a, 'x'.repeat(5000))
+    const db = openDb(join(dir, 'db.sqlite'))
+    // Manually create old schema with 4 columns (no ctime)
+    db.exec(`CREATE TABLE quick_hash_cache (
+      dev INTEGER NOT NULL, inode INTEGER NOT NULL, mtime INTEGER NOT NULL,
+      size INTEGER NOT NULL, hash TEXT NOT NULL,
+      PRIMARY KEY (dev, inode, mtime, size))`)
+    // Insert a row with old schema
+    db.prepare('INSERT INTO quick_hash_cache (dev,inode,mtime,size,hash) VALUES (?,?,?,?,?)')
+      .run(1, 2, 3000, 5000, 'old_hash_value')
+    // Now call createHasher, which should detect old schema and upgrade it
+    const h = createHasher(db)
+    // Verify ctime column exists by checking table info
+    const info = db.prepare('PRAGMA table_info(quick_hash_cache)').all() as Array<{ name: string }>
+    const columnNames = info.map(col => col.name)
+    expect(columnNames).toContain('ctime')
+    expect(columnNames).toContain('dev')
+    expect(columnNames).toContain('inode')
+    expect(columnNames).toContain('mtime')
+    expect(columnNames).toContain('size')
+    expect(columnNames).toContain('hash')
+    // Verify quickHash works
+    const stat = statOf(a)
+    const digest = await h.quickHash(a, stat)
+    expect(digest).toHaveLength(32)
   })
 })

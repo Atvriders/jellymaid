@@ -15,6 +15,20 @@ export function createHasher(db: Db) {
     dev INTEGER NOT NULL, inode INTEGER NOT NULL, mtime INTEGER NOT NULL, ctime INTEGER NOT NULL,
     size INTEGER NOT NULL, hash TEXT NOT NULL,
     PRIMARY KEY (dev, inode, mtime, ctime, size))`)
+
+  // Schema migration: if the table exists with old 4-column key (no ctime), drop and recreate it.
+  // This is safe because quick_hash_cache is a derived cache; the next scan will recompute any
+  // hashes that were cached.
+  const columns = db.prepare('PRAGMA table_info(quick_hash_cache)').all() as Array<{ name: string }>
+  const columnNames = columns.map(col => col.name)
+  if (!columnNames.includes('ctime')) {
+    db.exec('DROP TABLE quick_hash_cache')
+    db.exec(`CREATE TABLE quick_hash_cache (
+      dev INTEGER NOT NULL, inode INTEGER NOT NULL, mtime INTEGER NOT NULL, ctime INTEGER NOT NULL,
+      size INTEGER NOT NULL, hash TEXT NOT NULL,
+      PRIMARY KEY (dev, inode, mtime, ctime, size))`)
+  }
+
   const get = db.prepare('SELECT hash FROM quick_hash_cache WHERE dev=? AND inode=? AND mtime=? AND ctime=? AND size=?')
   const put = db.prepare('INSERT OR REPLACE INTO quick_hash_cache (dev,inode,mtime,ctime,size,hash) VALUES (?,?,?,?,?,?)')
 
