@@ -62,23 +62,25 @@ describe('quickHash', () => {
     expect(after).not.toBe(before)
   })
 
-  it('produces a different digest when a short read occurs than a full read of the same declared size', async () => {
-    const a = join(dir, 'a.mkv')
-    writeFileSync(a, 'x'.repeat(10000))
+  it('distinguishes short-read files from literal-null files via byte-count mixing', async () => {
     const db = openDb(join(dir, 'db.sqlite'))
     const h = createHasher(db)
-    // Hash the 10000-byte file with correct declared size
-    const fullKey = statOf(a)
-    expect(fullKey.size).toBe(10000)
-    const fullHash = await h.quickHash(a, fullKey)
-    // Truncate the file to 5000 bytes on disk, but keep declared size as 10000
-    // This forces the read to come up short (5000 vs 10000 declared)
-    truncateSync(a, 5000)
-    // Use different mtime/ctime to avoid cache hit
-    const shortKey = { ...fullKey, size: 10000, mtime: fullKey.mtime + 1, ctime: fullKey.ctime + 1 }
-    const shortHash = await h.quickHash(a, shortKey)
-    // Short read (5000 actual bytes, 10000 declared) should produce different digest than full read
-    expect(shortHash).not.toBe(fullHash)
+    // File A: 5000 bytes of 'x' on disk, hashed with declared size 10000
+    // Read comes up short, old code zero-fills: 'x'*5000 + NUL*5000
+    const a = join(dir, 'a.mkv')
+    writeFileSync(a, 'x'.repeat(5000))
+    const keyA = { ...statOf(a), size: 10000 }
+    const hashA = await h.quickHash(a, keyA)
+    // File B: genuinely 10000 bytes = 'x'*5000 + NUL*5000 on disk
+    // Read gets all 10000: 'x'*5000 + NUL*5000
+    const b = join(dir, 'b.mkv')
+    writeFileSync(b, Buffer.concat([Buffer.alloc(5000, 0x78), Buffer.alloc(5000, 0)]))
+    const keyB = statOf(b)
+    expect(keyB.size).toBe(10000)
+    const hashB = await h.quickHash(b, keyB)
+    // Pre-fix code hashes identical buffers → identical digests (REGRESSION)
+    // Post-fix code mixes byte counts: A mixes 5000, B mixes 10000 → different digests
+    expect(hashA).not.toBe(hashB)
   })
 
   it('recomputes when only ctime changes', async () => {
