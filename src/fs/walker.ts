@@ -22,6 +22,15 @@ export interface FsEntry {
   dev: number | null
   inode: number | null
   nlink: number | null
+  /**
+   * In-memory only — there is no `ctime` column in `fs_entries`; this exists solely to hand the
+   * hasher a complete cache key. `ctime` catches a rewrite that preserves `mtime`, which both
+   * `rsync` and `cp -p` do (they restore the source's mtime on the new inode's content). Without
+   * it, a same-size same-mtime rewrite would key identically in `quick_hash_cache` and serve a
+   * stale hash forever. NULL when the entry could not be stat'd, for the same reason dev/inode
+   * are NULL rather than 0: an unstattable file cannot be hashed at all.
+   */
+  ctime: number | null
   isMedia: boolean
   libraryRoot: string
   rootRole: PathRole
@@ -86,6 +95,7 @@ export async function* walkRoot(opts: WalkOptions): AsyncGenerator<FsEntry[]> {
             dev: null,
             inode: null,
             nlink: null,
+            ctime: null,
             // The extension comes from the dirent name, not the failed lstat, so it is known
             // even here. The row exists so an unreadable file does not read as "gone" to the
             // filesystem rules; hardcoding isMedia false would silently drop it from every
@@ -112,10 +122,13 @@ export async function* walkRoot(opts: WalkOptions): AsyncGenerator<FsEntry[]> {
           ext,
           isDir,
           sizeBytes: isDir ? 0 : st.size,
-          mtime: Math.floor(st.mtimeMs),
+          // Not floored: sub-millisecond resolution, where the filesystem provides it, is what
+          // keeps a same-size rewrite from keying identically to the original in the hash cache.
+          mtime: st.mtimeMs,
           dev: Number(st.dev),
           inode: Number(st.ino),
           nlink: st.nlink,
+          ctime: st.ctimeMs,
           isMedia: !isDir && ext !== null && media.has(ext),
           libraryRoot: opts.root.container,
           rootRole: opts.root.role,
