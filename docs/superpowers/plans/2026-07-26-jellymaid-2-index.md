@@ -232,6 +232,11 @@ export interface FsEntry {
   dev: number | null
   inode: number | null
   nlink: number | null
+  /**
+   * Carried in memory for the quick-hash cache key only — there is no ctime column in
+   * fs_entries. It catches a rewrite that preserved mtime, which rsync and `cp -p` both do.
+   */
+  ctime: number | null
   isMedia: boolean
   libraryRoot: string
   rootRole: PathRole
@@ -289,7 +294,11 @@ export async function* walkRoot(opts: WalkOptions): AsyncGenerator<FsEntry[]> {
             dev: null,
             inode: null,
             nlink: null,
-            isMedia: false,
+            ctime: null,
+            // Derived from the name, which the failed lstat tells us nothing about. Leaving
+            // this false would make an unreadable Movie.mkv invisible to every media rule —
+            // the exact disappearance this row exists to prevent.
+            isMedia: extname(dirent.name).toLowerCase() !== '' && media.has(extname(dirent.name).toLowerCase()),
             libraryRoot: opts.root.container,
             rootRole: opts.root.role,
           })
@@ -311,7 +320,10 @@ export async function* walkRoot(opts: WalkOptions): AsyncGenerator<FsEntry[]> {
           ext,
           isDir,
           sizeBytes: isDir ? 0 : st.size,
-          mtime: Math.floor(st.mtimeMs),
+          // Not floored: sub-millisecond resolution, where the filesystem provides it,
+          // is what keeps a same-size rewrite from keying identically in the hash cache.
+          mtime: st.mtimeMs,
+          ctime: st.ctimeMs,
           dev: Number(st.dev),
           inode: Number(st.ino),
           nlink: st.nlink,
@@ -654,6 +666,8 @@ export interface Torrent {
   ratio: number
   seedingTimeSeconds: number
   isPrivate: boolean
+  /** How `isPrivate` was decided, so a guard can explain an otherwise mysterious block. */
+  privacySource: 'flag' | 'host-list' | 'undetermined'
   trackerHost: string | null
   sizeBytes: number
   progress: number
@@ -733,11 +747,23 @@ export function createQbitClient(opts: QbitClientOptions): QbitClient {
     return { ...init, credentials: 'include', headers: { ...(init.headers as Record<string, string>), Referer: opts.url } }
   }
 
-  function isPrivate(raw: RawTorrent, host: string | null): boolean {
-    if (typeof raw.private === 'boolean') return raw.private
-    if (host && privateHosts.has(host.toLowerCase())) return true
-    if (!host) return true // undeterminable → treat as private
-    return false
+  /**
+   * Fail-safe. Privacy is only ESTABLISHED two ways: qBittorrent reporting the flag
+   * (determinative in both directions), or a match on the operator's private-host list.
+   * Anything else is undetermined, and undetermined means private — a blocked delete is
+   * recoverable, a hit-and-run on a private tracker is not.
+   *
+   * The consequence is deliberate: on a qBittorrent old enough not to report `private`,
+   * every unlisted torrent counts as private and the ratio minimums apply to all of them.
+   * `privacySource` is carried so the guard can say why, instead of blocking mysteriously.
+   */
+  function classifyPrivacy(raw: RawTorrent, host: string | null): {
+    isPrivate: boolean
+    privacySource: 'flag' | 'host-list' | 'undetermined'
+  } {
+    if (typeof raw.private === 'boolean') return { isPrivate: raw.private, privacySource: 'flag' }
+    if (host && privateHosts.has(host.toLowerCase())) return { isPrivate: true, privacySource: 'host-list' }
+    return { isPrivate: true, privacySource: 'undetermined' }
   }
 
   return {
@@ -953,6 +979,14 @@ export interface ArrClientOptions {
   minDelayMs: number
   instance?: string
   fetchImpl?: typeof fetch
+  /**
+   * Called when a series is skipped because its fetch failed. Sonarr's inventory is
+   * N+1 by nature, and one flaky series must not abort the whole library — but a
+   * quietly incomplete inventory is worse than a loud failure, because a missing
+   * record means a file gets deleted without being unmonitored and the *arr
+   * re-downloads it. The scan phase wires this to the logger and its own counts.
+   */
+  onProblem?: (message: string) => void
 }
 
 export interface ArrClient {
@@ -1451,8 +1485,9 @@ export const filesystemPhase: Phase = {
             let hash: string | null = null
             if (shouldHash && e.isMedia && ctx.deps.hasher) {
               try {
-                hash = await ctx.deps.hasher.quickHash(e.containerPath, {
-                  dev: e.dev, inode: e.inode, mtime: e.mtime, size: e.sizeBytes,
+                // Only hashable when the stat succeeded — an unknown inode cannot key a cache.
+                hash = e.dev === null || e.inode === null ? null : await ctx.deps.hasher.quickHash(e.containerPath, {
+                  dev: e.dev, inode: e.inode, mtime: e.mtime, ctime: e.ctime ?? 0, size: e.sizeBytes,
                 })
               } catch (err) {
                 errors.push({ path: e.containerPath, reason: describeError(err) })
@@ -1583,6 +1618,10 @@ export const arrPhase: Phase = {
 
     let written = 0
     const problems: string[] = []
+    // Series skipped inside an inventory are surfaced through the client's onProblem
+    // callback, which the worker wires to this same array — a partial inventory must
+    // never look like a complete one.
+    let skipped = 0
 
     for (const [label, client] of clients) {
       if (ctx.signal.aborted) return { status: 'cancelled', counts: { records: written } }
@@ -1612,7 +1651,7 @@ export const arrPhase: Phase = {
     if (problems.length === clients.length) {
       return { status: 'skipped', reason: problems.join('; '), counts: { records: written } }
     }
-    return { status: 'completed', counts: { records: written } }
+    return { status: 'completed', counts: { records: written, skipped } }
   },
 }
 ```

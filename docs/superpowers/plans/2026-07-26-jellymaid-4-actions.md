@@ -559,6 +559,10 @@ function privateRatio(r: Resolution, config: FileConfig): GuardVerdict {
     hash: t.hash, name: t.name, ratio: t.ratio,
     seedingDays: Number((t.seedingTimeSeconds / 86_400).toFixed(1)),
     trackerHost: t.trackerHost,
+    // Surfaced so an operator can tell "this really is a private tracker" from
+    // "qBittorrent did not report privacy, so Jellymaid assumed the worst". The second
+    // is fixed by listing the tracker in privateTrackerHosts or upgrading qBittorrent.
+    privacySource: t.privacySource,
   }))
   const reasons: string[] = []
   if (offenders.some((t) => t.ratio < config.guards.minRatio)) reasons.push(`ratio below ${config.guards.minRatio}`)
