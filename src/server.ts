@@ -4,16 +4,19 @@ import type { AppConfig } from './config/schema.js'
 import type { Db } from './index/db.js'
 import type { JellyfinClient } from './connectors/jellyfin.js'
 import type { Logger } from './core/logger.js'
+import type { ScanRunner } from './scan/runner.js'
 import { createLockout } from './auth/lockout.js'
 import { registerAuthRoutes } from './api/auth.js'
 import { registerHealthRoutes } from './api/health.js'
 import { registerPathMapRoutes } from './api/pathmap.js'
+import { registerScanRoutes } from './api/scan.js'
 
 export interface ServerDeps {
   config: AppConfig
   db: Db
   jellyfin: JellyfinClient
   logger: Logger
+  scanRunner: ScanRunner
 }
 
 export function buildServer(deps: ServerDeps): FastifyInstance {
@@ -46,6 +49,12 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     dataDir: deps.config.env.dataDir,
     sessionSecret: deps.config.env.sessionSecret,
     jellyfin: deps.jellyfin,
+    db: deps.db,
+  })
+  registerScanRoutes(app, {
+    runner: deps.scanRunner,
+    sessionSecret: deps.config.env.sessionSecret,
+    db: deps.db,
   })
 
   app.setErrorHandler((err, _req, reply) => {

@@ -24,6 +24,10 @@ function testDeps(pingImpl: () => Promise<void>) {
     db: openDb(join(dir, 'db.sqlite')),
     jellyfin: { ping: pingImpl } as never,
     logger: createLogger({ level: 'error', sink: () => {} }),
+    scanRunner: {
+      start: () => ({ scanId: 1 }), cancel: () => false, isRunning: () => false,
+      status: () => ({ running: false, scanId: null, phase: null, done: 0, total: null, lastScan: null }),
+    } as never,
   }
 }
 

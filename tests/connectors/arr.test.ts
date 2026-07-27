@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { createRadarrClient, createSonarrClient } from '../../src/connectors/arr.js'
+import { ConnectorError } from '../../src/connectors/http.js'
 
 function stub(routes: Record<string, unknown>, spy?: (url: string, init?: RequestInit) => void) {
   return (async (url: string | URL, init?: RequestInit) => {
@@ -130,6 +131,33 @@ describe('sonarr', () => {
       '/api/v3/episode': [{ id: 500, seriesId: 9, episodeFileId: 77, monitored: true, title: 'Pilot' }],
     })
     await expect(createSonarrClient(base(f)).inventory()).rejects.toThrow(TypeError)
+  })
+})
+
+describe('cancellation', () => {
+  // The worker holds one AbortController for the whole scan and hands its signal to every
+  // connector (see src/scan/worker.ts). Without this forwarding, cancelling a scan would still
+  // wait out whatever request each connector had in flight.
+  it('radarr forwards the caller-supplied signal to the underlying http client', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    let calls = 0
+    const f = (async () => { calls += 1; return new Response('[]', { status: 200 }) }) as unknown as typeof fetch
+    const err = await createRadarrClient({ ...base(f), signal: controller.signal }).ping().catch((e) => e)
+    expect(err).toBeInstanceOf(ConnectorError)
+    expect((err as ConnectorError).kind).toBe('cancelled')
+    expect(calls).toBe(0)
+  })
+
+  it('sonarr forwards the caller-supplied signal to the underlying http client', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    let calls = 0
+    const f = (async () => { calls += 1; return new Response('[]', { status: 200 }) }) as unknown as typeof fetch
+    const err = await createSonarrClient({ ...base(f), signal: controller.signal }).ping().catch((e) => e)
+    expect(err).toBeInstanceOf(ConnectorError)
+    expect((err as ConnectorError).kind).toBe('cancelled')
+    expect(calls).toBe(0)
   })
 })
 

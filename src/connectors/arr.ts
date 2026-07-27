@@ -19,6 +19,8 @@ export interface ArrClientOptions {
   minDelayMs: number
   instance?: string
   fetchImpl?: typeof fetch
+  /** Held by the caller for the client's whole lifetime; see HttpClientOptions.signal. */
+  signal?: AbortSignal
   /**
    * Called once per unit of work skipped due to a connector failure — currently just a Sonarr
    * series whose per-series fetch failed. A partial inventory must never be silently
@@ -44,6 +46,7 @@ function makeHttp(opts: ArrClientOptions, service: string) {
     minDelayMs: opts.minDelayMs,
     defaultHeaders: { 'X-Api-Key': opts.apiKey, 'Content-Type': 'application/json' },
     fetchImpl: opts.fetchImpl,
+    signal: opts.signal,
   })
 }
 

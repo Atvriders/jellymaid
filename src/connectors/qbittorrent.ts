@@ -38,6 +38,8 @@ export interface QbitClientOptions {
   minDelayMs: number
   privateTrackerHosts: string[]
   fetchImpl?: typeof fetch
+  /** Held by the caller for the client's whole lifetime; see HttpClientOptions.signal. */
+  signal?: AbortSignal
 }
 
 interface RawTorrent {
@@ -81,6 +83,7 @@ export function createQbitClient(opts: QbitClientOptions): QbitClient {
     concurrency: opts.concurrency,
     minDelayMs: opts.minDelayMs,
     fetchImpl: opts.fetchImpl,
+    signal: opts.signal,
   })
 
   async function login(): Promise<void> {

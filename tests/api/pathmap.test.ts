@@ -14,8 +14,18 @@ import type { JellyfinItem } from '../../src/connectors/jellyfin.js'
 
 const SECRET = 'y'.repeat(32)
 
+/** Set by app() on every call — lets tests inspect the same db the server under test is using,
+ * the same pattern tests/api/scan.test.ts uses for its own module-level `db`. */
+let db: ReturnType<typeof openDb>
+
+const fakeScanRunner = () => ({
+  start: () => ({ scanId: 1 }), cancel: () => false, isRunning: () => false,
+  status: () => ({ running: false, scanId: null, phase: null, done: 0, total: null, lastScan: null }),
+})
+
 function app(items?: (opts: { startIndex: number; limit: number }) => Promise<{ items: JellyfinItem[]; totalRecordCount: number }>) {
   const dir = mkdtempSync(join(tmpdir(), 'jm-pmapi-'))
+  db = openDb(join(dir, 'db.sqlite'))
   return buildServer({
     config: {
       env: {
@@ -26,12 +36,13 @@ function app(items?: (opts: { startIndex: number; limit: number }) => Promise<{ 
       },
       file: fileConfigSchema.parse({}),
     },
-    db: openDb(join(dir, 'db.sqlite')),
+    db,
     jellyfin: {
       ping: async () => {},
       items: items ?? (async () => ({ items: [], totalRecordCount: 0 })),
     } as never,
     logger: createLogger({ level: 'error', sink: () => {} }),
+    scanRunner: fakeScanRunner() as never,
   })
 }
 
@@ -124,6 +135,59 @@ describe('/api/pathmap', () => {
   })
 })
 
+describe('/api/pathmap/verify — persistence for the scan-start gate', () => {
+  // POST /api/scan/start (src/api/scan.ts) refuses to start against an unverified path map
+  // unless forced. It reads this exact record, so verify must actually write it, not just
+  // return the report in the response body.
+  it('persists the report under pathmap.lastVerification so a later scan-start gate can read it', async () => {
+    const a = app(async () => ({ items: [row('i1', '/media/Movies/Heat.mkv')], totalRecordCount: 1 }))
+    await a.inject({
+      method: 'PUT', url: '/api/pathmap', headers: { cookie: authCookie() },
+      payload: { mappings: [{ role: 'library', jellyfin: '/media/Movies', container: '/nope', qbit: null }] },
+    })
+    await a.inject({ method: 'POST', url: '/api/pathmap/verify', headers: { cookie: authCookie() } })
+
+    const stored = db.prepare("SELECT value_json FROM kv WHERE key = 'pathmap.lastVerification'").get() as
+      { value_json: string } | undefined
+    expect(stored).toBeDefined()
+    const record = JSON.parse(stored!.value_json) as { sampled: number; resolved: number; at: string }
+    expect(record).toMatchObject({ sampled: 1, resolved: 0 })
+    expect(record.at).toBeTruthy()
+  })
+
+  it('saving a new mapping set clears any prior verification record, so an edited map cannot ride on a stale pass', async () => {
+    const a = app(async () => ({ items: [row('i1', '/media/Movies/Heat.mkv')], totalRecordCount: 1 }))
+    await a.inject({
+      method: 'PUT', url: '/api/pathmap', headers: { cookie: authCookie() },
+      payload: { mappings: [{ role: 'library', jellyfin: '/media/Movies', container: '/nope', qbit: null }] },
+    })
+    await a.inject({ method: 'POST', url: '/api/pathmap/verify', headers: { cookie: authCookie() } })
+    expect(db.prepare("SELECT 1 FROM kv WHERE key = 'pathmap.lastVerification'").get()).toBeDefined()
+
+    await a.inject({
+      method: 'PUT', url: '/api/pathmap', headers: { cookie: authCookie() },
+      payload: { mappings: [{ role: 'library', jellyfin: '/media/Movies', container: '/nope', qbit: null }] },
+    })
+    expect(db.prepare("SELECT 1 FROM kv WHERE key = 'pathmap.lastVerification'").get()).toBeUndefined()
+  })
+
+  it('a PUT that fails validation does not clear an existing verification record', async () => {
+    const a = app(async () => ({ items: [row('i1', '/media/Movies/Heat.mkv')], totalRecordCount: 1 }))
+    await a.inject({
+      method: 'PUT', url: '/api/pathmap', headers: { cookie: authCookie() },
+      payload: { mappings: [{ role: 'library', jellyfin: '/media/Movies', container: '/nope', qbit: null }] },
+    })
+    await a.inject({ method: 'POST', url: '/api/pathmap/verify', headers: { cookie: authCookie() } })
+
+    const bad = await a.inject({
+      method: 'PUT', url: '/api/pathmap', headers: { cookie: authCookie() },
+      payload: { mappings: [{ role: 'library', jellyfin: null, container: '/mnt/m', qbit: null }] },
+    })
+    expect(bad.statusCode).toBe(400)
+    expect(db.prepare("SELECT 1 FROM kv WHERE key = 'pathmap.lastVerification'").get()).toBeDefined()
+  })
+})
+
 describe('/api/pathmap/detect', () => {
   it('requires a session', async () => {
     const res = await app().inject({
@@ -169,6 +233,7 @@ describe('item sampling', () => {
       dataDir: dir,
       sessionSecret: SECRET,
       random,
+      db: openDb(join(dir, 'db.sqlite')),
       jellyfin: {
         items: async ({ startIndex, limit }) => {
           startIndexes.push(startIndex)

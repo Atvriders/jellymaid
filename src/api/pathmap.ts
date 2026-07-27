@@ -5,6 +5,7 @@ import { readFileConfig, saveConfig } from '../config/load.js'
 import { verifyMappings, autoDetectMappings } from '../fs/pathmap.js'
 import { requireSession } from './auth.js'
 import type { JellyfinClient } from '../connectors/jellyfin.js'
+import type { Db } from '../index/db.js'
 
 const putSchema = z.object({ mappings: z.array(pathMappingSchema) })
 const detectSchema = z.object({ mountRoots: z.array(z.string().min(1)).min(1) })
@@ -20,6 +21,7 @@ export function registerPathMapRoutes(
     dataDir: string
     sessionSecret: string
     jellyfin: Pick<JellyfinClient, 'items'>
+    db: Db
     random?: () => number
   },
 ): void {
@@ -64,12 +66,22 @@ export function registerPathMapRoutes(
       return reply.code(400).send({ error: 'invalid mappings', issues: parsed.error.issues.map((i) => i.message) })
     }
     saveConfig(deps.dataDir, { pathMappings: parsed.data.mappings })
+    // A verification result describes a SPECIFIC mapping set. Once the mappings change, that
+    // result no longer means anything — an edited map must not ride on a pass recorded for the
+    // map it replaced, or POST /api/scan/start's gate (src/api/scan.ts) would wave through a scan
+    // against paths nobody has actually checked.
+    deps.db.prepare("DELETE FROM kv WHERE key = 'pathmap.lastVerification'").run()
     return reply.send({ mappings: parsed.data.mappings })
   })
 
   app.post('/api/pathmap/verify', guard, async (_req, reply) => {
     const mappings = readFileConfig(deps.dataDir).pathMappings
-    return reply.send(await verifyMappings({ mappings, sampleItems }))
+    const report = await verifyMappings({ mappings, sampleItems })
+    // Persisted so POST /api/scan/start's gate can read it later — verifying is a separate call
+    // from starting a scan, so the pass/fail has to outlive this one request.
+    deps.db.prepare("INSERT OR REPLACE INTO kv (key, value_json) VALUES ('pathmap.lastVerification', ?)")
+      .run(JSON.stringify({ ...report, at: new Date().toISOString() }))
+    return reply.send(report)
   })
 
   app.post('/api/pathmap/detect', guard, async (req, reply) => {

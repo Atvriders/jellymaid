@@ -163,6 +163,25 @@ describe('torrents', () => {
   })
 })
 
+describe('cancellation', () => {
+  // The worker holds one AbortController for the whole scan and hands its signal to every
+  // connector (see src/scan/worker.ts). Without this forwarding, cancelling a scan would still
+  // wait out whatever request each connector had in flight.
+  it('forwards the caller-supplied signal to the underlying http client', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const f = vi.fn(async () => new Response('Ok.', { status: 200, headers: { 'set-cookie': 'SID=abc' } }))
+    const c = createQbitClient({
+      url: 'http://qb:8080', user: 'u', pass: 'p', concurrency: 2, minDelayMs: 0,
+      privateTrackerHosts: [], fetchImpl: f as unknown as typeof fetch, signal: controller.signal,
+    })
+    const err = await c.ping().catch((e) => e)
+    expect(err).toBeInstanceOf(ConnectorError)
+    expect((err as ConnectorError).kind).toBe('cancelled')
+    expect(f).not.toHaveBeenCalled()
+  })
+})
+
 describe('files', () => {
   it('normalizes the file list', async () => {
     const files = await client(stub({ '/torrents/files': [{ index: 0, name: 'Heat/Heat.mkv', size: 900 }] })).files('H1')

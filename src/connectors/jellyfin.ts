@@ -34,6 +34,8 @@ export interface JellyfinClientOptions {
   concurrency: number
   minDelayMs: number
   fetchImpl?: typeof fetch
+  /** Held by the caller for the client's whole lifetime; see HttpClientOptions.signal. */
+  signal?: AbortSignal
 }
 
 const ITEM_FIELDS = 'Path,ProviderIds,MediaSources,MediaStreams,DateCreated,ParentId,ProductionYear,SortName'
@@ -106,6 +108,7 @@ export function createJellyfinClient(opts: JellyfinClientOptions): JellyfinClien
     minDelayMs: opts.minDelayMs,
     defaultHeaders: { 'X-Emby-Token': opts.apiKey, 'Content-Type': 'application/json' },
     fetchImpl: opts.fetchImpl,
+    signal: opts.signal,
   })
 
   return {

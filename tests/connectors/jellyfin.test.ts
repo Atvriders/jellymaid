@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { createJellyfinClient } from '../../src/connectors/jellyfin.js'
 import { ConnectorError } from '../../src/connectors/http.js'
 
@@ -151,6 +151,22 @@ describe('items', () => {
     const f = stub({ '/Items': { TotalRecordCount: 1, Items: [{ Id: 'ep5', Type: 'Episode', Name: 'Ep 5', ParentIndexNumber: 1, IndexNumber: 5 }] } })
     const { items } = await createJellyfinClient(opts(f)).items({ startIndex: 0, limit: 1 })
     expect(items[0]).toMatchObject({ seasonNo: 1, episodeNo: 5 })
+  })
+})
+
+describe('cancellation', () => {
+  // The worker holds one AbortController for the whole scan and hands its signal to every
+  // connector (see src/scan/worker.ts). Without this forwarding, cancelling a scan would still
+  // wait out whatever request each connector had in flight.
+  it('forwards the caller-supplied signal to the underlying http client', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const f = vi.fn(async () => new Response('{}', { status: 200 }))
+    const client = createJellyfinClient({ ...opts(f as unknown as typeof fetch), signal: controller.signal })
+    const err = await client.ping().catch((e) => e)
+    expect(err).toBeInstanceOf(ConnectorError)
+    expect((err as ConnectorError).kind).toBe('cancelled')
+    expect(f).not.toHaveBeenCalled()
   })
 })
 
