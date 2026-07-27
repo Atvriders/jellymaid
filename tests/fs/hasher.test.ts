@@ -8,7 +8,7 @@ import { createHasher } from '../../src/fs/hasher.js'
 let dir: string
 const statOf = (p: string) => {
   const s = statSync(p)
-  return { dev: Number(s.dev), inode: Number(s.ino), mtime: Math.floor(s.mtimeMs), size: s.size }
+  return { dev: Number(s.dev), inode: Number(s.ino), mtime: s.mtimeMs, ctime: s.ctimeMs, size: s.size }
 }
 
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'jm-hash-')) })
@@ -57,7 +57,37 @@ describe('quickHash', () => {
     const h = createHasher(db)
     const before = await h.quickHash(a, statOf(a))
     writeFileSync(a, 'w'.repeat(1000))
-    const after = await h.quickHash(a, { ...statOf(a), mtime: statOf(a).mtime + 1 })
+    const stat = statOf(a)
+    const after = await h.quickHash(a, { ...stat, mtime: stat.mtime + 1 })
     expect(after).not.toBe(before)
+  })
+
+  it('produces a different digest when a short read occurs than a full read of the same declared size', async () => {
+    const a = join(dir, 'a.mkv')
+    writeFileSync(a, 'x'.repeat(5000))
+    const db = openDb(join(dir, 'db.sqlite'))
+    const h = createHasher(db)
+    const fullKey = statOf(a)
+    const fullHash = await h.quickHash(a, fullKey)
+    // Hash again with declared size larger than actual — the read comes up short
+    const shortKey = { ...fullKey, size: 10000 }
+    const shortHash = await h.quickHash(a, shortKey)
+    expect(shortHash).not.toBe(fullHash)
+  })
+
+  it('recomputes when only ctime changes', async () => {
+    const a = join(dir, 'a.mkv')
+    writeFileSync(a, 'z'.repeat(1000))
+    const db = openDb(join(dir, 'db.sqlite'))
+    const h = createHasher(db)
+    const stat1 = statOf(a)
+    const first = await h.quickHash(a, stat1)
+    // Delete and rewrite with different content, then hash with original stat but different ctime
+    rmSync(a)
+    writeFileSync(a, 'w'.repeat(1000))
+    const stat2 = statOf(a)
+    const second = await h.quickHash(a, { ...stat1, ctime: stat1.ctime + 1 })
+    // Different ctime means cache miss; recompute with new content produces different hash
+    expect(second).not.toBe(first)
   })
 })
