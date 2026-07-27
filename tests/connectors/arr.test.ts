@@ -85,10 +85,11 @@ describe('sonarr', () => {
       .resolves.toEqual({ unmonitored: false, recordId: null })
   })
 
-  it('isolates a per-series failure so unrelated series still return records', async () => {
+  it('isolates a per-series failure, reports it via onProblem, and still returns unrelated records', async () => {
     // Series 9's /episodefile call fails outright (HTTP 400 → thrown immediately, no retry).
     // A flaky series must not blank out the whole library: unmonitoring (and therefore
-    // deletion) of every unrelated file would otherwise be blocked by one bad series.
+    // deletion) of every unrelated file would otherwise be blocked by one bad series. The
+    // failure must still reach a caller, not vanish once it's caught.
     const f = (async (url: string | URL) => {
       const u = String(url)
       if (u.includes('/api/v3/series')) {
@@ -107,10 +108,28 @@ describe('sonarr', () => {
       return new Response('nf', { status: 404 })
     }) as unknown as typeof fetch
 
-    const recs = await createSonarrClient(base(f)).inventory()
+    const problems: string[] = []
+    const recs = await createSonarrClient({ ...base(f), onProblem: (m) => problems.push(m) }).inventory()
+
     expect(recs).toHaveLength(1)
     expect(recs[0]).toMatchObject({ seriesId: 10, arrPath: '/tv/Show/S01E01.mkv' })
     expect(recs.some((r) => r.seriesId === 9)).toBe(false)
+
+    expect(problems).toHaveLength(1)
+    expect(problems[0]).toContain('9')
+  })
+
+  it('propagates a non-connector error rather than swallowing it as a skipped series', async () => {
+    // The episodefile endpoint returns `null` instead of an array — a malformed shape that
+    // survives the HTTP layer cleanly (200 OK, valid JSON) but throws a native TypeError once
+    // the mapping code iterates it. That is a programming-error class of failure, not a
+    // connector failure, and must not be downgraded to "skipped series".
+    const f = stub({
+      '/api/v3/series': [{ id: 9, title: 'Show', monitored: true, path: '/tv/Show' }],
+      '/api/v3/episodefile': null,
+      '/api/v3/episode': [{ id: 500, seriesId: 9, episodeFileId: 77, monitored: true, title: 'Pilot' }],
+    })
+    await expect(createSonarrClient(base(f)).inventory()).rejects.toThrow(TypeError)
   })
 })
 

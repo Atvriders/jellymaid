@@ -1,4 +1,4 @@
-import { HttpClient } from './http.js'
+import { HttpClient, ConnectorError } from './http.js'
 
 export interface ArrRecord {
   kind: 'radarr' | 'sonarr'
@@ -19,6 +19,15 @@ export interface ArrClientOptions {
   minDelayMs: number
   instance?: string
   fetchImpl?: typeof fetch
+  /**
+   * Called once per unit of work skipped due to a connector failure — currently just a Sonarr
+   * series whose per-series fetch failed. A partial inventory must never be silently
+   * indistinguishable from a complete one. This module has no logger dependency of its own
+   * (matching the other connectors), so — as with `logger` elsewhere in this codebase — the
+   * caller decides where the message goes; the scan phase wires this to the real logger and its
+   * own counts.
+   */
+  onProblem?: (message: string) => void
 }
 
 export interface ArrClient {
@@ -87,13 +96,15 @@ export function createSonarrClient(opts: ArrClientOptions): ArrClient {
    * Per-series failures are isolated rather than aborting the whole walk: a rejected
    * unmonitorByPath lookup makes the later executor skip that file's deletion entirely
    * (fail-closed by design), so one flaky series must not silently block unmonitoring — and
-   * therefore deletion — of every unrelated file in the library. Failures are still surfaced via
-   * `problems`, never swallowed: a quietly incomplete inventory would be worse than a loud one.
+   * therefore deletion — of every unrelated file in the library. Only a ConnectorError (the two
+   * HTTP calls' only failure mode) is treated as "this series is unreachable right now" and
+   * skipped; anything else — a programming error such as a TypeError from a wrong assumption
+   * about the API shape — propagates instead of being downgraded to a skipped series. A skipped
+   * series is reported via `onProblem`, never swallowed silently.
    */
-  const load = async (): Promise<{ records: ArrRecord[]; problems: string[] }> => {
+  const load = async (): Promise<ArrRecord[]> => {
     const series = await http.request<RawSeries[]>('/api/v3/series')
     const out: ArrRecord[] = []
-    const problems: string[] = []
     for (const s of series) {
       try {
         const [files, episodes] = await Promise.all([
@@ -111,20 +122,18 @@ export function createSonarrClient(opts: ArrClientOptions): ArrClient {
           })
         }
       } catch (err) {
-        problems.push(`series ${s.id} (${s.title ?? 'untitled'}): ${(err as Error).message}`)
+        if (!(err instanceof ConnectorError)) throw err
+        opts.onProblem?.(`series ${s.id} (${s.title ?? 'untitled'}): ${err.message}`)
       }
     }
-    if (problems.length) {
-      console.error(`[sonarr] inventory incomplete — ${problems.length} series skipped:\n${problems.join('\n')}`)
-    }
-    return { records: out, problems }
+    return out
   }
 
   return {
-    async inventory() { return (await load()).records },
+    async inventory() { return load() },
 
     async unmonitorByPath(path) {
-      const { records } = await load()
+      const records = await load()
       const hit = records.find((r) => r.arrPath === path)
       if (!hit?.episodeId) return { unmonitored: false, recordId: null }
       await http.request('/api/v3/episode/monitor', {
