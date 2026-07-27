@@ -154,6 +154,23 @@ describe('walkRoot', () => {
     expect(entries.some((e) => e.name === 'Escaped.mkv')).toBe(false)
   })
 
+  it('emits a row with NULL stat fields for an entry it cannot stat, rather than omitting it', async () => {
+    // A missing row reads as "the file is gone" to the filesystem rules. Unknown must be
+    // representable, and it must be NULL — 0 would collide on the (dev, inode) index.
+    const entries = await collect(libraryRoot(dir), {
+      onError: () => {},
+      lstatImpl: async (p: string) => {
+        if (String(p).endsWith('Heat.mkv')) throw Object.assign(new Error('EACCES'), { code: 'EACCES' })
+        return (await import('node:fs/promises')).lstat(String(p))
+      },
+    })
+    const row = entries.find((e) => e.name === 'Heat.mkv')!
+    expect(row).toBeDefined()
+    expect(row.dev).toBeNull()
+    expect(row.inode).toBeNull()
+    expect(row.nlink).toBeNull()
+  })
+
   it('records an unreadable directory instead of aborting the walk', async () => {
     const locked = join(dir, 'locked')
     mkdirSync(locked)
@@ -206,9 +223,15 @@ export interface FsEntry {
   isDir: boolean
   sizeBytes: number
   mtime: number
-  dev: number
-  inode: number
-  nlink: number
+  /**
+   * NULL when the entry could not be stat'd. Never 0: `(0, 0)` is a matchable value on
+   * the correlation index, so every unstattable row would collide with every other, and
+   * `nlink = 1` is indistinguishable from "only link, deleting reclaims the full size" —
+   * the exact input Plan 4's hardlink guard trusts.
+   */
+  dev: number | null
+  inode: number | null
+  nlink: number | null
   isMedia: boolean
   libraryRoot: string
   rootRole: PathRole
@@ -220,10 +243,13 @@ export interface WalkOptions {
   batchSize?: number
   signal?: AbortSignal
   onError?: (err: { path: string; reason: string }) => void
+  /** Injectable for tests only — the unknown-stat path is otherwise awkward to provoke portably. */
+  lstatImpl?: typeof lstat
 }
 
 export async function* walkRoot(opts: WalkOptions): AsyncGenerator<FsEntry[]> {
   const batchSize = opts.batchSize ?? 500
+  const statOf = opts.lstatImpl ?? lstat
   const media = new Set(opts.mediaExtensions.map((e) => e.toLowerCase()))
   const stack: string[] = [opts.root.container]
   let batch: FsEntry[] = []
@@ -246,9 +272,32 @@ export async function* walkRoot(opts: WalkOptions): AsyncGenerator<FsEntry[]> {
         // lstat, never stat: a symlink must not be followed out of the root.
         let st
         try {
-          st = await lstat(full)
+          st = await statOf(full)
         } catch (err) {
+          // readdir listed it, so the path exists — we just cannot describe it. Emit a
+          // row with unknown stat rather than skipping: a missing row reads as "this file
+          // is gone", which would make the filesystem rules report on a healthy file.
           opts.onError?.({ path: full, reason: (err as Error).message })
+          batch.push({
+            containerPath: full,
+            parentPath: current,
+            name: dirent.name,
+            ext: extname(dirent.name).toLowerCase() || null,
+            isDir: false,
+            sizeBytes: 0,
+            mtime: 0,
+            dev: null,
+            inode: null,
+            nlink: null,
+            isMedia: false,
+            libraryRoot: opts.root.container,
+            rootRole: opts.root.role,
+          })
+          if (batch.length >= batchSize) {
+            yield batch
+            batch = []
+            if (opts.signal?.aborted) return
+          }
           continue
         }
         if (st.isSymbolicLink()) continue
@@ -1352,7 +1401,10 @@ export const jellyfinPhase: Phase = {
       ctx.progress(written, total)
       if (startIndex >= total) break
     }
-    return { status: 'completed', counts: { items: written } }
+    // Items Jellyfin no longer returns were removed from the library; drop their rows so
+    // the duplicate and metadata rules do not reason about entries that no longer exist.
+    const stale = ctx.db.prepare('DELETE FROM jellyfin_items WHERE scan_id != ?').run(ctx.scanId).changes
+    return { status: 'completed', counts: { items: written, stale } }
   },
 }
 ```
@@ -1379,6 +1431,7 @@ export const filesystemPhase: Phase = {
     const done = new Set((ctx.cursor.completedRoots as string[] | undefined) ?? [])
     const errors: Array<{ path: string; reason: string }> = []
     let written = 0
+    let stale = 0
 
     for (const root of roots) {
       if (done.has(root.container)) continue
@@ -1418,10 +1471,18 @@ export const filesystemPhase: Phase = {
       } catch (err) {
         errors.push({ path: root.container, reason: describeError(err) })
       }
+      // Sweep this root's ghosts: rows written by an earlier scan that this pass did not
+      // see are files that no longer exist. Leaving them makes fs.orphan-media and
+      // fs.missing-file report on paths that are gone.
+      const swept = ctx.db.prepare(
+        'DELETE FROM fs_entries WHERE library_root = ? AND scan_id != ?',
+      ).run(root.container, ctx.scanId).changes
+      stale += swept
+
       done.add(root.container)
       ctx.saveCursor({ completedRoots: [...done] })
     }
-    return { status: 'completed', counts: { entries: written, errors: errors.length } }
+    return { status: 'completed', counts: { entries: written, stale, errors: errors.length } }
   },
 }
 ```
@@ -1491,7 +1552,12 @@ export const qbittorrentPhase: Phase = {
       })
       write()
     }
-    return { status: 'completed', counts: { torrents: torrents.length, files } }
+    // Torrents removed from qBittorrent since the last scan keep a stale fetched_at.
+    // Drop them and their file rows, or the cross-seed guard reasons about torrents that
+    // no longer exist and blocks deletes for nothing.
+    const staleTorrents = ctx.db.prepare('DELETE FROM torrents WHERE fetched_at != ?').run(now).changes
+    ctx.db.prepare('DELETE FROM torrent_files WHERE hash NOT IN (SELECT hash FROM torrents)').run()
+    return { status: 'completed', counts: { torrents: torrents.length, files, stale: staleTorrents } }
   },
 }
 ```
@@ -1528,6 +1594,9 @@ export const arrPhase: Phase = {
         continue
       }
       const write = ctx.db.transaction(() => {
+        // Wholesale replace per instance: this is a full inventory fetch, so anything not
+        // in it is gone. Scoped to the instance so one *arr being down cannot wipe the other.
+        ctx.db.prepare('DELETE FROM arr_records WHERE kind = ? AND instance = ?').run(label, label)
         for (const r of records) {
           insert.run(
             `${r.kind}:${r.instance}:${r.remoteId}`, r.kind, r.instance, r.remoteId, r.title,
@@ -1571,6 +1640,7 @@ git commit -m "feat: scan phases for jellyfin, filesystem, qbittorrent and arr"
 **Interfaces:**
 - Consumes: the four phases, `Db`.
 - Produces:
+  - First, close a Plan 1 carry-forward: `HttpClient` currently discards a caller's `init.signal`, so cancelling a scan cannot interrupt a request already in flight — with retries that is up to two minutes of a scan that the operator has told to stop. Add `signal?: AbortSignal` to `HttpClientOptions`, link it to each request's internal `AbortController`, add `'cancelled'` to `ConnectorErrorKind`, and classify a caller-initiated abort as `'cancelled'` with **no retry** (distinct from `'timeout'`, which is the internal deadline and stays retryable). The worker passes the scan's signal into every connector factory. Tests: an already-aborted signal fails immediately without calling fetch; aborting mid-flight rejects with kind `'cancelled'`; the internal timeout still classifies as `'timeout'`.
   - `runScan(opts: { db, deps, signal, scanId?, phases?, onProgress? }): Promise<ScanSummary>`
   - `ScanSummary = { scanId: number; status: 'completed' | 'cancelled' | 'failed'; phases: Record<PhaseName, PhaseResult>; startedAt: string; finishedAt: string }`
   - `latestScan(db): ScanRow | null` · `pruneOldScans(db, keep = 2): number`
