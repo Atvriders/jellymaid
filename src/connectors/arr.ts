@@ -83,33 +83,48 @@ export function createSonarrClient(opts: ArrClientOptions): ArrClient {
   const http = makeHttp(opts, 'sonarr')
   const instance = opts.instance ?? 'sonarr'
 
-  const load = async (): Promise<ArrRecord[]> => {
+  /**
+   * Per-series failures are isolated rather than aborting the whole walk: a rejected
+   * unmonitorByPath lookup makes the later executor skip that file's deletion entirely
+   * (fail-closed by design), so one flaky series must not silently block unmonitoring — and
+   * therefore deletion — of every unrelated file in the library. Failures are still surfaced via
+   * `problems`, never swallowed: a quietly incomplete inventory would be worse than a loud one.
+   */
+  const load = async (): Promise<{ records: ArrRecord[]; problems: string[] }> => {
     const series = await http.request<RawSeries[]>('/api/v3/series')
     const out: ArrRecord[] = []
+    const problems: string[] = []
     for (const s of series) {
-      const [files, episodes] = await Promise.all([
-        http.request<RawEpisodeFile[]>(`/api/v3/episodefile?seriesId=${s.id}`),
-        http.request<RawEpisode[]>(`/api/v3/episode?seriesId=${s.id}`),
-      ])
-      const episodeByFile = new Map<number, RawEpisode>()
-      for (const e of episodes) if (e.episodeFileId) episodeByFile.set(e.episodeFileId, e)
-      for (const f of files) {
-        const ep = episodeByFile.get(f.id)
-        out.push({
-          kind: 'sonarr', instance, remoteId: f.id, title: ep?.title ?? s.title ?? '',
-          arrPath: f.path ?? null, monitored: Boolean(ep?.monitored),
-          seriesId: s.id, episodeId: ep?.id ?? null, episodeFileId: f.id,
-        })
+      try {
+        const [files, episodes] = await Promise.all([
+          http.request<RawEpisodeFile[]>(`/api/v3/episodefile?seriesId=${s.id}`),
+          http.request<RawEpisode[]>(`/api/v3/episode?seriesId=${s.id}`),
+        ])
+        const episodeByFile = new Map<number, RawEpisode>()
+        for (const e of episodes) if (e.episodeFileId) episodeByFile.set(e.episodeFileId, e)
+        for (const f of files) {
+          const ep = episodeByFile.get(f.id)
+          out.push({
+            kind: 'sonarr', instance, remoteId: f.id, title: ep?.title ?? s.title ?? '',
+            arrPath: f.path ?? null, monitored: Boolean(ep?.monitored),
+            seriesId: s.id, episodeId: ep?.id ?? null, episodeFileId: f.id,
+          })
+        }
+      } catch (err) {
+        problems.push(`series ${s.id} (${s.title ?? 'untitled'}): ${(err as Error).message}`)
       }
     }
-    return out
+    if (problems.length) {
+      console.error(`[sonarr] inventory incomplete — ${problems.length} series skipped:\n${problems.join('\n')}`)
+    }
+    return { records: out, problems }
   }
 
   return {
-    async inventory() { return load() },
+    async inventory() { return (await load()).records },
 
     async unmonitorByPath(path) {
-      const records = await load()
+      const { records } = await load()
       const hit = records.find((r) => r.arrPath === path)
       if (!hit?.episodeId) return { unmonitored: false, recordId: null }
       await http.request('/api/v3/episode/monitor', {

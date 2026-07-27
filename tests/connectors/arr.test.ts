@@ -74,14 +74,73 @@ describe('sonarr', () => {
     expect(url).toContain('/api/v3/episode/monitor')
     expect(body).toEqual({ episodeIds: [500], monitored: false })
   })
+
+  it('reports not-found rather than throwing when the path is unknown', async () => {
+    const f = stub({
+      '/api/v3/series': [{ id: 9, title: 'Show', monitored: true, path: '/tv/Show' }],
+      '/api/v3/episodefile': [{ id: 77, seriesId: 9, path: '/tv/Show/S01E01.mkv' }],
+      '/api/v3/episode': [{ id: 500, seriesId: 9, episodeFileId: 77, monitored: true, title: 'Pilot' }],
+    })
+    await expect(createSonarrClient(base(f)).unmonitorByPath('/nope.mkv'))
+      .resolves.toEqual({ unmonitored: false, recordId: null })
+  })
+
+  it('isolates a per-series failure so unrelated series still return records', async () => {
+    // Series 9's /episodefile call fails outright (HTTP 400 → thrown immediately, no retry).
+    // A flaky series must not blank out the whole library: unmonitoring (and therefore
+    // deletion) of every unrelated file would otherwise be blocked by one bad series.
+    const f = (async (url: string | URL) => {
+      const u = String(url)
+      if (u.includes('/api/v3/series')) {
+        return new Response(JSON.stringify([
+          { id: 9, title: 'Broken', monitored: true, path: '/tv/Broken' },
+          { id: 10, title: 'Show', monitored: true, path: '/tv/Show' },
+        ]), { status: 200 })
+      }
+      if (u.includes('seriesId=9')) return new Response('boom', { status: 400 })
+      if (u.includes('/api/v3/episodefile')) {
+        return new Response(JSON.stringify([{ id: 77, seriesId: 10, path: '/tv/Show/S01E01.mkv' }]), { status: 200 })
+      }
+      if (u.includes('/api/v3/episode')) {
+        return new Response(JSON.stringify([{ id: 500, seriesId: 10, episodeFileId: 77, monitored: true, title: 'Pilot' }]), { status: 200 })
+      }
+      return new Response('nf', { status: 404 })
+    }) as unknown as typeof fetch
+
+    const recs = await createSonarrClient(base(f)).inventory()
+    expect(recs).toHaveLength(1)
+    expect(recs[0]).toMatchObject({ seriesId: 10, arrPath: '/tv/Show/S01E01.mkv' })
+    expect(recs.some((r) => r.seriesId === 9)).toBe(false)
+  })
 })
 
 describe('safety', () => {
+  // This is the enforcement point for a hard product constraint — Jellymaid unmonitors and
+  // nothing else, never deleting a movie/series/file or blocklisting a release — so it is
+  // deliberately stricter than a single `method: 'DELETE'` literal check, which is trivially
+  // bypassed by double quotes, a template literal, lowercase 'delete' (fetch uppercases the
+  // method for you), or any other indirection.
   it('the source contains no delete or blocklist call', () => {
     const src = readFileSync(new URL('../../src/connectors/arr.ts', import.meta.url), 'utf8')
-    expect(src).not.toMatch(/method:\s*'DELETE'/)
+    // Strip comments first — this file's own explanatory prose is allowed to say "delete"
+    // (e.g. explaining why something is NOT a delete); only executable source is banned below.
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')
+
+    expect(code).not.toMatch(/\bdelete\b/i)
     expect(src.toLowerCase()).not.toContain('blocklist')
     expect(src.toLowerCase()).not.toContain('blacklist')
-    expect(src).not.toMatch(/deleteFiles/)
+    expect(src.toLowerCase()).not.toContain('deletefiles')
+
+    // Enumerate every HTTP method literal actually used, however it's quoted, and require each
+    // one to be PUT — GET is the implicit default and is never spelled out in this file. This
+    // catches a DELETE (or anything else) introduced under a spelling the word-ban above
+    // wouldn't anticipate.
+    const methodKeywords = code.match(/\bmethod\s*:/g) ?? []
+    const quotedMethods = [...code.matchAll(/method\s*:\s*['"`]([a-zA-Z]+)['"`]/g)].map((m) => m[1]!.toUpperCase())
+    // Every `method:` must resolve to a literal right there — a `method:` whose value comes from
+    // a variable or expression (e.g. an assembled string) would dodge the literal scan above.
+    expect(methodKeywords.length).toBe(quotedMethods.length)
+    expect(quotedMethods.length).toBeGreaterThan(0)
+    for (const method of quotedMethods) expect(method).toBe('PUT')
   })
 })
