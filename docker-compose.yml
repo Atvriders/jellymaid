@@ -22,23 +22,30 @@ services:
       QBIT_URL: "http://192.0.2.10:8080"
       QBIT_USER: "${QBIT_USER}"
       QBIT_PASS: "${QBIT_PASS}"
-      # Optional. Jellymaid only ever unmonitors in these — it never deletes or blocklists. Each
-      # is a pair: RADARR_URL and RADARR_API_KEY must both be present, or both absent — delete
-      # both of a connector's two lines below (URL is a literal here, not env-substituted) if you
-      # don't run it, or the container refuses to start rather than guess at a half-configured one.
-      RADARR_URL: "http://192.0.2.11:7878"
-      RADARR_API_KEY: "${RADARR_API_KEY}"
-      SONARR_URL: "http://192.0.2.11:8989"
-      SONARR_API_KEY: "${SONARR_API_KEY}"
+      # Optional. Jellymaid only ever unmonitors in these — it never deletes or blocklists. Each is
+      # a pair, set entirely from .env: RADARR_URL and RADARR_API_KEY must both be filled in, or
+      # both left blank (the .env.example default) — the container refuses to start rather than
+      # guess at a half-configured one. Unlike JELLYFIN_URL/QBIT_URL above (mandatory, and meant to
+      # be edited directly here), both sides of each *arr pair are env-substituted, so the
+      # documented "copy .env.example to .env and fill in the values" path needs no edit to this
+      # file at all to leave Radarr/Sonarr unconfigured.
+      RADARR_URL: "${RADARR_URL:-}"
+      RADARR_API_KEY: "${RADARR_API_KEY:-}"
+      SONARR_URL: "${SONARR_URL:-}"
+      SONARR_API_KEY: "${SONARR_API_KEY:-}"
       # Any Olson zone (e.g. America/New_York); only affects log timestamps and SCAN_CRON.
       TZ: "UTC"
       # Must equal the number of proxies actually in front of this service — behind a single
-      # Cloudflare tunnel or reverse proxy that is 1, with nothing in front of it that is 0
-      # (the default, applied when this line is removed). Setting it HIGHER than the real count
-      # lets a caller forge X-Forwarded-For and reinstate the login-lockout bypass this setting
-      # exists to close; setting it LOWER collapses every real client onto the proxy's own
-      # address and locks all of them out together after a few failed logins from any one of them.
-      TRUST_PROXY: "1"
+      # Cloudflare tunnel or reverse proxy that is 1, with nothing in front of it (this default,
+      # matching the bare `ports: 8099:8099` below — no proxy, no TLS) that is 0. Setting it HIGHER
+      # than the real count lets a caller forge X-Forwarded-For and reinstate the login-lockout
+      # bypass this setting exists to close — it also marks the session cookie `secure`, which a
+      # plain http://<host>:8099 browser will then silently refuse to store, permanently looping
+      # the login page. Setting it LOWER collapses every real client onto the proxy's own address
+      # and locks all of them out together after a few failed logins from any one of them. Raise
+      # this only once this service is actually behind that many real, TLS-terminating proxies —
+      # never before.
+      TRUST_PROXY: "0"
       # Optional. Unset by default: Jellymaid mints a random secret on first boot and persists it
       # at /data/.session-secret, so sessions already survive container restarts and image
       # upgrades without this being set. Set it only if you need every session invalidated on a

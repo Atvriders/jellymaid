@@ -6,7 +6,7 @@ data
 .git
 docs
 .superpowers
-tests
+**/tests
 .env
 *.log
 *.tsbuildinfo
