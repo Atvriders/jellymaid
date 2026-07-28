@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { Api, RequestedAction } from '../api.js'
+import type { Api, ExecutionSummary, RequestedAction } from '../api.js'
 import { useAsync } from '../hooks.js'
 import { Bytes, EmptyState } from '../components/index.js'
 
@@ -39,7 +39,9 @@ function outcomeTagClass(outcome: string): string {
 
 /** A plan's own status vocabulary (draft/approved/running/completed/failed) is a different scale
  * from an action's — a plan is never itself "blocked" or "skipped" — so it gets its own mapping
- * rather than overloading `outcomeTagClass` with a status that vocabulary does not use. */
+ * rather than overloading `outcomeTagClass` with a status that vocabulary does not use. Kept
+ * identical to PlanScreen's own `planStatusTagClass` (client/src/screens/PlanScreen.tsx) — an
+ * `approved` plan must read the same way, armed and pre-authorised, wherever it is shown. */
 function planStatusTagClass(status: string): string {
   if (status === 'completed') return 'tag tag-ok'
   if (status === 'failed') return 'tag tag-block'
@@ -47,11 +49,32 @@ function planStatusTagClass(status: string): string {
   return 'tag tag-quiet' // draft
 }
 
+/** Same "did this run actually do anything" honesty check PlanScreen applies to its own execution
+ * summary (see PlanScreen.tsx's `isHollowExecution`), duplicated here rather than imported: Resume
+ * runs the identical executor and can return the identical shape, and a resume where every
+ * remaining action was blocked or skipped must not read as an ordinary clean "completed" pass
+ * either. */
+function isHollowExecution(summary: ExecutionSummary): boolean {
+  return summary.done === 0 && summary.blocked + summary.skipped > 0
+}
+
+function ExecutionSummaryLine({ summary }: { summary: ExecutionSummary }) {
+  const text = (
+    <>
+      Execution {summary.status}: {summary.done} done, {summary.failed} failed,{' '}
+      {summary.skipped} skipped, {summary.blocked} blocked — <Bytes value={summary.bytesFreed} /> freed.
+    </>
+  )
+  return isHollowExecution(summary)
+    ? <p className="alert alert-warn" role="status">{text}</p>
+    : <p className="plan-execution-summary" role="status">{text}</p>
+}
+
 /**
- * The record of what Jellymaid has actually done, and the two ways an operator can act on that
+ * The record of what Jellymaid has actually done, and the three ways an operator can act on that
  * record after the fact: undoing a reversible merge, restoring something from the trash, and
- * nudging a plan a crashed process left stuck mid-run. None of these three is a fresh destructive
- * action in its own right —
+ * nudging a plan a crashed process left stuck mid-run. The first two are never a fresh destructive
+ * action in their own right; Resume is the one exception, and this screen must not undersell it —
  *
  *   - "Undo merge" only ever QUEUES a `split-versions` action (same queue-then-plan discipline as
  *     Findings/Duplicates/Explorer); it does not call Jellyfin directly from here.
@@ -59,7 +82,17 @@ function planStatusTagClass(status: string): string {
  *     itself refuses a replay or a missing file rather than doing anything destructive.
  *   - "Resume" is the documented crash-recovery path (`POST /api/plans/:id/resume`) for a plan
  *     stuck `running` — offered ONLY for that status, since resuming anything else either does
- *     nothing (already-terminal plans) or races a run that is not actually dead.
+ *     nothing (already-terminal plans) or races a run that is not actually dead. It is NOT a
+ *     passive nudge: the route flips the plan back to `approved` and calls the SAME executor
+ *     `POST /api/plans/:id/execute` uses, which runs `deleteWithData` and `unlinkSync` for every
+ *     action still `pending` — a real, files-and-torrents-gone destructive tail, not a status
+ *     flip. Its returned `ExecutionSummary` is rendered exactly as PlanScreen renders one
+ *     (`ExecutionSummaryLine` above), never discarded after a bare `plans.reload()`.
+ *   - "Open" is not destructive at all — it hands a plan's id up to the shell (`onOpenPlan`) so
+ *     the Plan screen can load and render it via `api.getPlan`. It is the only way back into a
+ *     plan once its own screen has been navigated away from and returned to (see App.tsx's
+ *     `planId`), and the only way to reach an `approved` plan at all: Resume's server semantics
+ *     are `running`-only (src/api/plans.ts), so offering it for `approved` would just 400.
  *
  * Every non-`done` audit outcome still shows whatever bytes it froze: a per-action failure does
  * not abort the plan (src/plan/executor.ts runs every action regardless of an earlier one's
@@ -68,13 +101,18 @@ function planStatusTagClass(status: string): string {
  * screen must never let a non-`done` label read as "nothing happened" when the audit row itself
  * says otherwise.
  */
-export function History({ api, onQueue }: { api: HistoryApi; onQueue: (actions: RequestedAction[]) => void }) {
+export function History({ api, onQueue, onOpenPlan }: {
+  api: HistoryApi
+  onQueue: (actions: RequestedAction[]) => void
+  onOpenPlan: (id: string) => void
+}) {
   const audit = useAsync(() => api.audit())
   const plans = useAsync(() => api.plans())
   const trash = useAsync(() => api.trash())
 
   const [resumingId, setResumingId] = useState<string | null>(null)
   const [resumeError, setResumeError] = useState<string | null>(null)
+  const [resumeSummary, setResumeSummary] = useState<ExecutionSummary | null>(null)
 
   const [restoringId, setRestoringId] = useState<string | null>(null)
   const [restoreNotes, setRestoreNotes] = useState<Record<string, string>>({})
@@ -84,9 +122,18 @@ export function History({ api, onQueue }: { api: HistoryApi; onQueue: (actions: 
   async function resume(id: string) {
     setResumingId(id)
     setResumeError(null)
+    setResumeSummary(null)
     try {
-      await api.resumePlan(id)
+      // MAJOR finding: this used to discard the returned ExecutionSummary entirely and only
+      // reload the plans list — a resume that ran a real destructive tail (deleteWithData,
+      // unlinkSync for every still-pending action) reported NONE of it: not what ran, not what
+      // failed, not what was freed. Render it exactly as PlanScreen does.
+      const result = await api.resumePlan(id)
+      setResumeSummary(result)
       plans.reload()
+      // A resume writes new audit rows for every action in its unfinished tail — the audit trail
+      // above must not go on showing the pre-resume record until an unrelated action reloads it.
+      audit.reload()
     } catch (err) {
       setResumeError(err instanceof Error ? err.message : 'failed to resume plan')
     } finally {
@@ -188,6 +235,7 @@ export function History({ api, onQueue }: { api: HistoryApi; onQueue: (actions: 
       <section className="panel history-section history-plans">
         <h2>Plans</h2>
         {resumeError ? <p className="alert" role="alert"><span>{resumeError}</span></p> : null}
+        {resumeSummary ? <ExecutionSummaryLine summary={resumeSummary} /> : null}
         {plans.error ? (
           <p className="alert" role="alert"><span>{plans.error}</span></p>
         ) : !plans.data ? (
@@ -203,7 +251,7 @@ export function History({ api, onQueue }: { api: HistoryApi; onQueue: (actions: 
                 <th scope="col">By</th>
                 <th scope="col">Status</th>
                 <th scope="col">Bytes freed</th>
-                <th scope="col">Resume</th>
+                <th scope="col">Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -215,20 +263,29 @@ export function History({ api, onQueue }: { api: HistoryApi; onQueue: (actions: 
                   <td><span className={planStatusTagClass(p.status)}>{p.status}</span></td>
                   <td><Bytes value={p.dryRun.bytesFreed} /></td>
                   <td>
-                    {/* Offered ONLY for `running` — the crash-recovery path (spec §13). Anything
-                        else either has nothing left to resume (draft/approved/completed/failed) or
-                        risks racing a run that is not actually dead. */}
-                    {p.status === 'running' ? (
-                      <button
-                        type="button"
-                        className="btn btn-danger"
-                        disabled={resumingId === p.id}
-                        aria-busy={resumingId === p.id}
-                        onClick={() => void resume(p.id)}
-                      >
-                        Resume
+                    <div className="history-plan-actions">
+                      {/* The only route back into a plan once this screen has been navigated away
+                          from — including an `approved` one, which Resume (below) cannot reach at
+                          all: its server semantics are `running`-only. Hands the id up to the
+                          shell, which switches to Plan and lets it load via `api.getPlan`. */}
+                      <button type="button" className="btn btn-quiet" onClick={() => onOpenPlan(p.id)}>
+                        Open
                       </button>
-                    ) : null}
+                      {/* Offered ONLY for `running` — the crash-recovery path (spec §13). Anything
+                          else either has nothing left to resume (draft/approved/completed/failed) or
+                          risks racing a run that is not actually dead. */}
+                      {p.status === 'running' ? (
+                        <button
+                          type="button"
+                          className="btn btn-danger"
+                          disabled={resumingId === p.id}
+                          aria-busy={resumingId === p.id}
+                          onClick={() => void resume(p.id)}
+                        >
+                          Resume
+                        </button>
+                      ) : null}
+                    </div>
                   </td>
                 </tr>
               ))}
@@ -252,6 +309,10 @@ export function History({ api, onQueue }: { api: HistoryApi; onQueue: (actions: 
                 <th scope="col">Path</th>
                 <th scope="col">Size</th>
                 <th scope="col">Deleted</th>
+                {/* MINOR finding: `purgeAfter` is on the wire (api.ts's TrashEntry) and, until now,
+                    never rendered — the one screen that says a file is recoverable never said when
+                    that stops being true. */}
+                <th scope="col">Recoverable until</th>
                 <th scope="col">Status</th>
                 <th scope="col">Restore</th>
               </tr>
@@ -262,6 +323,7 @@ export function History({ api, onQueue }: { api: HistoryApi; onQueue: (actions: 
                   <td className="subject-path">{t.originalPath}</td>
                   <td><Bytes value={t.sizeBytes} /></td>
                   <td className="subject-path">{t.deletedAt}</td>
+                  <td className="subject-path">{t.purgeAfter}</td>
                   <td>
                     <span className={t.restoredAt ? 'tag tag-ok' : 'tag tag-quiet'}>
                       {t.restoredAt ? 'restored' : 'trashed'}

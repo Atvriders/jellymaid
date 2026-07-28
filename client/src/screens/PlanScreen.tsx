@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { Api, ExecutionSummary, GuardId, PlanActionView, PlanView, RequestedAction } from '../api.js'
 import { Bytes, EmptyState, GuardVerdictList } from '../components/index.js'
 
@@ -14,12 +14,48 @@ const ACTION_TYPE_LABEL: Record<PlanActionView['type'], string> = {
 
 /** Same escalating-weight tag vocabulary as everywhere else in the app: a terminal failure or a
  * block reads as loud as a guard block does, `running`/`skipped` get the warn tint (something is
- * unresolved or did not go as planned, not necessarily wrong), and `pending`/`done` are quiet. */
+ * unresolved or did not go as planned, not necessarily wrong), and `pending`/`done` are quiet.
+ * ACTION statuses only — see `planStatusTagClass` below for the PLAN's own, different vocabulary. */
 function statusTagClass(status: string): string {
   if (status === 'blocked' || status === 'failed') return 'tag tag-block'
   if (status === 'skipped' || status === 'running') return 'tag tag-warn'
   if (status === 'done') return 'tag tag-ok'
   return 'tag tag-quiet' // pending
+}
+
+/** A plan's own status vocabulary (draft/approved/running/completed/failed) is a different scale
+ * from an action's — a plan is never itself "blocked" or "skipped" — so it gets its own mapping
+ * rather than being read through `statusTagClass` above. Kept identical to History's own
+ * `planStatusTagClass` (client/src/screens/History.tsx), which explains the same reasoning: an
+ * `approved` plan — armed, pre-authorised, and the one state that shows the red Execute button —
+ * must not render as the quietest tag on the screen. */
+function planStatusTagClass(status: string): string {
+  if (status === 'completed') return 'tag tag-ok'
+  if (status === 'failed') return 'tag tag-block'
+  if (status === 'running' || status === 'approved') return 'tag tag-warn'
+  return 'tag tag-quiet' // draft
+}
+
+/** "Execution completed" must not headline a run that did nothing: `summary.status` is only
+ * `'failed'` when at least one action actually failed (src/plan/executor.ts), so a plan every one
+ * of whose remaining actions was blocked or skipped still reports `'completed'` — honest about the
+ * word, misleading about the tone. This reads as a caution (the `alert alert-warn` treatment
+ * already used elsewhere on this screen) rather than a plain, quiet paragraph whenever nothing was
+ * actually done and something held it back. */
+function isHollowExecution(summary: ExecutionSummary): boolean {
+  return summary.done === 0 && summary.blocked + summary.skipped > 0
+}
+
+function ExecutionSummaryLine({ summary }: { summary: ExecutionSummary }) {
+  const text = (
+    <>
+      Execution {summary.status}: {summary.done} done, {summary.failed} failed,{' '}
+      {summary.skipped} skipped, {summary.blocked} blocked — <Bytes value={summary.bytesFreed} /> freed.
+    </>
+  )
+  return isHollowExecution(summary)
+    ? <p className="alert alert-warn" role="status">{text}</p>
+    : <p className="plan-execution-summary" role="status">{text}</p>
 }
 
 function targetLabel(payload: RequestedAction): string {
@@ -67,14 +103,25 @@ function toRequestedAction(action: PlanActionView, overrides: string[]): Request
  *      so an override can never silently clear a DIFFERENT guard that starts blocking later.
  *      Checking a box here is not a blanket "proceed no matter what" for this row.
  */
-export function PlanScreen({ api, queued, onClear }: {
+export function PlanScreen({ api, queued, onClear, planId, onPlanIdChange }: {
   api: PlanApi
   queued: RequestedAction[]
   onClear: () => void
+  /** The plan App already knows about, if any — set once a build has happened THIS session (in
+   * this mount or an earlier one) or once History has handed one over via "Open". `null` means
+   * there is genuinely nothing to load yet, not that loading failed. */
+  planId: string | null
+  onPlanIdChange: (id: string | null) => void
 }) {
   const [plan, setPlan] = useState<PlanView | null>(null)
   const [building, setBuilding] = useState(false)
   const [buildError, setBuildError] = useState<string | null>(null)
+
+  // Starts `true` exactly when there is something to fetch, so the FIRST render of a remount that
+  // was handed a `planId` never flashes the "nothing queued" empty state before the effect below
+  // has had a chance to run.
+  const [loadingPlan, setLoadingPlan] = useState(planId !== null)
+  const [loadError, setLoadError] = useState<string | null>(null)
 
   const [overridesByAction, setOverridesByAction] = useState<Record<string, string[]>>({})
 
@@ -84,6 +131,38 @@ export function PlanScreen({ api, queued, onClear }: {
   const [executing, setExecuting] = useState(false)
   const [executeError, setExecuteError] = useState<string | null>(null)
   const [summary, setSummary] = useState<ExecutionSummary | null>(null)
+
+  /**
+   * CRITICAL finding: this screen used to hold `plan`/`summary` in state with nothing outside it
+   * remembering which plan that was, so switching nav tabs (which unmounts this component — see
+   * App.tsx) threw both away. An operator who built, approved and even EXECUTED a plan, then
+   * glanced at another screen and came back, found "nothing queued" again — inviting a second,
+   * redundant `createPlan` against files the first plan had already removed, and leaving an
+   * approved-but-unexecuted plan with no way back into view at all.
+   *
+   * `planId` is now lifted to App beside `queued`, and this effect loads whatever it names ONCE,
+   * on this fresh mount — not on every later change to `planId` within the same mount. A
+   * build/rebuild that happens while already mounted updates `plan` locally and lifts the new id
+   * via `onPlanIdChange` itself; re-running this fetch off that same change would race a stale GET
+   * against whatever the operator does next (approve, execute) and could overwrite newer state
+   * with the draft snapshot the plan started as.
+   */
+  useEffect(() => {
+    if (!planId) return
+    let cancelled = false
+    api.getPlan(planId)
+      .then((loaded) => {
+        if (cancelled) return
+        if (loaded) setPlan(loaded)
+        else setLoadError(`plan ${planId} could not be found`)
+      })
+      .catch((err) => {
+        if (!cancelled) setLoadError(err instanceof Error ? err.message : 'failed to load plan')
+      })
+      .finally(() => { if (!cancelled) setLoadingPlan(false) })
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   function toggleOverride(actionId: string, guard: string) {
     setOverridesByAction((prev) => {
@@ -99,6 +178,12 @@ export function PlanScreen({ api, queued, onClear }: {
     try {
       const built = await api.createPlan(actions)
       setPlan(built)
+      onPlanIdChange(built.id)
+      // The queue's job is done the moment it is baked into a built plan — whether this build came
+      // from the queue itself or from a rebuild (which reads `plan.actions`, never `queued`; see
+      // `rebuild` below). Nothing is lost by clearing it: `rebuild` never reads it, and a build
+      // FROM the queue has, by definition, already sent everything in it.
+      onClear()
       setOverridesByAction({})
       setSummary(null)
       setApproveError(null)
@@ -160,6 +245,14 @@ export function PlanScreen({ api, queued, onClear }: {
   const hasOverridesSelected = Object.values(overridesByAction).some((list) => list.length > 0)
   const hasExecutableAction = plan?.actions.some((a) => a.status === 'pending') ?? false
 
+  if (loadingPlan) {
+    return <EmptyState>Loading plan…</EmptyState>
+  }
+
+  if (loadError) {
+    return <p className="alert" role="alert"><span>{loadError}</span></p>
+  }
+
   if (queued.length === 0 && !plan) {
     return <EmptyState>Nothing queued. Add actions from Findings, Duplicates or Explorer first, then come back here to build a plan.</EmptyState>
   }
@@ -196,7 +289,7 @@ export function PlanScreen({ api, queued, onClear }: {
       {plan ? (
         <>
           <section className="panel plan-summary">
-            <h2>Plan <code>{plan.id}</code> — <span className={statusTagClass(plan.status)}>{plan.status}</span></h2>
+            <h2>Plan <code>{plan.id}</code> — <span className={planStatusTagClass(plan.status)}>{plan.status}</span></h2>
 
             <p className="plan-caution" role="note">
               Guard verdicts below reflect state at the moment this plan was built or last
@@ -208,11 +301,48 @@ export function PlanScreen({ api, queued, onClear }: {
               If that happens, the affected action does not run, and this plan must be rebuilt to
               see and decide on the new refusal.
             </p>
-            <p className="plan-note">
-              Deleting a file also unmonitors it in Radarr/Sonarr where one manages it — the show or
-              movie record itself is never deleted, only unmonitored — and removes its torrent with
-              its data where one backs it.
-            </p>
+            {/*
+              MAJOR finding: the old text here disclosed only 2 of the executor's 5 steps
+              (*arr-unmonitor and torrent removal), leaving the other 3 — each materially
+              surprising — undisclosed: a junk file's own delete can be recoverable from the trash
+              while a media file's cannot, under the identical "Delete" label; the sweep below
+              removes parent folders the operator never named; and Jellyfin's own item is removed
+              or refreshed at the very end. This is the ACTUAL order src/plan/executor.ts runs,
+              read from the code, not paraphrased from memory of what it used to say.
+            */}
+            <div className="plan-note">
+              <p>Executing an approved plan runs these steps, in this exact order, for every delete action it contains:</p>
+              <ol>
+                <li>
+                  Unmonitor the file in Radarr/Sonarr where one manages it — the show or movie
+                  record itself is never deleted, only unmonitored — so nothing can re-grab the
+                  title while the rest of this runs.
+                </li>
+                <li>
+                  Remove the file's torrent, with its data, from qBittorrent, and confirm
+                  qBittorrent has actually let it go before continuing.
+                </li>
+                <li>
+                  Remove whatever qBittorrent left behind — this path's own remaining hardlink. A
+                  junk file with no torrent behind it is trashed (recoverable later from History)
+                  when there is room; a media file, or any file a torrent backs, is unlinked
+                  directly here and cannot be recovered — one "Delete" vocabulary covering two
+                  different outcomes.
+                </li>
+                <li>
+                  Sweep away the parent directories this now leaves empty, one level at a time,
+                  never past the configured library root. "Directories swept" below counts these —
+                  folders the operator never named directly, removed as a consequence of approving
+                  the file(s) inside them.
+                </li>
+                <li>
+                  Remove the item from Jellyfin — or, if anything about it survived this action
+                  (another version, a sibling file, a merge), refresh it instead — then run ONE
+                  batched library refresh after every action in the whole plan has finished, never
+                  one refresh per file.
+                </li>
+              </ol>
+            </div>
 
             <dl className="plan-dry-run">
               <div><dt>Deletes planned</dt><dd>{plan.dryRun.deleteCount}</dd></div>
@@ -226,7 +356,12 @@ export function PlanScreen({ api, queued, onClear }: {
                   existed — rendering "0" or "undefined" for that case would both be lies about a
                   number Jellymaid never actually computed for this plan. */}
               {plan.dryRun.directoriesSwept !== undefined ? (
-                <div><dt>Directories swept</dt><dd>{plan.dryRun.directoriesSwept}</dd></div>
+                <div>
+                  <dt title="Now-empty parent folders removed after the file(s) inside them are gone, one level at a time, never above the configured library root">
+                    Directories swept
+                  </dt>
+                  <dd>{plan.dryRun.directoriesSwept}</dd>
+                </div>
               ) : null}
             </dl>
 
@@ -276,12 +411,7 @@ export function PlanScreen({ api, queued, onClear }: {
               ) : null}
             </div>
 
-            {summary ? (
-              <p className="plan-execution-summary" role="status">
-                Execution {summary.status}: {summary.done} done, {summary.failed} failed,{' '}
-                {summary.skipped} skipped, {summary.blocked} blocked — <Bytes value={summary.bytesFreed} /> freed.
-              </p>
-            ) : null}
+            {summary ? <ExecutionSummaryLine summary={summary} /> : null}
           </section>
 
           <table className="table plan-actions-table">

@@ -165,7 +165,10 @@ export function Dashboard({ api }: { api: DashboardApi }) {
             {/* The refusal reason is server text — a text node only, never markup. */}
             <span>{scanRefusal.message}</span>
             {scanRefusal.forcible ? (
-              <button type="button" className="btn btn-danger" onClick={() => void startScan(true)}>
+              // Not `btn-danger`: that fill is reserved for an action that actually blocks or
+              // destroys something (see styles.css). Forcing a scan only bypasses the path-map
+              // verification gate — a read-only check — so it gets the ordinary primary treatment.
+              <button type="button" className="btn btn-primary" onClick={() => void startScan(true)}>
                 Force scan anyway
               </button>
             ) : null}

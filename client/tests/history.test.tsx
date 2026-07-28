@@ -38,7 +38,7 @@ function section(container: HTMLElement, cls: string): HTMLElement {
 
 describe('History', () => {
   it('shows the audit trail: timestamp, actor, action, subject, outcome', async () => {
-    const { container } = render(<History api={api()} onQueue={() => {}} />)
+    const { container } = render(<History api={api()} onQueue={() => {}} onOpenPlan={() => {}} />)
     await screen.findByText('2026-07-28T00:00:00.000Z')
     const auditSection = section(container, '.history-audit')
     expect(within(auditSection).getByText('bob')).toBeInTheDocument()
@@ -59,13 +59,13 @@ describe('History', () => {
           afterJson: JSON.stringify({ status: 'failed', bytesFreed: 1_073_741_824, error: 'jellyfin item could not be removed' }),
         })],
       })),
-    })} onQueue={() => {}} />)
+    })} onQueue={() => {}} onOpenPlan={() => {}} />)
     const auditSection = section(container, '.history-audit')
     expect(await within(auditSection).findByText('1.0 GB')).toBeInTheDocument()
   })
 
   it('lists plans with their status', async () => {
-    const { container } = render(<History api={api()} onQueue={() => {}} />)
+    const { container } = render(<History api={api()} onQueue={() => {}} onOpenPlan={() => {}} />)
     const plansSection = section(container, '.history-plans')
     expect(await within(plansSection).findByText('p1')).toBeInTheDocument()
     expect(within(plansSection).getByText('draft')).toBeInTheDocument()
@@ -76,20 +76,20 @@ describe('History', () => {
     render(<History api={api({
       plans: vi.fn(async () => ({ plans: [planSummary({ status: 'running' })] })),
       resumePlan,
-    })} onQueue={() => {}} />)
+    })} onQueue={() => {}} onOpenPlan={() => {}} />)
     await userEvent.click(await screen.findByRole('button', { name: /resume/i }))
     expect(resumePlan).toHaveBeenCalledWith('p1')
   })
 
   it('does not offer Resume for a plan that is not stuck running', async () => {
-    render(<History api={api()} onQueue={() => {}} />)
+    render(<History api={api()} onQueue={() => {}} onOpenPlan={() => {}} />)
     await screen.findByText('draft')
     expect(screen.queryByRole('button', { name: /resume/i })).not.toBeInTheDocument()
   })
 
   it('lists trash entries with a Restore button, and calls restoreTrash with the trash id', async () => {
     const restoreTrash = vi.fn(async () => ({ restored: true }))
-    render(<History api={api({ restoreTrash })} onQueue={() => {}} />)
+    render(<History api={api({ restoreTrash })} onQueue={() => {}} onOpenPlan={() => {}} />)
     await userEvent.click(await screen.findByRole('button', { name: /restore/i }))
     expect(restoreTrash).toHaveBeenCalledWith('t1')
   })
@@ -97,7 +97,7 @@ describe('History', () => {
   it('does not offer Restore for a trash entry that was already restored', async () => {
     render(<History api={api({
       trash: vi.fn(async () => ({ entries: [trashEntry({ restoredAt: '2026-07-28T01:00:00.000Z' })] })),
-    })} onQueue={() => {}} />)
+    })} onQueue={() => {}} onOpenPlan={() => {}} />)
     await screen.findByText('/mnt/m/junk.nfo')
     expect(screen.queryByRole('button', { name: /restore/i })).not.toBeInTheDocument()
   })
@@ -111,7 +111,7 @@ describe('History', () => {
           afterJson: JSON.stringify({ mergedItemIds: ['item-a', 'item-b'] }),
         })],
       })),
-    })} onQueue={onQueue} />)
+    })} onQueue={onQueue} onOpenPlan={() => {}} />)
     await userEvent.click(await screen.findByRole('button', { name: /undo merge/i }))
     expect(onQueue).toHaveBeenCalledWith([{ type: 'split-versions', itemIds: ['item-a'] }])
   })
@@ -130,7 +130,7 @@ describe('History', () => {
           afterJson: JSON.stringify({ status: 'done', bytesFreed: 0, merged: ['item-a', 'item-b'] }),
         })],
       })),
-    })} onQueue={onQueue} />)
+    })} onQueue={onQueue} onOpenPlan={() => {}} />)
     await userEvent.click(await screen.findByRole('button', { name: /undo merge/i }))
     expect(onQueue).toHaveBeenCalledWith([{ type: 'split-versions', itemIds: ['item-a'] }])
   })
@@ -140,14 +140,73 @@ describe('History', () => {
       audit: vi.fn(async () => ({
         entries: [auditEntry({ actionType: 'merge-versions', outcome: 'failed', afterJson: null })],
       })),
-    })} onQueue={() => {}} />)
+    })} onQueue={() => {}} onOpenPlan={() => {}} />)
     await screen.findByText('merge-versions')
     expect(screen.queryByRole('button', { name: /undo merge/i })).not.toBeInTheDocument()
   })
 
   it('does not offer Undo merge on an unrelated action type', async () => {
-    render(<History api={api()} onQueue={() => {}} />)
+    render(<History api={api()} onQueue={() => {}} onOpenPlan={() => {}} />)
     await screen.findByText('delete-media')
     expect(screen.queryByRole('button', { name: /undo merge/i })).not.toBeInTheDocument()
+  })
+
+  // --- MAJOR 3: Resume runs a real destructive tail and must report what it actually did ----------
+  it('renders the ExecutionSummary a resume actually returns, rather than discarding it', async () => {
+    const resumePlan = vi.fn(async () => (
+      { planId: 'p1', status: 'completed', done: 4, failed: 0, skipped: 1, blocked: 0, bytesFreed: 9_999_999 }
+    ))
+    render(<History api={api({
+      plans: vi.fn(async () => ({ plans: [planSummary({ status: 'running' })] })),
+      resumePlan,
+    })} onQueue={() => {}} onOpenPlan={() => {}} />)
+    await userEvent.click(await screen.findByRole('button', { name: /resume/i }))
+    expect(await screen.findByText(/4 done/i)).toBeInTheDocument()
+    expect(await screen.findByText(/1 skipped/i)).toBeInTheDocument()
+    expect(await screen.findByText(/9\.5 MB/i)).toBeInTheDocument()
+  })
+
+  it('does not headline an all-blocked-or-skipped resume as an ordinary completed pass', async () => {
+    const resumePlan = vi.fn(async () => (
+      { planId: 'p1', status: 'completed', done: 0, failed: 0, skipped: 2, blocked: 0, bytesFreed: 0 }
+    ))
+    render(<History api={api({
+      plans: vi.fn(async () => ({ plans: [planSummary({ status: 'running' })] })),
+      resumePlan,
+    })} onQueue={() => {}} onOpenPlan={() => {}} />)
+    await userEvent.click(await screen.findByRole('button', { name: /resume/i }))
+    const summaryLine = await screen.findByText(/0 done/i)
+    expect(summaryLine.closest('.alert-warn')).not.toBeNull()
+  })
+
+  // --- MINOR 7: TrashEntry.purgeAfter is on the wire and must actually be shown -------------------
+  it('shows when a trashed file stops being recoverable', async () => {
+    const { container } = render(<History api={api({
+      trash: vi.fn(async () => ({ entries: [trashEntry({ purgeAfter: '2026-08-04T00:00:00.000Z' })] })),
+    })} onQueue={() => {}} onOpenPlan={() => {}} />)
+    await screen.findByText('/mnt/m/junk.nfo')
+    const trashSection = section(container, '.history-trash')
+    expect(within(trashSection).getByText('2026-08-04T00:00:00.000Z')).toBeInTheDocument()
+  })
+
+  // --- CRITICAL 1 (second half): an approved-but-unexecuted plan must be reachable again ----------
+  // Resume's server semantics are `running`-only (src/api/plans.ts) — offering it for `approved`
+  // would just 400. "Open" hands the id to the shell instead, which is what actually gets an
+  // operator back into a plan Resume can never reach.
+  it('offers Open for every plan, including one that is approved but not yet executed, and hands its id up', async () => {
+    const onOpenPlan = vi.fn()
+    render(<History api={api({
+      plans: vi.fn(async () => ({ plans: [planSummary({ id: 'p2', status: 'approved' })] })),
+    })} onQueue={() => {}} onOpenPlan={onOpenPlan} />)
+    await userEvent.click(await screen.findByRole('button', { name: /^open$/i }))
+    expect(onOpenPlan).toHaveBeenCalledWith('p2')
+  })
+
+  it('does not offer Resume for an approved plan, since resuming only ever works on a running one', async () => {
+    render(<History api={api({
+      plans: vi.fn(async () => ({ plans: [planSummary({ status: 'approved' })] })),
+    })} onQueue={() => {}} onOpenPlan={() => {}} />)
+    await screen.findByRole('button', { name: /^open$/i })
+    expect(screen.queryByRole('button', { name: /resume/i })).not.toBeInTheDocument()
   })
 })

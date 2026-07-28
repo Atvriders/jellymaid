@@ -1137,6 +1137,15 @@ button {
   color: var(--ink-muted);
 }
 
+/* A plan row's Open (always offered) and Resume (running only) buttons side by side, rather than
+   two separate columns for what is really one "act on this plan" cell. */
+.history-plan-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
 /* ---------- Misc ---------- */
 
 .empty {

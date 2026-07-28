@@ -17,6 +17,14 @@ type AuthState =
   | { kind: 'anonymous' }
   | { kind: 'authenticated'; username: string }
 
+/** Identity for de-duplicating a queued action: same type, same target path, same item ids. A
+ * NUL byte separates the fields (not a plain comma or space) so a `targetPath` that happens to
+ * contain one cannot collide with a different `itemIds` split — the same join-collision
+ * reasoning `findingId` (src/core/types.ts) uses elsewhere in this codebase. */
+function queuedActionKey(a: RequestedAction): string {
+  return [a.type, a.targetPath ?? '', (a.itemIds ?? []).join(',')].join('\0')
+}
+
 /**
  * The auth gate for the whole app. `/api/auth/me` only ever answers 200 (a live session) or 401
  * (no session) — see src/api/auth.ts — so any failure of that check is treated as "show the login
@@ -38,12 +46,44 @@ export function App({ api }: { api: Api }) {
    * `addToQueue` APPENDS rather than replaces: an operator building one plan out of a duplicate
    * queued on the Duplicates screen and a stray file queued on Explorer needs both to still be
    * there when they reach Plan, not just whichever screen queued something most recently.
+   *
+   * It also DE-DUPLICATES on `(type, targetPath, itemIds)`, and does so HERE rather than trusting
+   * any one screen to catch it: every screen's own "already queued" receipt (History's
+   * `queuedUndos`, Duplicates' `queuedFor`, Findings' selection, Explorer's `selected` map) is
+   * component-local state, so it resets the moment that screen unmounts. An operator who queues the
+   * same undo, the same duplicate or the same stray file twice from two visits to the same screen —
+   * or once each from two different screens naming the same target — must still see it once in the
+   * plan, not twice paying for the same bytes or double-submitting the same Jellyfin call.
    */
   const [queued, setQueued] = useState<RequestedAction[]>([])
   const addToQueue = useCallback((actions: RequestedAction[]) => {
-    setQueued((prev) => [...prev, ...actions])
+    setQueued((prev) => {
+      const seen = new Set(prev.map(queuedActionKey))
+      const next = [...prev]
+      for (const action of actions) {
+        const key = queuedActionKey(action)
+        if (seen.has(key)) continue
+        seen.add(key)
+        next.push(action)
+      }
+      return next
+    })
   }, [])
   const clearQueue = useCallback(() => setQueued([]), [])
+
+  /**
+   * The plan a build produced (or an operator reopened from History) — lifted beside `queued` for
+   * the identical reason: PlanScreen's own `plan`/`summary` state does not survive a tab switch,
+   * so without this, navigating away and back after a build (or after Approve, or after Execute)
+   * showed the pre-build "nothing queued" screen again, inviting a second `createPlan` against
+   * files a first, already-executed plan had just removed. PlanScreen refetches whatever this
+   * names via `api.getPlan` on its own mount; it never re-derives it from `queued`.
+   */
+  const [planId, setPlanId] = useState<string | null>(null)
+  const openPlan = useCallback((id: string) => {
+    setPlanId(id)
+    setScreen('Plan')
+  }, [])
 
   const checkSession = useCallback(() => {
     setAuth({ kind: 'checking' })
@@ -107,8 +147,10 @@ export function App({ api }: { api: Api }) {
         {screen === 'Findings' ? <Findings api={api} onQueue={addToQueue} /> : null}
         {screen === 'Duplicates' ? <Duplicates api={api} onQueue={addToQueue} /> : null}
         {screen === 'Explorer' ? <Explorer api={api} onQueue={addToQueue} /> : null}
-        {screen === 'Plan' ? <PlanScreen api={api} queued={queued} onClear={clearQueue} /> : null}
-        {screen === 'History' ? <History api={api} onQueue={addToQueue} /> : null}
+        {screen === 'Plan' ? (
+          <PlanScreen api={api} queued={queued} onClear={clearQueue} planId={planId} onPlanIdChange={setPlanId} />
+        ) : null}
+        {screen === 'History' ? <History api={api} onQueue={addToQueue} onOpenPlan={openPlan} /> : null}
         {screen === 'Settings' ? <Settings api={api} /> : null}
       </main>
     </div>

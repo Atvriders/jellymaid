@@ -139,6 +139,19 @@ describe('Dashboard', () => {
     expect(scanStart).toHaveBeenLastCalledWith({ force: true })
   })
 
+  // --- MINOR 8: `btn-danger` is reserved for an action that actually blocks or destroys (see
+  // styles.css) — forcing a scan only bypasses the path-map verification gate, a read-only check.
+  // It must not wear the same solid, high-contrast fill Execute/Resume use for a real delete.
+  it('does not give "Force scan anyway" the danger treatment reserved for a genuinely destructive action', async () => {
+    const scanStart = vi.fn()
+      .mockRejectedValueOnce(new ApiError(412, 'the path map has not been verified', { error: 'the path map has not been verified', forcible: true }))
+    render(<Dashboard api={api({ scanStart })} />)
+    await userEvent.click(await screen.findByRole('button', { name: /scan now/i }))
+    const forceButton = await screen.findByRole('button', { name: /force/i })
+    expect(forceButton.className).not.toContain('btn-danger')
+    expect(forceButton.className).toContain('btn-primary')
+  })
+
   it('does not offer a force option when the server body says forcible: false, even on a 412', async () => {
     const scanStart = vi.fn().mockRejectedValueOnce(new ApiError(412, 'refused for another reason', { error: 'refused for another reason', forcible: false }))
     render(<Dashboard api={api({ scanStart })} />)

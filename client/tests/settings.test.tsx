@@ -40,6 +40,26 @@ describe('Settings', () => {
     expect(pathmapPut).toHaveBeenCalled()
   })
 
+  // --- TEST HONESTY M8 ----------------------------------------------------------------------------
+  // The screen's own doc comment (line 40) says auto-detect only ever PROPOSES a row, and accepting
+  // one ("Add to mappings") is still local state — nothing reaches the server until "Save mappings"
+  // is clicked separately. The previous test above only proves DETECTING doesn't save; it never
+  // clicks the per-row "Add to mappings" button, so a mutant that made THAT button write straight
+  // to the server would still pass every test that existed before this one.
+  it('accepting a proposed mapping ("Add to mappings") only updates local state — it does not save until "Save mappings" is clicked separately', async () => {
+    const pathmapPut = vi.fn(async (m: unknown[]) => ({ mappings: m }))
+    render(<Settings api={api({ pathmapPut })} />)
+    await userEvent.type(await screen.findByLabelText(/mount roots/i), '/mnt')
+    await userEvent.click(screen.getByRole('button', { name: /auto-detect/i }))
+    await screen.findByText('/media/TV')
+
+    await userEvent.click(screen.getByRole('button', { name: /^add to mappings$/i }))
+    expect(pathmapPut).not.toHaveBeenCalled()
+
+    await userEvent.click(screen.getByRole('button', { name: /save mappings/i }))
+    expect(pathmapPut).toHaveBeenCalled()
+  })
+
   // Task 6 extension: the brief's own text calls for "read-only display of the current
   // thresholds", but GET /api/config/thresholds does not exist anywhere else in this app's
   // surface, so it was added alongside this screen (src/api/plans.ts). Every test above uses an
