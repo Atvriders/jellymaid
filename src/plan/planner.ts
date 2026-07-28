@@ -61,6 +61,16 @@ interface ResolvedAction {
   status: ActionStatus
 }
 
+/** The delete targets of every action not (yet) blocked — the plan's real scope. */
+function deletePathsOf(resolved: ResolvedAction[]): Set<string> {
+  return new Set(
+    resolved
+      .filter((r) => (r.action.type === 'delete-media' || r.action.type === 'delete-junk-file') && r.status !== 'blocked')
+      .map((r) => r.action.targetPath)
+      .filter((p): p is string => p !== undefined),
+  )
+}
+
 export async function buildPlan(deps: PlannerDeps, request: PlanRequest): Promise<PlanView> {
   const planId = randomUUID()
   const createdAt = new Date().toISOString()
@@ -72,15 +82,6 @@ export async function buildPlan(deps: PlannerDeps, request: PlanRequest): Promis
       throw new Error('merge-versions requires at least two item ids')
     }
   }
-
-  // Every path this plan proposes to remove, so `guard.torrent-scope` can tell "this torrent backs
-  // exactly what we asked for" from "this torrent also holds eleven files nobody named". Built from
-  // the REQUEST, not from guard outcomes, which is what keeps it free of circularity — a path stays
-  // in the plan's scope whether or not its own action ends up blocked.
-  const plannedPaths = new Set(
-    ordered.filter((a) => a.type === 'delete-media' || a.type === 'delete-junk-file')
-      .map((a) => a.targetPath).filter((p): p is string => p !== undefined),
-  )
 
   // One *arr inventory for the whole build, not one per action. See snapshotInventory.
   const resolveDeps: ResolveDeps = {
@@ -95,9 +96,7 @@ export async function buildPlan(deps: PlannerDeps, request: PlanRequest): Promis
   // land on different verdicts (one cleared by its override, the other not).
   const resolved: ResolvedAction[] = []
   for (const action of ordered) {
-    let verdicts: GuardVerdict[] = []
     let resolution: Resolution | undefined
-    let status: ActionStatus = 'pending'
 
     if (action.targetPath) {
       const root = deps.pathMap.rootFor(action.targetPath)
@@ -105,13 +104,33 @@ export async function buildPlan(deps: PlannerDeps, request: PlanRequest): Promis
         throw new Error(`refusing to plan an action outside every configured root: ${action.targetPath}`)
       }
       resolution = await resolveTarget(resolveDeps, action.targetPath)
-      verdicts = evaluateGuards(resolution, deps.config, {
-        plannedPaths, removesTorrentData: action.type !== 'remove-empty-folder',
-      })
-      if (isBlocked(verdicts, action.overrides ?? []).blocked) status = 'blocked'
     }
 
-    resolved.push({ action, resolution, verdicts, status })
+    resolved.push({ action, resolution, verdicts: [], status: 'pending' })
+  }
+
+  // Pass 2: judge every resolution. `guard.torrent-scope` asks "would removing this torrent take
+  // files nobody named", which depends on which OTHER actions will actually run — and that depends
+  // on their own verdicts, this one included. Guards are pure functions of an already-fetched
+  // resolution, so the knot is untied by iterating to a fixed point instead of guessing: start
+  // optimistic (every delete counts), re-judge with whatever survived, and repeat. Each pass can
+  // only remove paths, never add them, so it converges in at most one iteration per action, and the
+  // set it converges on is exactly `executablePaths` — the same "will actually run" set the byte
+  // accounting below uses. Reading the RAW REQUEST here instead would let a blocked sibling vouch
+  // for a torrent's scope on behalf of a delete that is never going to happen.
+  let plannedPaths = deletePathsOf(resolved)
+  for (let pass = 0; pass <= resolved.length; pass += 1) {
+    for (const entry of resolved) {
+      if (!entry.resolution) continue
+      entry.verdicts = evaluateGuards(entry.resolution, deps.config, {
+        plannedPaths,
+        removesTorrentData: entry.action.type !== 'remove-empty-folder',
+      })
+      entry.status = isBlocked(entry.verdicts, entry.action.overrides ?? []).blocked ? 'blocked' : 'pending'
+    }
+    const next = deletePathsOf(resolved)
+    if (next.size === plannedPaths.size) break
+    plannedPaths = next
   }
 
   // Only a path whose OWN action will actually run belongs in "this link goes away in this plan":

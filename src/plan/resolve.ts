@@ -233,17 +233,27 @@ export async function resolveTarget(deps: ResolveDeps, containerPath: string): P
   if (deps.qbittorrent) {
     try {
       const all = await deps.qbittorrent.torrents()
-      const fileSets = new Map<string, TorrentFileSet | null>()
-      const fileSetFor = async (t: Torrent): Promise<TorrentFileSet | null> => {
+      const liveSets = new Map<string, TorrentFileSet | null>()
+      const liveFileSetFor = async (t: Torrent): Promise<TorrentFileSet | null> => {
+        const cached = liveSets.get(t.hash)
+        if (cached !== undefined) return cached
+        const fresh = await liveFileSet(deps, t)
+        liveSets.set(t.hash, fresh)
+        return fresh
+      }
+      const fileSets = new Map<string, LoadedFileSet>()
+      const fileSetFor = async (t: Torrent): Promise<LoadedFileSet> => {
         const cached = fileSets.get(t.hash)
         if (cached !== undefined) return cached
-        const resolved = await loadFileSet(deps, t)
+        const resolved = await loadFileSet(deps, t, liveFileSetFor)
         fileSets.set(t.hash, resolved)
         return resolved
       }
       torrents = []
       for (const t of all) {
-        const match = await matchTorrent(t, deps.pathMap, containerPath, inodeSet, dev, inode, ownedHashes, fileSetFor)
+        const match = await matchTorrent(
+          t, deps.pathMap, containerPath, inodeSet, dev, inode, ownedHashes, fileSetFor, liveFileSetFor,
+        )
         if (match) torrents.push(match)
       }
     } catch {
@@ -314,31 +324,59 @@ export async function resolveTarget(deps: ResolveDeps, containerPath: string): P
 }
 
 /**
- * Every file a torrent owns, preferring the index (written by the qBittorrent scan phase, which
- * already did the path translation) and falling back to a live fetch. Returns null only when
- * neither could answer — which is the one case a caller must treat as "unknown", never as "one
- * file".
+ * A file list may only be used to prove a torrent does NOT own a path when it is complete: every
+ * file it counts is a file it can name. `paths` holds only the MAPPABLE subset, so a shorter
+ * `paths` than `count` means the list cannot answer the question — and a `count` of zero is
+ * qBittorrent saying nothing at all, not saying "no files".
  */
-async function loadFileSet(deps: ResolveDeps, t: Torrent): Promise<TorrentFileSet | null> {
+const isCompleteFileSet = (s: TorrentFileSet | null): s is TorrentFileSet =>
+  s !== null && s.count > 0 && s.paths.length === s.count
+
+type FileSetSource = 'index' | 'live' | 'none'
+interface LoadedFileSet { set: TorrentFileSet | null; source: FileSetSource }
+
+/** The torrent's files exactly as the last scan translated them; null when it indexed none. */
+function indexedFileSet(deps: ResolveDeps, hash: string): TorrentFileSet | null {
   const rows = deps.db.prepare('SELECT container_path FROM torrent_files WHERE hash = ?')
-    .all(t.hash) as Array<{ container_path: string | null }>
-  if (rows.length > 0) {
-    // `count` is rows.length, not the mapped subset: a file whose path no mapping covers is still
-    // a file that "delete with data" would take.
-    return { count: rows.length, paths: rows.map((r) => r.container_path).filter((p): p is string => p !== null) }
-  }
+    .all(hash) as Array<{ container_path: string | null }>
+  if (rows.length === 0) return null
+  // `count` is rows.length, not the mapped subset: a file whose path no mapping covers is still a
+  // file that "delete with data" would take, and it must not shrink the total.
+  return { count: rows.length, paths: rows.map((r) => r.container_path).filter((p): p is string => p !== null) }
+}
+
+/** The torrent's files as qBittorrent reports them right now; null when it could not be asked. */
+async function liveFileSet(deps: ResolveDeps, t: Torrent): Promise<TorrentFileSet | null> {
   if (!deps.qbittorrent?.files) return null
   try {
     const list = await deps.qbittorrent.files(t.hash)
     // Same translation the scan phase performs: file names are relative to the torrent's savePath.
+    // An unmappable savePath yields no paths at all, which `isCompleteFileSet` then refuses to
+    // treat as an answer rather than reading it as "owns nothing".
     const base = t.savePath ? deps.pathMap.qbitToContainer(t.savePath) : null
-    return {
-      count: list.length,
-      paths: base ? list.map((f) => join(base, f.relPath)) : [],
-    }
+    return { count: list.length, paths: base ? list.map((f) => join(base, f.relPath)) : [] }
   } catch {
     return null
   }
+}
+
+/**
+ * The best file list available for a torrent: the index first (already translated by the scan
+ * phase, no network), a live fetch when the indexed one cannot answer. Whichever is returned, the
+ * `source` says where it came from, because "the index does not name this file" is a scan-time
+ * claim that deserves a second opinion and "qBittorrent does not name this file" is not.
+ */
+async function loadFileSet(
+  deps: ResolveDeps, t: Torrent, live: (t: Torrent) => Promise<TorrentFileSet | null>,
+): Promise<LoadedFileSet> {
+  const indexed = indexedFileSet(deps, t.hash)
+  if (isCompleteFileSet(indexed)) return { set: indexed, source: 'index' }
+  const fresh = await live(t)
+  if (isCompleteFileSet(fresh)) return { set: fresh, source: 'live' }
+  // Neither can answer. Whatever partial list exists is still worth carrying as evidence — the
+  // count feeds `guard.torrent-scope` — but nothing derived from it is authoritative.
+  if (indexed) return { set: indexed, source: 'index' }
+  return { set: fresh, source: fresh ? 'live' : 'none' }
 }
 
 /**
@@ -383,7 +421,9 @@ function resolveJellyfinOwnership(db: Db, containerPath: string): JellyfinOwners
 
 async function matchTorrent(
   t: Torrent, pathMap: PathMap, target: string, inodeSet: Set<string>, dev: number, inode: number,
-  ownedHashes: Set<string>, fileSetFor: (t: Torrent) => Promise<TorrentFileSet | null>,
+  ownedHashes: Set<string>,
+  fileSetFor: (t: Torrent) => Promise<LoadedFileSet>,
+  liveFileSetFor: (t: Torrent) => Promise<TorrentFileSet | null>,
 ): Promise<TorrentMatch | null> {
   const base = {
     hash: t.hash, name: t.name, category: t.category, tags: t.tags, state: t.state,
@@ -399,18 +439,18 @@ async function matchTorrent(
   // like a match on the sentinel value alone.
   for (const candidate of [contentContainer, saveContainer]) {
     if (!candidate) continue
-    if (inodeSet.has(candidate)) return { ...base, matchedBy: 'inode', files: await fileSetFor(t) }
+    if (inodeSet.has(candidate)) return { ...base, matchedBy: 'inode', files: (await fileSetFor(t)).set }
     try {
       const st = statSync(candidate)
       if (Number(st.dev) === dev && Number(st.ino) === inode && inode !== 0) {
-        return { ...base, matchedBy: 'inode', files: await fileSetFor(t) }
+        return { ...base, matchedBy: 'inode', files: (await fileSetFor(t)).set }
       }
     } catch { /* not present on disk right now */ }
   }
 
   // The torrent's own file list, per the index: it names the files this torrent owns, which is the
   // question — not what the paths happen to look like.
-  if (ownedHashes.has(t.hash)) return { ...base, matchedBy: 'file', files: await fileSetFor(t) }
+  if (ownedHashes.has(t.hash)) return { ...base, matchedBy: 'file', files: (await fileSetFor(t)).set }
 
   // Containment is the LAST resort, and only when there is no file list to consult. `contentPath`
   // looks authoritative but is not: qBittorrent reports `content_path === save_path` for a
@@ -426,9 +466,23 @@ async function matchTorrent(
     : Boolean(saveContainer && target.startsWith(`${saveContainer}${sep}`))
   if (!contained) return null
 
-  const files = await fileSetFor(t)
-  // A file list that CAN be read and does not contain the target settles it: not this torrent's
-  // file. `ownedHashes` above already covered the indexed case, and a live list is checked here.
-  if (files) return files.paths.includes(target) ? { ...base, matchedBy: 'file', files } : null
-  return { ...base, matchedBy: 'path', files: null }
+  const loaded = await fileSetFor(t)
+  if (loaded.set?.paths.includes(target)) return { ...base, matchedBy: 'file', files: loaded.set }
+
+  // The list in hand does not name the target — which only means "not this torrent's file" if the
+  // list could name every file it counts. An INCOMPLETE list names none of the files whose paths no
+  // mapping covered (the qBittorrent phase writes NULL container_path for a torrent whose savePath
+  // did not map, and their NULL dev/inode keeps the inode join from rescuing them either), and an
+  // indexed list is in any case a scan-time claim about a torrent that may have been moved since.
+  // Getting this wrong in this direction is the expensive one: an over-match is caught by
+  // `guard.torrent-scope`, while a miss unlinks a file qBittorrent is actively seeding with no
+  // guard in the chain ever running. So only a complete, LIVE-confirmed list ends it here.
+  let authoritative = loaded.source === 'live' && isCompleteFileSet(loaded.set)
+  if (loaded.source === 'index') {
+    const fresh = await liveFileSetFor(t)
+    if (fresh?.paths.includes(target)) return { ...base, matchedBy: 'file', files: fresh }
+    if (isCompleteFileSet(fresh)) authoritative = true
+  }
+  if (authoritative) return null
+  return { ...base, matchedBy: 'path', files: loaded.set }
 }

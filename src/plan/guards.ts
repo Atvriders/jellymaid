@@ -170,12 +170,20 @@ function protectedState(r: Resolution, config: FileConfig): GuardVerdict {
     if (r.arrUnmappable.count > 0) {
       // The same fail-closed reasoning as a partial inventory, one layer earlier: the inventory
       // arrived complete, but its paths live in a namespace no path mapping covers, so no record
-      // could ever match this file and "absent" cannot be read as "not managed". The operator fixes
-      // this by adding a mapping, not by overriding the guard — hence the reason names the paths.
+      // could ever match this file and "absent" cannot be read as "not managed".
+      //
+      // This blocks the whole install on a single record, with no override, so the reason has to
+      // carry its own remedy — and the remedy is genuinely non-obvious. *arr paths are translated
+      // through the JELLYFIN prefix of a `PathMapping` (there is no *arr field on it today), so
+      // "add a mapping" means adding one whose `jellyfin` prefix is really the *arr's prefix.
+      // Radarr also reports the movie FOLDER for a movie that has no file yet, so one decommissioned
+      // or second root folder is enough to wedge every delete until a mapping covers it.
       parts.push(
-        `${r.arrUnmappable.count} *arr record(s) report a path namespace no mapping covers `
-        + `(e.g. ${r.arrUnmappable.samples.join(', ')}), so Jellymaid cannot confirm whether this file is `
-        + '*arr-managed and cannot guarantee it will be unmonitored before deletion',
+        `${r.arrUnmappable.count} *arr record(s) report paths that no path mapping can translate `
+        + `(e.g. ${r.arrUnmappable.samples.join(', ')}). Add a path mapping whose jellyfin prefix covers that `
+        + '*arr namespace — *arr paths are translated through the jellyfin prefix — and re-scan. Until then '
+        + 'Jellymaid cannot confirm whether this file is *arr-managed and cannot guarantee it will be '
+        + 'unmonitored before deletion',
       )
     }
     if (unverifiable.includes('qbittorrent')) {
@@ -243,8 +251,16 @@ function torrentScope(r: Resolution, context: GuardContext): GuardVerdict {
   const planned = new Set([...(context.plannedPaths ?? [r.path]), r.path, ...r.hardlinks])
   const offenders: Array<Record<string, unknown>> = []
   for (const t of r.torrents) {
-    if (!t.files) {
-      offenders.push({ hash: t.hash, name: t.name, reason: 'file list could not be read' })
+    // No list, or a list of nothing. A `files()` that returns [] is qBittorrent declining to say
+    // (most often a hash it no longer has), never a torrent that owns zero files — and reading it
+    // as zero makes `filesNotInPlan` zero, which would pass the guard and remove the torrent with
+    // its data on the strength of an empty answer.
+    if (!t.files || t.files.count === 0) {
+      offenders.push({
+        hash: t.hash,
+        name: t.name,
+        reason: t.files ? 'qBittorrent reported no files for this torrent' : 'file list could not be read',
+      })
       continue
     }
     const targeted = t.files.paths.filter((p) => planned.has(p)).length
@@ -265,13 +281,14 @@ function torrentScope(r: Resolution, context: GuardContext): GuardVerdict {
     return pass('guard.torrent-scope', 'every file of every matched torrent is in this plan')
   }
   const unreadable = offenders.filter((o) => 'reason' in o)
+  const unreadableDetail = unreadable.map((o) => `${String(o.name)} (${String(o.reason)})`)
   const wider = offenders.filter((o) => 'filesNotInPlan' in o)
   const reasons: string[] = []
   if (wider.length) {
     reasons.push(wider.map((o) => `removing ${String(o.name)} would also delete ${String(o.filesNotInPlan)} file(s) this plan does not name`).join('; '))
   }
   if (unreadable.length) {
-    reasons.push(`${unreadable.map((o) => String(o.name)).join(', ')}: file list could not be read, so the scope of the delete is unknown`)
+    reasons.push(`${unreadableDetail.join(', ')}: the scope of the delete is unknown`)
   }
   return {
     guard: 'guard.torrent-scope',

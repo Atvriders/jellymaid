@@ -41,8 +41,6 @@ interface RunContext {
   planId: string
   /** `deps` with the *arr inventory snapshotted for this run. Never used for the unmonitor call. */
   resolveDeps: ResolveDeps
-  /** Every container path the plan removes, for `guard.torrent-scope`. */
-  plannedPaths: Set<string>
   /** Items whose merge state this plan changes, so the index no longer describes them. */
   mergedItemIds: Set<string>
 }
@@ -122,6 +120,31 @@ export function createExecutor(deps: ExecutorDeps) {
     )
   }
 
+  /**
+   * The paths this plan is still going to remove, read fresh from the action statuses each time it
+   * is asked. `guard.torrent-scope` reads it, and "named in the plan" is emphatically not the same
+   * as "will actually be deleted": if E01's *arr unmonitor could not be confirmed, its delete is
+   * skipped precisely so nothing takes E01's bytes — and if E02 still counted E01 as planned, E02's
+   * delete-with-data would remove the whole torrent and destroy E01 anyway, silently undoing the
+   * fail-closed protection. So `skipped`, `blocked` and `failed` actions drop out, and because this
+   * is recomputed per action rather than once up front, an action skipped moments ago is already
+   * gone from the set. `done` and `pending` both stay: a resumed plan still targets what its first
+   * attempt removed.
+   */
+  function eligiblePaths(planId: string): Set<string> {
+    const rows = deps.db.prepare(
+      `SELECT payload_json FROM plan_actions
+       WHERE plan_id = ? AND type IN ('delete-media','delete-junk-file')
+         AND status NOT IN ('skipped','blocked','failed')`,
+    ).all(planId) as Array<{ payload_json: string }>
+    const paths = new Set<string>()
+    for (const row of rows) {
+      const payload = JSON.parse(row.payload_json) as { targetPath?: string }
+      if (payload.targetPath) paths.add(payload.targetPath)
+    }
+    return paths
+  }
+
   async function execute(planId: string, actor: string): Promise<ExecutionSummary> {
     // The mutex is claimed before ANY other work, including the validating reads, so that no later
     // edit which introduces an await into validation can open a window for a second run. It is
@@ -175,23 +198,13 @@ export function createExecutor(deps: ExecutorDeps) {
         .flatMap((a) => a.payload.itemIds ?? []),
     )
 
-    /**
-     * Every path this plan removes, for `guard.torrent-scope`. Taken from the whole approved plan
-     * including actions already done — a resumed plan still "targets" what its first attempt
-     * removed, and forgetting that would block the tail of every resumed multi-file delete.
-     */
-    const plannedPaths = new Set(
-      plan.actions.filter((a) => a.type === 'delete-media' || a.type === 'delete-junk-file')
-        .map((a) => a.payload.targetPath).filter((p): p is string => p !== undefined),
-    )
-
     // One *arr inventory for the whole run rather than one per action; see snapshotInventory for
     // why the unmonitor call and the torrent list are deliberately left un-snapshotted.
     const resolveDeps: ResolveDeps = {
       ...deps, radarr: snapshotInventory(deps.radarr), sonarr: snapshotInventory(deps.sonarr),
     }
 
-    const context: RunContext = { planId, resolveDeps, plannedPaths, mergedItemIds }
+    const context: RunContext = { planId, resolveDeps, mergedItemIds }
 
     try {
       // Actions run in `seq` order — the order the planner fixed (merges first) and the operator
@@ -313,7 +326,7 @@ export function createExecutor(deps: ExecutorDeps) {
 
     const resolution = await resolveTarget(context.resolveDeps, target)
     const verdicts = evaluateGuards(resolution, deps.config, {
-      plannedPaths: context.plannedPaths,
+      plannedPaths: eligiblePaths(context.planId),
       // rmdir takes nothing but an empty directory; only the delete actions reach deleteWithData.
       removesTorrentData: action.type !== 'remove-empty-folder',
     })

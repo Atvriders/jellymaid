@@ -181,6 +181,64 @@ describe('resolveTarget', () => {
     expect(r.torrents[0]!.files).toEqual({ count: 2, paths: [episode] })
   })
 
+  it('does not read an INDEXED list of unmapped files as proof the torrent does not own the target', async () => {
+    // The qBittorrent phase writes NULL container_path for every file of a torrent whose savePath
+    // did not map at scan time. Add the download mapping afterwards and, until the next scan, the
+    // indexed list is non-empty but names nothing — and its NULL dev/inode means the inode join
+    // cannot rescue it either. Concluding "not this torrent's file" there unlinks a file
+    // qBittorrent is actively seeding, with no guard in the chain ever running.
+    mkdirSync(join(dir, 'dl', 'Pack'), { recursive: true })
+    const episode = join(dir, 'dl', 'Pack', 'E01.mkv')
+    writeFileSync(episode, 'e')
+    db.prepare('INSERT INTO torrent_files (hash, file_index, rel_path, container_path, size_bytes) VALUES (?,?,?,?,?)')
+      .run('H1', 0, 'Pack/E01.mkv', null, 1)
+    db.prepare('INSERT INTO torrent_files (hash, file_index, rel_path, container_path, size_bytes) VALUES (?,?,?,?,?)')
+      .run('H1', 1, 'Pack/E02.mkv', null, 1)
+    const r = await resolveTarget(deps({
+      qbittorrent: {
+        torrents: async () => [torrent({ contentPath: '/downloads/Pack', savePath: '/downloads' })],
+        files: async () => { throw new Error('qbit 500') },
+      },
+    }), episode)
+    expect(r.torrents.map((t) => t.matchedBy)).toEqual(['path'])
+  })
+
+  it('does not read a LIVE list whose save path is unmappable as proof of non-ownership', async () => {
+    // contentPath maps but savePath does not, so every relPath joins onto nothing: a non-zero count
+    // with zero usable paths. Same trap, reached live rather than through the index.
+    mkdirSync(join(dir, 'dl', 'Pack'), { recursive: true })
+    const episode = join(dir, 'dl', 'Pack', 'E01.mkv')
+    writeFileSync(episode, 'e')
+    const r = await resolveTarget(deps({
+      qbittorrent: {
+        torrents: async () => [torrent({ contentPath: '/downloads/Pack', savePath: '/elsewhere' })],
+        files: async () => [
+          { index: 0, relPath: 'Pack/E01.mkv', sizeBytes: 1 }, { index: 1, relPath: 'Pack/E02.mkv', sizeBytes: 1 },
+        ],
+      },
+    }), episode)
+    expect(r.torrents.map((t) => t.matchedBy)).toEqual(['path'])
+  })
+
+  it('re-checks live when a stale indexed list does not name the target', async () => {
+    mkdirSync(join(dir, 'dl', 'Pack'), { recursive: true })
+    const episode = join(dir, 'dl', 'Pack', 'E02.mkv')
+    writeFileSync(episode, 'e')
+    // The index knows one file; qBittorrent has since added the one being deleted.
+    db.prepare('INSERT INTO torrent_files (hash, file_index, rel_path, container_path, size_bytes) VALUES (?,?,?,?,?)')
+      .run('H1', 0, 'Pack/E01.mkv', join(dir, 'dl', 'Pack', 'E01.mkv'), 1)
+    const r = await resolveTarget(deps({
+      qbittorrent: {
+        torrents: async () => [torrent({ contentPath: '/downloads/Pack', savePath: '/downloads' })],
+        files: async () => [
+          { index: 0, relPath: 'Pack/E01.mkv', sizeBytes: 1 }, { index: 1, relPath: 'Pack/E02.mkv', sizeBytes: 1 },
+        ],
+      },
+    }), episode)
+    expect(r.torrents.map((t) => t.matchedBy)).toEqual(['file'])
+    expect(r.torrents[0]!.files?.count).toBe(2)
+  })
+
   it('falls back to path containment, flagged as such, only when the file list cannot be read', async () => {
     const inside = join(dir, 'dl', 'Heat', 'CD1.mkv')
     mkdirSync(join(dir, 'dl', 'Heat'), { recursive: true })

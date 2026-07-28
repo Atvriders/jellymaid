@@ -231,6 +231,17 @@ describe('guard.torrent-scope', () => {
     expect(v.outcome).toBe('pass')
   })
 
+  it('blocks when qBittorrent reports an EMPTY file list — nothing said is not "no files"', () => {
+    // A hash qBittorrent no longer has answers []. Read as "zero files", filesNotInPlan is zero and
+    // the guard would wave through a delete-with-data on the strength of an empty answer.
+    const v = verdict(
+      evaluateGuards(resolution({ torrents: [torrent({ files: { count: 0, paths: [] } })] }), config()),
+      'guard.torrent-scope',
+    )
+    expect(v.outcome).toBe('block')
+    expect(v.reason).toMatch(/no files/i)
+  })
+
   it('blocks when the torrent file list could not be read at all', () => {
     const v = verdict(evaluateGuards(resolution({ torrents: [torrent({ files: null })] }), config()), 'guard.torrent-scope')
     expect(v.outcome).toBe('block')
@@ -281,8 +292,12 @@ describe('guard.protected — an *arr namespace no mapping covers', () => {
     const v = verdict(evaluateGuards(resolution({ arrUnmappable: { count: 3, samples: ['/data/movies/Heat.mkv'] } }), config()), 'guard.protected')
     expect(v.outcome).toBe('block')
     expect(v.overridable).toBe(false)
-    expect(v.reason).toMatch(/namespace|mapping/i)
     expect(isBlocked([v], ['guard.protected']).blocked).toBe(true)
+    // The block is whole-install and has no override, so the reason has to carry its own remedy:
+    // which paths failed, and that the fix is a mapping covering that *arr namespace.
+    expect(v.reason).toContain('/data/movies/Heat.mkv')
+    expect(v.reason).toMatch(/add a path mapping/i)
+    expect(v.reason).toMatch(/jellyfin prefix/i)
   })
 
   it('passes when every *arr path translated', () => {

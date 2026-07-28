@@ -380,6 +380,50 @@ describe('execute — qBittorrent', () => {
     expect(calls).toContain('qbit.delete:H1')
   })
 
+  it('does not count a sibling whose own delete was skipped as still targeted', async () => {
+    // E01 and E02 are the two files of one torrent, so the plan clears guard.torrent-scope: both
+    // are named. At execute time E01's *arr unmonitor cannot be confirmed and its delete is skipped
+    // — the fail-closed protection. If E02 still counts E01 as "in the plan", delete-with-data
+    // takes E01's bytes anyway and the protection is silently undone.
+    const pack = join(root, 'Pack')
+    mkdirSync(pack, { recursive: true })
+    const e01 = join(pack, 'E01.mkv')
+    const e02 = join(pack, 'E02.mkv')
+    writeFileSync(e01, '1'); writeFileSync(e02, '2')
+    const d = deps({
+      qbittorrent: qbit({
+        torrents: async () => [torrent({ contentPath: '/downloads/Pack', savePath: '/downloads' })],
+        files: async () => [
+          { index: 0, relPath: 'Pack/E01.mkv', sizeBytes: 1 }, { index: 1, relPath: 'Pack/E02.mkv', sizeBytes: 1 },
+        ],
+      }),
+      radarr: arrClient('radarr', {
+        inventory: async () => ({
+          records: [
+            arrRecord({ remoteId: 1, arrPath: '/media/Pack/E01.mkv' }),
+            arrRecord({ remoteId: 2, arrPath: '/media/Pack/E02.mkv' }),
+          ],
+          complete: true,
+        }),
+        unmonitorByPath: async (p: string) => {
+          calls.push(`radarr.unmonitor:${p}`)
+          return p.endsWith('E01.mkv')
+            ? { outcome: 'lookup-failed', recordId: null }
+            : { outcome: 'unmonitored', recordId: 2 }
+        },
+      }),
+    })
+    const plan = await planFor(d, [
+      { type: 'delete-media', targetPath: e01 }, { type: 'delete-media', targetPath: e02 },
+    ])
+    const summary = await createExecutor(d).execute(plan.id, 'bob')
+    expect(summary.skipped).toBe(1)
+    expect(summary.blocked).toBe(1)
+    expect(calls.some((c) => c.startsWith('qbit.delete'))).toBe(false)
+    expect(existsSync(e01)).toBe(true)
+    expect(existsSync(e02)).toBe(true)
+  })
+
   it('one failure does not abort the rest of the plan', async () => {
     const other = join(root, 'Other.mkv')
     writeFileSync(other, 'y'.repeat(50))

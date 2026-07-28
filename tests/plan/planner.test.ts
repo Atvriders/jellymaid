@@ -187,6 +187,46 @@ describe('buildPlan', () => {
     expect(plan.dryRun.bytesFreed).toBe(0)
   })
 
+  it('does not let a blocked sibling vouch for a torrent\'s scope', async () => {
+    // Both files of one torrent are named, so at first glance the whole torrent is in the plan. But
+    // A.mkv is blocked (it did not override the private-ratio block that B.mkv did), so removing
+    // the torrent for B.mkv would take A.mkv's bytes — the very file the block just protected.
+    const files = async () => [
+      { index: 0, relPath: 'A.mkv', sizeBytes: 1 }, { index: 1, relPath: 'B.mkv', sizeBytes: 1 },
+    ]
+    const plan = await buildPlan(deps({
+      config: fileConfigSchema.parse({ guards: { minRatio: 10 } }),
+      qbittorrent: {
+        torrents: async () => [torrent({ isPrivate: true, ratio: 1, contentPath: '/downloads', savePath: '/downloads' })],
+        files,
+      },
+    }), { createdBy: 'bob', actions: [
+      { type: 'delete-media', targetPath: a },
+      { type: 'delete-media', targetPath: b, overrides: ['guard.private-ratio'] },
+    ] })
+    const aAction = plan.actions.find((x) => x.payload.targetPath === a)!
+    const bAction = plan.actions.find((x) => x.payload.targetPath === b)!
+    expect(aAction.status).toBe('blocked')
+    expect(bAction.status).toBe('blocked')
+    expect(bAction.guardVerdicts.find((v) => v.guard === 'guard.torrent-scope')!.outcome).toBe('block')
+    expect(plan.dryRun.torrentsRemoved).toBe(0)
+  })
+
+  it('leaves both files pending when the plan really does cover the whole torrent', async () => {
+    const plan = await buildPlan(deps({
+      qbittorrent: {
+        torrents: async () => [torrent({ contentPath: '/downloads', savePath: '/downloads' })],
+        files: async () => [
+          { index: 0, relPath: 'A.mkv', sizeBytes: 1 }, { index: 1, relPath: 'B.mkv', sizeBytes: 1 },
+        ],
+      },
+    }), { createdBy: 'bob', actions: [
+      { type: 'delete-media', targetPath: a }, { type: 'delete-media', targetPath: b },
+    ] })
+    expect(plan.actions.every((x) => x.status === 'pending')).toBe(true)
+    expect(plan.dryRun.torrentsRemoved).toBe(1)
+  })
+
   it('marks a guard-blocked action blocked and counts it', async () => {
     const plan = await buildPlan(deps({
       qbittorrent: { torrents: async () => [torrent({ state: 'downloading', contentPath: '/downloads/A.mkv' })] },
