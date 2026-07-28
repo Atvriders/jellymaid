@@ -15,6 +15,18 @@ describe('normalizeTitle', () => {
     ['Mission: Impossible — Fallout', 'mission impossible fallout'],
     ['   Extra   Spaces   ', 'extra spaces'],
     ['Blade Runner 2049', 'blade runner 2049'],
+    // Ambiguous release-token words that are also ordinary English words: only a
+    // filename-shaped string may break on these, and never at token index 0.
+    ['Internal Affairs', 'internal affairs'],
+    ['Cut Bank', 'cut bank'],
+    ['The Cut', 'cut'],
+    ['Extended Family', 'extended family'],
+    ['The Final Cut', 'final cut'],
+    // A bare hyphen in a display title is part of the word, not a scene-group suffix.
+    ['Spider-Man', 'spider man'],
+    ['X-Men', 'x men'],
+    // Drop at most one leading article, never chain into a second one.
+    ['The A Word', 'a word'],
   ]
   for (const [input, expected] of cases) {
     it(`normalizes ${JSON.stringify(input)}`, () => expect(normalizeTitle(input)).toBe(expected))
@@ -27,6 +39,22 @@ describe('normalizeTitle', () => {
 
   it('returns an empty string for input that is only noise', () => {
     expect(normalizeTitle('(2019) [1080p]')).toBe('')
+  })
+
+  it('does not fold "Spider-Man" onto the unrelated film "Spider"', () => {
+    expect(normalizeTitle('Spider-Man')).not.toBe(normalizeTitle('Spider'))
+  })
+
+  it('still strips a real release-name year and scene tags behind a filename separator', () => {
+    expect(normalizeTitle('Heat.1995.1080p.BluRay.x264-GROUP')).toBe('heat')
+  })
+
+  it('keeps non-Latin scripts instead of erasing them to an empty, colliding key', () => {
+    const spiritedAway = normalizeTitle('千と千尋の神隠し')
+    const princessMononoke = normalizeTitle('もののけ姫')
+    expect(spiritedAway).not.toBe('')
+    expect(princessMononoke).not.toBe('')
+    expect(spiritedAway).not.toBe(princessMononoke)
   })
 })
 

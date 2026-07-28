@@ -123,11 +123,25 @@ Expected: FAIL — module not found.
 
 ```ts
 // src/rules/normalize.ts
-const RELEASE_TOKENS = new Set([
-  '1080p', '720p', '480p', '2160p', '4k', 'uhd', 'hdr', 'hdr10', 'dv', 'sdr',
-  'bluray', 'blu', 'ray', 'bdrip', 'brrip', 'dvdrip', 'webrip', 'web', 'webdl', 'hdtv', 'remux',
+/**
+ * Tokens that are never words in a real title — breaking on one is always safe.
+ */
+const UNAMBIGUOUS_RELEASE_TOKENS = new Set([
+  '1080p', '720p', '480p', '2160p', '4k',
+  'bluray', 'bdrip', 'brrip', 'dvdrip', 'webrip', 'webdl', 'hdtv', 'remux',
   'x264', 'x265', 'h264', 'h265', 'hevc', 'avc', 'xvid', 'divx', 'av1',
-  'aac', 'ac3', 'dts', 'hd', 'ma', 'truehd', 'atmos', 'ddp', 'dd', 'eac3', 'flac',
+  'aac', 'ac3', 'dts', 'truehd', 'atmos', 'eac3', 'flac', 'ddp',
+])
+
+/**
+ * Tokens that ARE ordinary English words. Breaking on these unconditionally erased real
+ * films: "Internal Affairs", "Cut Bank", "The Cut" and "Extended Family" all collapsed to
+ * the empty string and therefore matched each other. Only break on one when the string
+ * already looks like a filename, and never at position 0 — a title that STARTS with one
+ * of these is a title, not a release name.
+ */
+const AMBIGUOUS_RELEASE_TOKENS = new Set([
+  'uhd', 'hdr', 'hdr10', 'dv', 'sdr', 'blu', 'ray', 'web', 'hd', 'ma', 'dd',
   'proper', 'repack', 'internal', 'limited', 'extended', 'unrated', 'imax', 'directors', 'cut',
 ])
 
@@ -148,15 +162,20 @@ export function normalizeTitle(raw: string): string {
   s = s.toLowerCase()
   s = s.replace(/\[[^\]]*\]/g, ' ')                                 // [1080p]
   s = s.replace(/\((?:19|20)\d{2}\)/g, ' ')                         // (1995)
-  s = s.replace(/-[a-z0-9]+\s*$/i, ' ')                             // -GROUP suffix
+  // Gated: a scene-group suffix only ever appears in a filename. Unconditionally, this
+  // turned "Spider-Man" into "spider" — colliding with Spider (2002) — and "X-Men" into "x".
+  if (looksLikeFilename) s = s.replace(/-[a-z0-9]+\s*$/i, ' ')
   s = s.replace(/[._]/g, ' ')
-  s = s.replace(/[^a-z0-9\s]/g, ' ')
+  // Unicode-aware: an ASCII-only filter erased every CJK, Cyrillic and Greek title to ''.
+  s = s.replace(/[^\p{L}\p{N}\s]/gu, ' ')
 
   const tokens = s.split(/\s+/).filter(Boolean)
   const kept: string[] = []
   let brokeOnReleaseToken = false
-  for (const t of tokens) {
-    if (RELEASE_TOKENS.has(t)) {
+  for (const [i, t] of tokens.entries()) {
+    const isRelease = UNAMBIGUOUS_RELEASE_TOKENS.has(t)
+      || (looksLikeFilename && AMBIGUOUS_RELEASE_TOKENS.has(t))
+    if (isRelease && i > 0) {
       // Everything after the first release token is scene noise.
       brokeOnReleaseToken = true
       break
@@ -169,9 +188,10 @@ export function normalizeTitle(raw: string): string {
     if (/^(?:19|20)\d{2}$/.test(last)) kept.pop()
   }
 
-  // "Matrix, The" is the same film as "The Matrix": drop a leading or trailing article.
-  while (kept.length > 1 && ARTICLES.has(kept[kept.length - 1]!)) kept.pop()
-  while (kept.length > 1 && ARTICLES.has(kept[0]!)) kept.shift()
+  // "Matrix, The" is the same film as "The Matrix": drop ONE leading and ONE trailing
+  // article. Looping stripped "The A Word" down to "word" and "The A-Team" to nothing.
+  if (kept.length > 1 && ARTICLES.has(kept[kept.length - 1]!)) kept.pop()
+  if (kept.length > 1 && ARTICLES.has(kept[0]!)) kept.shift()
   if (kept.length === 1 && ARTICLES.has(kept[0]!)) return ''
 
   return kept.join(' ').trim()
