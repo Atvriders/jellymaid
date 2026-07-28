@@ -40,6 +40,18 @@ close it. Nothing here is a known-broken behaviour today; they are traps set for
 | If the two retained scans both fail before reaching the rules phase, the last successful scan's row is pruned and the summary's `evaluated` flips false while `findings` still holds real open rows. Narrow, currently unreachable. | `src/scan/orchestrator.ts`, `src/api/findings.ts` | Plan 6 |
 | `fuzzy-title`'s first-letter bucketing has no size bound and rebuilds trigram sets per comparison; a movie-heavy library with a skewed letter bucket could take minutes. Needs a size guard or timeout before running against a large library. | `src/rules/dupes/index.ts` | Plan 6 |
 
+## Added by Plan 4 — must be closed by a specific slice
+
+| Item | Where | Close in |
+|---|---|---|
+| **`dryRun.directoriesSwept` is typed required but old rows read `undefined`.** `getPlan` and `GET /api/plans` parse `dry_run_json` with no schema, so a plan persisted before that field existed yields `undefined` behind a `number` type. It does not throw — it surfaces in the UI as "undefined directories will be removed". Make it optional or default it at parse time. | `src/plan/planner.ts`, `src/api/plans.ts` | **Plan 5, before the Plan screen** |
+| **A rejected override fails the whole plan build with 400.** A UI that resubmits a previously built action list with its overrides attached gets a hard 400 for every action if live state moved (the torrent crossed its ratio, so `guard.private-ratio` no longer blocks) rather than dropping the now-pointless override. Correct per the ruling, but the UI must handle it — either strip overrides on resubmit or surface which one was unearned. | `src/api/plans.ts` | **Plan 5** |
+| **The `arrUnmappable` block is invisible until an operator builds a plan.** It blocks every delete, non-overridably, and Radarr reports the movie *folder* for a filmless movie — so one decommissioned root folder wedges the whole install with a message only reachable by trying. Surface the unmapped count on the health page. | `src/api/health.ts` | **Plan 6, before ship** |
+| Siblings are unmonitored before it is known the delete will happen. If a later sibling fails to confirm, the earlier ones are already `monitored: false` with their files intact — the conservative state, but an unrequested \*arr mutation, and `detail` names only the FAILING sibling so the audit cannot tell an operator which titles to re-monitor. Carry the confirmed list in `detail`. | `src/plan/executor.ts` | Plan 6 |
+| `/resume`'s staleness window only covers the first five minutes: `started_at` is written once and never refreshed, so a legitimately long run elsewhere is resumable and would double-execute its tail. A heartbeat would close it. | `src/api/plans.ts` | Plan 6 |
+| With `guard.torrent-scope` overridden, **out-of-plan** torrent files are still deleted with no unmonitor. The in-plan siblings are covered; an override deliberately accepts the rest. Worth an explicit warning in the override UI. | `src/plan/executor.ts` | Plan 5 (warning) / Plan 6 |
+| The plans API suite builds an executor stub that always succeeds, so it proves nothing about execution semantics. Fine today because the routes check the DB themselves — remember it when the UI is wired to these routes. | `tests/api/plans.test.ts` | Plan 5 |
+
 ## Known limits, accepted
 
 - **Hop-count over-counting reinstates the vulnerability it closes.** `TRUST_PROXY` set higher than the real number of proxies makes Fastify trust a caller-supplied `X-Forwarded-For` token again. Documented in `parseHopCount` and the compose file; unguardable in code, since only the operator knows the topology.
