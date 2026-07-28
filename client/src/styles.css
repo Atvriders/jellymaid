@@ -571,6 +571,212 @@ button {
   padding: 0 0.3em;
 }
 
+/* ---------- Panels (Dashboard, and any later screen built from stacked sections) ---------- */
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-panel);
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 1.25rem;
+}
+
+.panel h2 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-muted);
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 0.6em;
+  margin-bottom: 0.9em;
+}
+
+/* An alert that cautions rather than blocks — e.g. "these results are from an older scan" — reads
+   in the warn tint instead of the danger tint reserved for an actual refusal. Same reject-slip
+   shape, different weight, same rule as the tag system: a warning is not an error dressed down. */
+.alert-warn {
+  background: var(--warn-tint);
+  border-color: var(--warn-line);
+  border-left-color: var(--warn-strong);
+  color: var(--warn-strong);
+}
+
+/* ---------- Dashboard ---------- */
+
+.connector-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.connector {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5em;
+  background: var(--panel-alt);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.4em 0.7em;
+}
+
+.connector-name {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+
+.scan-progress {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.scan-progress p {
+  margin: 0;
+  font-size: 13.5px;
+}
+
+.class-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+.tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.3em;
+  background: var(--panel-alt);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.9em 0.5em;
+}
+
+.tile-count {
+  font-family: var(--font-mono);
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.tile-label {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-muted);
+}
+
+.reclaimable {
+  font-size: 14px;
+  display: flex;
+  align-items: baseline;
+  gap: 0.5em;
+}
+
+/* ---------- Data tables (Findings, and later Duplicates/Plan/History) ---------- */
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+}
+
+.table th {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-muted);
+  text-align: left;
+  padding: 0.5em 0.6em;
+  border-bottom: 1px solid var(--line-strong);
+  white-space: nowrap;
+}
+
+.table td {
+  padding: 0.55em 0.6em;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+.table code {
+  font-size: 12.5px;
+}
+
+.subject-path {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.not-queueable {
+  color: var(--ink-faint);
+}
+
+/* ---------- Findings ---------- */
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+}
+
+.filters .field {
+  margin-bottom: 0;
+  min-width: 9rem;
+}
+
+.findings-count {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-muted);
+  margin: 0 0 0.6em;
+}
+
+.dismiss-form {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  flex-wrap: wrap;
+}
+
+.dismiss-form label {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-muted);
+}
+
+.dismiss-form input {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  padding: 0.35em 0.5em;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--panel);
+  color: var(--ink);
+  min-width: 10rem;
+}
+
+.findings-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 1rem;
+}
+
 /* ---------- Misc ---------- */
 
 .empty {
