@@ -21,7 +21,12 @@ let dir: string
 let root: string
 let media: string
 
-function build() {
+interface BuildOpts {
+  jellyfin?: { mergeVersions(ids: string[]): Promise<void> }
+  isRunning?: () => boolean
+}
+
+function build(opts: BuildOpts = {}) {
   const app = Fastify()
   app.register(cookie)
   registerPlanRoutes(app, {
@@ -37,10 +42,10 @@ function build() {
     }),
     executor: {
       execute: async (planId: string) => ({ planId, status: 'completed', done: 1, failed: 0, skipped: 0, blocked: 0, bytesFreed: 100 }),
-      isRunning: () => false,
+      isRunning: opts.isRunning ?? (() => false),
     },
     trashDeps: () => ({ db, config: fileConfigSchema.parse({}), pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }]) }),
-    jellyfin: { mergeVersions: async () => {} },
+    jellyfin: opts.jellyfin ?? { mergeVersions: async () => {} },
   } as never)
   return app
 }
@@ -83,6 +88,21 @@ describe('POST /api/plans', () => {
       payload: { actions: [{ type: 'delete-media', targetPath: '/etc/passwd' }] },
     })
     expect(res.statusCode).toBe(400)
+  })
+
+  it('rejects an override for a guard that does not block the action it names', async () => {
+    // `overrides` accepts any GUARD_IDS member for any action, and nothing here blocks — so this
+    // override clears nothing now and would stand ready to clear whatever blocks at EXECUTE time,
+    // against live state the operator never saw. An operator cannot meaningfully pre-authorise a
+    // block the plan never showed them, so the plan is refused rather than minted.
+    const res = await build().inject({
+      method: 'POST', url: '/api/plans', headers: auth(),
+      payload: { actions: [{ type: 'delete-media', targetPath: media, overrides: ['guard.torrent-scope'] }] },
+    })
+    expect(res.statusCode).toBe(400)
+    expect(res.json().error).toMatch(/guard\.torrent-scope/)
+    // Nothing was persisted: a refused plan leaves no half-built rows to approve later.
+    expect((db.prepare('SELECT COUNT(*) c FROM plans').get() as { c: number }).c).toBe(0)
   })
 })
 
@@ -138,6 +158,36 @@ describe('POST /api/plans/:id/resume', () => {
     const res = await app.inject({ method: 'POST', url: `/api/plans/${id}/resume`, headers: auth() })
     expect(res.statusCode).toBe(409)
   })
+
+  async function runningPlan(app: ReturnType<typeof build>, startedAt: string | null) {
+    const id = (await app.inject({
+      method: 'POST', url: '/api/plans', headers: auth(),
+      payload: { actions: [{ type: 'delete-media', targetPath: media }] },
+    })).json().id as string
+    await app.inject({ method: 'POST', url: `/api/plans/${id}/approve`, headers: auth() })
+    db.prepare("UPDATE plans SET status='running', started_at=? WHERE id=?").run(startedAt, id)
+    return id
+  }
+
+  // Finding 5: isRunning() only speaks for THIS process. A plan whose started_at is seconds old is
+  // far more likely to be actively executing in another process than to be crash wreckage.
+  it('refuses to resume a plan that started moments ago, saying why', async () => {
+    const app = build()
+    const id = await runningPlan(app, new Date().toISOString())
+    const res = await app.inject({ method: 'POST', url: `/api/plans/${id}/resume`, headers: auth() })
+    expect(res.statusCode).toBe(409)
+    expect(res.json().error).toMatch(/recent/i)
+    expect(res.json().error).toMatch(/wait/i)
+    // Refused, not half-recovered: the plan is still claimed for whoever is running it.
+    expect((db.prepare('SELECT status FROM plans WHERE id=?').get(id) as { status: string }).status).toBe('running')
+  })
+
+  it('resumes a plan whose started_at is old enough to be a crash', async () => {
+    const app = build()
+    const id = await runningPlan(app, new Date(Date.now() - 60 * 60_000).toISOString())
+    const res = await app.inject({ method: 'POST', url: `/api/plans/${id}/resume`, headers: auth() })
+    expect(res.statusCode).toBe(200)
+  })
 })
 
 describe('GET /api/audit', () => {
@@ -184,6 +234,47 @@ describe('POST /api/duplicates/:groupId/merge', () => {
   it('404s an unknown duplicate group', async () => {
     const res = await build().inject({ method: 'POST', url: '/api/duplicates/nope/merge', headers: auth() })
     expect(res.statusCode).toBe(404)
+  })
+
+  // Finding 4: the double-click the route's own comment names as the threat. Both requests are in
+  // flight at once — the first is parked inside mergeVersions when the second arrives — so a status
+  // check that is not atomic with the Jellyfin call lets both through and merges twice.
+  it('merges once, not twice, when two requests race', async () => {
+    seedGroup()
+    let calls = 0
+    const app = build({
+      jellyfin: {
+        mergeVersions: async () => {
+          calls += 1
+          await new Promise((resolve) => setTimeout(resolve, 20))
+        },
+      },
+    })
+    // Fired without awaiting between them, so the second enters the handler while the first is
+    // still suspended in mergeVersions.
+    const first = app.inject({ method: 'POST', url: '/api/duplicates/g1/merge', headers: auth() })
+    const second = app.inject({ method: 'POST', url: '/api/duplicates/g1/merge', headers: auth() })
+    const [a, b] = await Promise.all([first, second])
+
+    expect([a.statusCode, b.statusCode].sort()).toEqual([200, 409])
+    expect(calls).toBe(1)
+    // Exactly one merge happened, so exactly one audit row may claim one.
+    expect((db.prepare("SELECT COUNT(*) c FROM audit WHERE action_type='merge-versions'").get() as { c: number }).c).toBe(1)
+    expect((db.prepare("SELECT status FROM dupe_groups WHERE id='g1'").get() as { status: string }).status).toBe('merged')
+  })
+
+  it('releases the claim when Jellyfin fails, so the group can still be merged later', async () => {
+    seedGroup()
+    const app = build({ jellyfin: { mergeVersions: async () => { throw new Error('jellyfin unreachable') } } })
+    const res = await app.inject({ method: 'POST', url: '/api/duplicates/g1/merge', headers: auth() })
+    expect(res.statusCode).toBe(500)
+    // A transient Jellyfin outage must not wedge the group as permanently un-mergeable.
+    expect((db.prepare("SELECT status FROM dupe_groups WHERE id='g1'").get() as { status: string }).status).toBe('open')
+    expect((db.prepare("SELECT COUNT(*) c FROM audit WHERE action_type='merge-versions'").get() as { c: number }).c).toBe(0)
+
+    // And the retry, against a healthy Jellyfin, goes through.
+    const retry = await build().inject({ method: 'POST', url: '/api/duplicates/g1/merge', headers: auth() })
+    expect(retry.statusCode).toBe(200)
   })
 })
 

@@ -41,20 +41,47 @@ export function moveToTrash(
   if (!deps.pathMap.isWithinRoot(trashPath, root)) {
     return { trashed: false, reason: 'trash target escaped its root (invalid planId)' }
   }
+  const deletedAt = new Date()
+  const purgeAfter = new Date(deletedAt.getTime() + deps.config.trash.retentionDays * 86_400_000)
+  // Row first, file second — and the row is committed on its own before the rename is even
+  // attempted. The two cannot be made atomic (a filesystem rename cannot join a SQLite
+  // transaction), so all that is left to choose is which side of the crash window is survivable,
+  // and the two orphans are not equally bad:
+  //
+  //   orphan ROW, no file — recoverable. restoreFromTrash reports "trashed file is gone",
+  //     purgeExpiredTrash treats the ENOENT as already-gone and reaps the row, and until then
+  //     the row is a legible trace of what this run was in the middle of doing.
+  //   orphan FILE, no row — NOT recoverable by anything here. purgeExpiredTrash only ever
+  //     iterates rows and restoreFromTrash only ever looks up rows, so a file sitting under
+  //     .jellymaid-trash/<planId> with no row is never purged, never restorable, and never
+  //     listed. It is invisible and permanent, and it is the operator's file.
+  //
+  // So the window is deliberately parked on the harmless side. Note this must NOT be one
+  // transaction wrapped around the INSERT and the rename: the whole point is that the row is
+  // durable at the instant the file moves, which an uncommitted transaction would not give us.
+  deps.db.transaction(() => {
+    deps.db.prepare(
+      'INSERT INTO trash (id, original_path, trash_path, size_bytes, deleted_at, purge_after, plan_id) VALUES (?,?,?,?,?,?,?)',
+    ).run(id, opts.path, trashPath, opts.sizeBytes, deletedAt.toISOString(), purgeAfter.toISOString(), opts.planId)
+  })()
+
   try {
     mkdirSync(trashDir, { recursive: true })
     // Same-filesystem rename only. A cross-device move would mean copying, which the
     // whole point of trashing small files is to avoid.
     renameSync(opts.path, trashPath)
   } catch (err) {
+    try {
+      // The move was refused outright, so the row describes something that never happened —
+      // undo it by hand, since the INSERT is already committed and nothing will roll it back.
+      deps.db.prepare('DELETE FROM trash WHERE id = ?').run(id)
+    } catch {
+      // A failed rollback must not replace the failure the caller actually needs to hear about
+      // (a locked or unwritable database would otherwise mask "the file could not be moved").
+      // The worst case of swallowing it is the benign orphan row described above.
+    }
     return { trashed: false, reason: `move failed: ${(err as Error).message}` }
   }
-
-  const deletedAt = new Date()
-  const purgeAfter = new Date(deletedAt.getTime() + deps.config.trash.retentionDays * 86_400_000)
-  deps.db.prepare(
-    'INSERT INTO trash (id, original_path, trash_path, size_bytes, deleted_at, purge_after, plan_id) VALUES (?,?,?,?,?,?,?)',
-  ).run(id, opts.path, trashPath, opts.sizeBytes, deletedAt.toISOString(), purgeAfter.toISOString(), opts.planId)
 
   return { trashed: true, trashPath }
 }

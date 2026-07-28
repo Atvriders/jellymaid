@@ -1,5 +1,5 @@
-import { existsSync, lstatSync, readdirSync, realpathSync, rmdirSync, unlinkSync } from 'node:fs'
-import { dirname, resolve as resolvePath } from 'node:path'
+import { existsSync, lstatSync, readdirSync, rmdirSync, unlinkSync } from 'node:fs'
+import { dirname } from 'node:path'
 import type { Db } from '../index/db.js'
 import type { FileConfig } from '../config/schema.js'
 import type { PathMap } from '../fs/pathmap.js'
@@ -7,10 +7,11 @@ import type { ActionStatus, ActionType, GuardVerdict, PathMapping } from '../cor
 import type { JellyfinClient } from '../connectors/jellyfin.js'
 import type { QbitClient } from '../connectors/qbittorrent.js'
 import type { ArrClient } from '../connectors/arr.js'
-import { resolveTarget, snapshotInventory, type ResolveDeps, type Resolution } from './resolve.js'
+import { resolveTarget, snapshotInventory, type ArrMatch, type ResolveDeps, type Resolution } from './resolve.js'
 import { evaluateGuards, isBlocked } from './guards.js'
 import { getPlan, type PlanActionView } from './planner.js'
 import { moveToTrash } from './trash.js'
+import { canSweepInto, MAX_SWEEP_DEPTH, samePath } from './sweep.js'
 import { writeAudit } from './audit.js'
 
 export interface ExecutorDeps {
@@ -32,9 +33,6 @@ export interface ExecutionSummary {
   blocked: number
   bytesFreed: number
 }
-
-/** A directory tree deeper than this below a root is a symptom, not a library. Bounds the sweep. */
-const MAX_SWEEP_DEPTH = 256
 
 /** Everything an action needs from the run it belongs to, rather than from module state. */
 interface RunContext {
@@ -67,20 +65,6 @@ const failure = (error: string, detail: Record<string, unknown> = {}) => outcome
 const skip = (error: string, detail: Record<string, unknown> = {}) => outcome('skipped', { error, detail })
 
 const nowIso = () => new Date().toISOString()
-
-/**
- * Two paths that name the same directory, whether or not the strings agree. The lexical compare
- * catches the common case cheaply; the realpath compare catches a root reached through a symlink,
- * which is the one that matters — it is the last stop between the sweep and the root's parent.
- */
-function samePath(a: string, b: string): boolean {
-  if (resolvePath(a) === resolvePath(b)) return true
-  try {
-    return realpathSync(a) === realpathSync(b)
-  } catch {
-    return false
-  }
-}
 
 /**
  * Runs an approved plan. Everything dangerous in Jellymaid happens inside this file, in one fixed
@@ -324,23 +308,54 @@ export function createExecutor(deps: ExecutorDeps) {
       return failure(`refusing to act on a path outside every configured root: ${target}`)
     }
 
+    const plannedPaths = eligiblePaths(context.planId)
     const resolution = await resolveTarget(context.resolveDeps, target)
     const verdicts = evaluateGuards(resolution, deps.config, {
-      plannedPaths: eligiblePaths(context.planId),
+      plannedPaths,
       // rmdir takes nothing but an empty directory; only the delete actions reach deleteWithData.
       removesTorrentData: action.type !== 'remove-empty-folder',
     })
-    const blocked = isBlocked(verdicts, action.payload.overrides ?? [])
+
+    // An override is a PRE-AUTHORISATION, and an operator can only pre-authorise something the plan
+    // actually put in front of them. The guards below are re-run against LIVE state, so a guard
+    // that passed at plan time can block here — a `sample.mkv` whose single-file torrent owns
+    // eleven episodes by the time the plan runs is the concrete case — and honouring an override
+    // for a guard that was GREEN at approval would clear that block on the strength of a question
+    // nobody was ever asked. The audit row would read "overrode guard.torrent-scope", which is true
+    // and useless. So the overrides that count are the intersection with the APPROVED snapshot:
+    // `action.guardVerdicts` is `guard_verdicts_json`, which `settle` deliberately never overwrites.
+    // (`buildPlan` also refuses to mint such a plan; this is the second line, and the one that
+    // holds for a plan written by anything else.)
+    const requestedOverrides = action.payload.overrides ?? []
+    const blockedAtApproval = new Set(
+      action.guardVerdicts.filter((v) => v.outcome === 'block').map((v) => v.guard),
+    )
+    const honoured = requestedOverrides.filter((g) => blockedAtApproval.has(g))
+    const ignoredOverrides = requestedOverrides.filter((g) => !blockedAtApproval.has(g))
+
+    const blocked = isBlocked(verdicts, honoured)
     if (blocked.blocked) {
       const why = verdicts.filter((v) => blocked.by.includes(v.guard)).map((v) => `${v.guard}: ${v.reason}`)
-      return outcome('blocked', { verdicts, error: `blocked by ${why.join('; ')}`, detail: { path: target } })
+      // Naming the ignored override matters: without it this reads as a guard the operator thought
+      // they had already answered for, and the remedy (re-plan, so the block is on screen) is not
+      // obvious from the block alone.
+      const stale = ignoredOverrides.filter((g) => blocked.by.includes(g))
+      const note = stale.length
+        ? `; the override of ${stale.join(', ')} was ignored — ${stale.length > 1 ? 'those guards were' : 'that guard was'} `
+          + 'not blocking when this plan was approved, so nothing about this was shown to the approver. Re-plan to decide it.'
+        : ''
+      return outcome('blocked', {
+        verdicts,
+        error: `blocked by ${why.join('; ')}${note}`,
+        detail: { path: target, ignoredOverrides },
+      })
     }
 
     let result: ActionOutcome
     if (action.type === 'remove-empty-folder') {
       result = removeEmptyFolder(target, root)
     } else if (action.type === 'delete-media' || action.type === 'delete-junk-file') {
-      result = await deleteTarget(action.type, target, root, resolution, context)
+      result = await deleteTarget(action.type, target, root, resolution, plannedPaths, context)
     } else {
       // Unreachable: `runAction` only routes the three path actions here. Spelled out rather than
       // cast, so adding a sixth action type is a compile error at the guard gate, not a silent
@@ -365,11 +380,68 @@ export function createExecutor(deps: ExecutorDeps) {
     return outcome('done', { detail: { removed: [target, ...swept] } })
   }
 
+  /**
+   * Confirms every *arr record for one path is unmonitored, fail-closed: anything short of a
+   * confirmed flip returns the skip that stops the delete, and nothing is deleted on a maybe.
+   * `where` is empty for this action's own target and names the file otherwise, so a refusal on a
+   * SIBLING's account says which sibling — the operator needs to know which title to look at, and
+   * "delete skipped" with no path is not an answer.
+   */
+  async function confirmUnmonitored(records: ArrMatch[], where: string): Promise<ActionOutcome | null> {
+    for (const record of records) {
+      const client = record.kind === 'radarr' ? deps.radarr : deps.sonarr
+      if (!client) {
+        // Unreachable by construction (the same client produced the match), and still not treated
+        // as "nothing to unmonitor" — that assumption is exactly what re-downloads a deleted file.
+        return skip(`${record.kind} has no client configured, so ${record.title}${where} cannot be unmonitored; delete skipped`)
+      }
+      let unmonitor
+      try {
+        // The *arr-NATIVE path, which is what both connectors match on. See ArrMatch.arrPath.
+        unmonitor = await client.unmonitorByPath(record.arrPath)
+      } catch (err) {
+        return skip(`${record.kind} unmonitor threw (${(err as Error).message})${where}; delete skipped so it cannot re-grab the title`)
+      }
+      if (unmonitor.outcome !== 'unmonitored') {
+        // 'lookup-failed' is "I could not look". 'not-managed' here contradicts the inventory that
+        // produced this very match, so the flip provably did not happen for a file that IS
+        // managed. Both mean the same thing to a delete: not safe.
+        return skip(
+          `${record.kind} did not confirm unmonitoring ${record.title}${where} (${unmonitor.outcome}); delete skipped`,
+          { arrPath: record.arrPath },
+        )
+      }
+    }
+    return null
+  }
+
+  /**
+   * The OTHER files this action's torrent removal would destroy — restricted to paths this plan
+   * still intends to delete, which after `guard.torrent-scope` has passed is all of them.
+   *
+   * The target's own path and every hardlink to it are excluded: those are the same inode under
+   * another name (the standard *arr layout), already covered by the target's own `resolution.arr`.
+   * A file the plan does NOT name is excluded too — `guard.torrent-scope` is what answers for those
+   * and it blocks unless the operator explicitly overrode it, at which point they have said in so
+   * many words that the rest of the torrent may go.
+   */
+  function siblingsToUnmonitor(resolution: Resolution, plannedPaths: Set<string>): string[] {
+    const mine = new Set([resolution.path, ...resolution.hardlinks])
+    const siblings = new Set<string>()
+    for (const t of resolution.torrents) {
+      for (const p of t.files?.paths ?? []) {
+        if (!mine.has(p) && plannedPaths.has(p)) siblings.add(p)
+      }
+    }
+    return [...siblings].sort()
+  }
+
   async function deleteTarget(
     type: Extract<ActionType, 'delete-media' | 'delete-junk-file'>,
     target: string,
     root: PathMapping,
     resolution: Resolution,
+    plannedPaths: Set<string>,
     context: RunContext,
   ): Promise<ActionOutcome> {
     // The identity of the bytes the guards just cleared, captured before anything is touched and
@@ -392,34 +464,52 @@ export function createExecutor(deps: ExecutorDeps) {
       identity = { dev: Number(st.dev), ino: Number(st.ino), size: st.size, mtimeMs: st.mtimeMs, nlink: st.nlink }
     }
 
+    const hashes = [...new Set(resolution.torrents.map((t) => t.hash))]
+
     // ---- 1. *arr unmonitor. Fail-closed: anything short of a confirmed flip skips the delete.
-    for (const record of resolution.arr) {
-      const client = record.kind === 'radarr' ? deps.radarr : deps.sonarr
-      if (!client) {
-        // Unreachable by construction (the same client produced the match), and still not treated
-        // as "nothing to unmonitor" — that assumption is exactly what re-downloads a deleted file.
-        return skip(`${record.kind} has no client configured, so ${record.title} cannot be unmonitored; delete skipped`)
-      }
-      let unmonitor
+    //
+    // Not only this action's own target. Step 2 removes each matched torrent WITH ALL OF ITS DATA,
+    // and `guard.torrent-scope` passes precisely when the torrent's OTHER files are named by other
+    // actions in this same plan — actions whose *arr step has not happened yet. Unmonitoring the
+    // target alone and then removing the torrent takes twelve episodes while eleven of them are
+    // still monitored in Sonarr; the first of those to fail its own unmonitor a moment later would
+    // report `skipped` — "delete skipped so it cannot re-grab the title" — with its bytes already
+    // gone and Sonarr free to re-grab it. The constraint would be satisfied on paper and violated
+    // in fact. So the whole set is confirmed BEFORE the torrent goes, and if any ONE of them cannot
+    // be confirmed the torrent is not removed at all and every one of those files stays put. Their
+    // own actions then run normally later, or are skipped on their own merits.
+    const targetFailure = await confirmUnmonitored(resolution.arr, '')
+    if (targetFailure) return targetFailure
+
+    for (const sibling of hashes.length > 0 ? siblingsToUnmonitor(resolution, plannedPaths) : []) {
+      const also = `, a file torrent ${hashes.join(', ')} would also destroy`
+      let siblingResolution: Resolution
       try {
-        // The *arr-NATIVE path, which is what both connectors match on. See ArrMatch.arrPath.
-        unmonitor = await client.unmonitorByPath(record.arrPath)
+        siblingResolution = await resolveTarget(context.resolveDeps, sibling)
       } catch (err) {
-        return skip(`${record.kind} unmonitor threw (${(err as Error).message}); delete skipped so it cannot re-grab the title`)
-      }
-      if (unmonitor.outcome !== 'unmonitored') {
-        // 'lookup-failed' is "I could not look". 'not-managed' here contradicts the inventory that
-        // produced this very match, so the flip provably did not happen for a file that IS
-        // managed. Both mean the same thing to a delete: not safe.
         return skip(
-          `${record.kind} did not confirm unmonitoring ${record.title} (${unmonitor.outcome}); delete skipped`,
-          { arrPath: record.arrPath },
+          `${sibling}${also}, could not be resolved (${(err as Error).message}); delete skipped`,
+          { sibling, torrents: hashes },
         )
+      }
+      // The same fail-closed rule `guard.protected` applies to the target: an empty `arr` list from
+      // a source that could not be verified is "unknown", not "not managed", and unknown is never
+      // permission to take this sibling's bytes.
+      const unverifiable = siblingResolution.sourcesUnavailable.filter((s) => s === 'radarr' || s === 'sonarr')
+      if (unverifiable.length) {
+        return skip(
+          `${unverifiable.join(' and ')} could not be verified for ${sibling}${also}, so it cannot be `
+          + 'confirmed unmonitored; delete skipped',
+          { sibling, torrents: hashes },
+        )
+      }
+      const siblingFailure = await confirmUnmonitored(siblingResolution.arr, ` for ${sibling}${also}`)
+      if (siblingFailure) {
+        return { ...siblingFailure, detail: { ...siblingFailure.detail, sibling, torrents: hashes } }
       }
     }
 
     // ---- 2. qBittorrent removes its own data, and must confirm it.
-    const hashes = [...new Set(resolution.torrents.map((t) => t.hash))]
     if (hashes.length > 0) {
       if (!deps.qbittorrent) {
         return failure('torrents back this file but qBittorrent is not configured')
@@ -565,22 +655,15 @@ export function createExecutor(deps: ExecutorDeps) {
   }
 
   /**
-   * Walks upward removing directories that are now empty, and stops dead at the root. Three
-   * independent stops have to agree before each step upward, because a single off-by-one here
-   * deletes an operator's library root:
-   *
-   *  - `samePath` against the root itself, so the root is never the thing removed;
-   *  - `isWithinRoot`, which resolves symlinks and fails closed — a plain `startsWith` would let
-   *    `/media/lib-backup` pass as inside `/media/lib`;
-   *  - the filesystem root, as a backstop if the two above were ever misconfigured away.
+   * Walks upward removing directories that are now empty, and stops dead at the root. The three
+   * independent stops that have to agree before each step upward live in `canSweepInto`, shared
+   * with the planner's dry-run preview so the two cannot drift on where the sweep ends.
    */
   function sweepEmptyParents(from: string, root: PathMapping): string[] {
     const removed: string[] = []
     let current = from
     for (let depth = 0; depth < MAX_SWEEP_DEPTH; depth += 1) {
-      if (samePath(current, root.container)) break
-      if (!deps.pathMap.isWithinRoot(current, root)) break
-      if (current === dirname(current)) break
+      if (!canSweepInto(current, root, deps.pathMap)) break
       try {
         if (!existsSync(current)) break
         if (!lstatSync(current).isDirectory()) break

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest'
+import Database from 'better-sqlite3'
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, chmodSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
@@ -9,6 +10,7 @@ import { fileConfigSchema } from '../../src/config/schema.js'
 
 let db: Db
 let dir: string
+let dbPath: string
 let root: string
 let file: string
 
@@ -20,7 +22,8 @@ const deps = (config = fileConfigSchema.parse({})) => ({
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'jm-trash-'))
-  db = openDb(join(dir, 'db.sqlite'))
+  dbPath = join(dir, 'db.sqlite')
+  db = openDb(dbPath)
   root = join(dir, 'lib')
   mkdirSync(root, { recursive: true })
   file = join(root, 'sample.mkv')
@@ -88,6 +91,71 @@ describe('moveToTrash', () => {
     if (!a.trashed || !b.trashed) throw new Error('unreachable')
     expect(a.trashPath).not.toBe(b.trashPath)
     expect(readFileSync(b.trashPath, 'utf8')).toBe('other')
+  })
+
+  it('records exactly one row pointing at the returned trash path and the original path', () => {
+    // The row is written before the move, so this guards that the reordering did not change
+    // WHAT is recorded: the row must still describe the move that actually happened.
+    const res = moveToTrash(deps(), { path: file, planId: 'p1', sizeBytes: 4 })
+    if (!res.trashed) throw new Error('unreachable')
+    const rows = db.prepare('SELECT original_path, trash_path, size_bytes, plan_id FROM trash').all()
+    expect(rows).toEqual([
+      { original_path: file, trash_path: res.trashPath, size_bytes: 4, plan_id: 'p1' },
+    ])
+  })
+
+  it('leaves no row behind and leaves the file in place when the move fails', () => {
+    // Dropping write permission on the root makes the mkdirSync of <root>/.jellymaid-trash fail
+    // with EACCES, which is the "the move never happened" branch. The row written before the
+    // move must be rolled back: a row pointing at a file that was never moved is recoverable,
+    // but it should not survive a failure the caller was told about.
+    chmodSync(root, 0o555)
+    try {
+      const res = moveToTrash(deps(), { path: file, planId: 'p1', sizeBytes: 4 })
+      expect(res.trashed).toBe(false)
+      if (res.trashed) throw new Error('unreachable')
+      expect(res.reason).toMatch(/move failed/i)
+      expect((db.prepare('SELECT COUNT(*) c FROM trash').get() as { c: number }).c).toBe(0)
+      expect(existsSync(file)).toBe(true)
+    } finally {
+      chmodSync(root, 0o755)
+    }
+  })
+
+  it('commits the row before the file moves, so a crash mid-move can only orphan a row', () => {
+    // The ordering IS the fix, so it gets asserted directly rather than inferred. A plain
+    // delegating Proxy (no mocking framework) lets the test run at the one instant that matters:
+    // immediately after moveToTrash's transaction returns. At that instant a SEPARATE connection
+    // must already see the row (it is committed, so it would survive a SIGKILL here) and the
+    // source file must still be sitting at its original path (the rename has not run yet).
+    const observed: Array<{ rowsVisibleElsewhere: number; sourceStillInPlace: boolean }> = []
+    const reader = new Database(dbPath, { readonly: true })
+    const observing = new Proxy(db, {
+      get(target, prop) {
+        if (prop === 'transaction') {
+          return (fn: (...args: unknown[]) => unknown) => {
+            const tx = target.transaction(fn)
+            return (...args: unknown[]) => {
+              const result = tx(...args)
+              observed.push({
+                rowsVisibleElsewhere: (reader.prepare('SELECT COUNT(*) c FROM trash').get() as { c: number }).c,
+                sourceStillInPlace: existsSync(file),
+              })
+              return result
+            }
+          }
+        }
+        const value = Reflect.get(target, prop) as unknown
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    try {
+      const res = moveToTrash({ ...deps(), db: observing }, { path: file, planId: 'p1', sizeBytes: 4 })
+      expect(res.trashed).toBe(true)
+      expect(observed).toEqual([{ rowsVisibleElsewhere: 1, sourceStillInPlace: true }])
+    } finally {
+      reader.close()
+    }
   })
 })
 

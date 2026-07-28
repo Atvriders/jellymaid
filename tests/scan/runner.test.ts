@@ -27,7 +27,22 @@ function fakeWorker(body: string): URL {
   return new URL(`file://${path}`)
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+/**
+ * Polls `condition` until it holds or the deadline passes, then returns. Every wait in this file
+ * is really "wait until the worker thread has exited and the runner's bookkeeping has caught up",
+ * which is a CONDITION, not a duration: a fixed sleep encodes an assumption about how fast a
+ * thread spawns and exits, and under parallel-vitest CPU contention that assumption is wrong
+ * often enough to make this suite — the one guarding deletion — flake red. On timeout it returns
+ * rather than throwing, so the `expect` that follows produces the real, legible failure message.
+ */
+async function waitFor(condition: () => boolean, timeoutMs = 5000, intervalMs = 10): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    if (condition()) return
+    if (Date.now() >= deadline) return
+    await new Promise((r) => setTimeout(r, intervalMs))
+  }
+}
 
 /** Mirrors what POST /api/pathmap/verify persists. */
 function setVerification(report: { sampled: number; resolved: number; failures: unknown[] }) {
@@ -62,11 +77,12 @@ describe('createScanRunner', () => {
     const workerUrl = fakeWorker(`Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50)`)
     const runner = createScanRunner({ db, dbPath, env: {}, workerUrl })
     runner.start()
-    await sleep(400)
+    await waitFor(() => !runner.isRunning())
     expect(runner.isRunning()).toBe(false)
     const second = runner.start()
     expect('scanId' in second).toBe(true)
-    await sleep(400)
+    // Let the second worker exit before the test ends, so it does not outlive the suite.
+    await waitFor(() => !runner.isRunning())
   })
 
   it('marks the scan row failed — not stuck at running — when the worker dies before it can finish', async () => {
@@ -77,7 +93,9 @@ describe('createScanRunner', () => {
     const result = runner.start()
     if (!('scanId' in result)) throw new Error('expected a scanId')
 
-    await sleep(400)
+    await waitFor(() => (
+      db.prepare('SELECT status FROM scans WHERE id = ?').get(result.scanId) as { status: string } | undefined
+    )?.status === 'failed')
 
     const row = db.prepare('SELECT status FROM scans WHERE id = ?').get(result.scanId) as { status: string }
     expect(row.status).toBe('failed')
@@ -98,10 +116,10 @@ describe('createScanRunner', () => {
     const runner = createScanRunner({ db: exploding, dbPath, env: {}, workerUrl })
     // The gate reads through the same handle, so seed it before swapping in the exploding one.
     expect('scanId' in runner.start()).toBe(true)
-    await sleep(400)
+    await waitFor(() => !runner.isRunning())
     expect(runner.isRunning()).toBe(false)
     expect('scanId' in runner.start()).toBe(true)
-    await sleep(400)
+    await waitFor(() => !runner.isRunning())
   })
 
   it('cancel() returns false when nothing is running', () => {
@@ -125,7 +143,7 @@ describe('createScanRunner', () => {
     const runner = createScanRunner({ db, dbPath, env: {}, workerUrl })
     runner.start()
     expect(runner.cancel()).toBe(true)
-    await sleep(300)
+    await waitFor(() => !runner.isRunning())
     expect(runner.isRunning()).toBe(false)
   })
 })
@@ -162,14 +180,17 @@ describe('createScanRunner — path-map verification gate', () => {
 
   it('starts when the last verification was clean', async () => {
     clean()
-    expect('scanId' in runner().start()).toBe(true)
-    await sleep(400)
+    // Hoisted out of the expect() so there is a handle to poll for the worker's exit.
+    const r = runner()
+    expect('scanId' in r.start()).toBe(true)
+    await waitFor(() => !r.isRunning())
   })
 
   it('starts anyway when the operator explicitly forces it', async () => {
     setVerification({ sampled: 20, resolved: 0, failures: [{ jellyfinPath: '/x', reason: 'nope' }] })
-    expect('scanId' in runner().start({ force: true })).toBe(true)
-    await sleep(400)
+    const r = runner()
+    expect('scanId' in r.start({ force: true })).toBe(true)
+    await waitFor(() => !r.isRunning())
   })
 
   it('gates the scheduled path too — a scheduler tick with a failing verification runs no scan', async () => {

@@ -243,6 +243,30 @@ describe('buildPlan', () => {
     expect(plan.actions[0]!.status).toBe('pending')
   })
 
+  it('refuses an override for a guard that does not block this action', async () => {
+    // A blank cheque, not a decision: nothing about guard.torrent-scope is blocking here, so the
+    // override has nothing to clear NOW and stands ready to clear whatever blocks at execute time
+    // — a block the operator was never shown. Refused at build time, which the route turns into a
+    // 400, so they are asked again with the block actually on screen.
+    await expect(buildPlan(deps(), { createdBy: 'bob', actions: [
+      { type: 'delete-media', targetPath: a, overrides: ['guard.torrent-scope'] },
+    ] })).rejects.toThrow(/refusing to pre-authorise guard\.torrent-scope/i)
+  })
+
+  it('refuses an override on an action that has no guards at all', async () => {
+    await expect(buildPlan(deps(), { createdBy: 'bob', actions: [
+      { type: 'merge-versions', itemIds: ['a', 'b'], overrides: ['guard.private-ratio'] },
+    ] })).rejects.toThrow(/refusing to pre-authorise/i)
+  })
+
+  it('accepts an override for a guard that really is blocking this action', async () => {
+    const plan = await buildPlan(deps({
+      config: fileConfigSchema.parse({ guards: { minRatio: 10 } }),
+      qbittorrent: { torrents: async () => [torrent({ isPrivate: true, ratio: 1, contentPath: '/downloads/A.mkv' })] },
+    }), { createdBy: 'bob', actions: [{ type: 'delete-media', targetPath: a, overrides: ['guard.private-ratio'] }] })
+    expect(plan.actions[0]!.status).toBe('pending')
+  })
+
   it('records the override in the persisted action', async () => {
     await buildPlan(deps({
       config: fileConfigSchema.parse({ guards: { minRatio: 10 } }),
@@ -276,6 +300,71 @@ describe('buildPlan', () => {
       { type: 'merge-versions', itemIds: ['x', 'y'] },
     ] })
     expect(plan.actions.map((x) => x.type)).toEqual(['merge-versions', 'delete-media'])
+  })
+
+  /**
+   * The executor sweeps the target's now-empty parent chain, stopping at the mapped root. Nothing
+   * in the dry run used to mention it, so an operator approving one episode was silently approving
+   * `Show/Season 01/` and `Show/` as well.
+   */
+  describe('directory sweep preview', () => {
+    function episodeIn(...segments: string[]) {
+      const nested = join(dir, 'lib', ...segments)
+      mkdirSync(nested, { recursive: true })
+      return nested
+    }
+
+    it('counts the empty parent chain one delete would take, and never the root itself', async () => {
+      const nested = episodeIn('Show', 'Season 01')
+      const episode = join(nested, 'S01E01.mkv')
+      writeFileSync(episode, 'e')
+      const plan = await buildPlan(deps(), { createdBy: 'bob', actions: [{ type: 'delete-media', targetPath: episode }] })
+      // Season 01 and Show. `lib` is the mapped root and is where the sweep stops dead.
+      expect(plan.dryRun.directoriesSwept).toBe(2)
+    })
+
+    it('counts nothing when a file the plan does not name keeps the directory alive', async () => {
+      const nested = episodeIn('Show', 'Season 01')
+      writeFileSync(join(nested, 'S01E01.mkv'), 'e')
+      writeFileSync(join(nested, 'S01E02.mkv'), 'e')
+      const plan = await buildPlan(deps(), { createdBy: 'bob', actions: [
+        { type: 'delete-media', targetPath: join(nested, 'S01E01.mkv') },
+      ] })
+      expect(plan.dryRun.directoriesSwept).toBe(0)
+    })
+
+    it('counts a shared directory once when two actions empty it between them', async () => {
+      const nested = episodeIn('Show', 'Season 01')
+      writeFileSync(join(nested, 'S01E01.mkv'), 'e')
+      writeFileSync(join(nested, 'S01E02.mkv'), 'e')
+      const plan = await buildPlan(deps(), { createdBy: 'bob', actions: [
+        { type: 'delete-media', targetPath: join(nested, 'S01E01.mkv') },
+        { type: 'delete-media', targetPath: join(nested, 'S01E02.mkv') },
+      ] })
+      expect(plan.dryRun.directoriesSwept).toBe(2)
+    })
+
+    it('does not count a chain only a BLOCKED action would have emptied', async () => {
+      const nested = episodeIn('Show', 'Season 01')
+      const episode = join(nested, 'S01E01.mkv')
+      writeFileSync(episode, 'e')
+      const plan = await buildPlan(deps({
+        qbittorrent: {
+          torrents: async () => [torrent({ state: 'downloading', contentPath: '/downloads/Show/Season 01/S01E01.mkv' })],
+        },
+      }), { createdBy: 'bob', actions: [{ type: 'delete-media', targetPath: episode }] })
+      expect(plan.actions[0]!.status).toBe('blocked')
+      expect(plan.dryRun.directoriesSwept).toBe(0)
+    })
+
+    it('counts the parents a remove-empty-folder would take above the folder it names', async () => {
+      const nested = episodeIn('Show', 'Season 01')
+      const plan = await buildPlan(deps(), { createdBy: 'bob', actions: [
+        { type: 'remove-empty-folder', targetPath: nested },
+      ] })
+      // Only `Show`: `Season 01` is the folder the operator explicitly named, not a surprise.
+      expect(plan.dryRun.directoriesSwept).toBe(1)
+    })
   })
 
   // --- Alternate-version carry-through: a delete targeting a merged item's alternate version is

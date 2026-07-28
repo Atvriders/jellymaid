@@ -37,10 +37,15 @@ export interface TorrentMatch {
    * How this torrent was tied to the target, weakest last:
    *  - 'inode' — the same bytes, whatever the paths say. Authoritative.
    *  - 'file'  — the target is literally one of the torrent's files, per the file list.
-   *  - 'path'  — the file list could not be read at all, so containment under the torrent's own
-   *    content path is the only evidence left. qBittorrent reports `content_path === save_path`
-   *    for a multi-file torrent with no common root folder, which makes containment a bare
-   *    directory prefix, so this is a fallback and is labelled as one.
+   *  - 'path'  — no file list could RULE THE TARGET OUT, so containment under the torrent's own
+   *    content path is the only evidence left. That covers three cases, not just the first: the
+   *    list could not be read at all; it was read but is incomplete (it counts more files than it
+   *    can name, because some path no mapping covers); or the only complete list available came
+   *    from the INDEX — a scan-time claim about a torrent that may have been moved since — and
+   *    qBittorrent could not be reached to confirm it live. See `matchTorrent`: only a complete,
+   *    live-confirmed list ends the search with "not this torrent's file". qBittorrent reports
+   *    `content_path === save_path` for a multi-file torrent with no common root folder, which
+   *    makes containment a bare directory prefix, so this is a fallback and is labelled as one.
    */
   matchedBy: 'inode' | 'file' | 'path'
   /** Every file this torrent owns, or null when the list could not be read at all. */

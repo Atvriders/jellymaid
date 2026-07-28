@@ -26,6 +26,22 @@ const auditQuery = z.object({ limit: z.coerce.number().int().min(1).max(1000).de
 
 const sessionOf = (req: FastifyRequest) => (req as FastifyRequest & { session: SessionPayload }).session
 
+/**
+ * How long a plan must have been `running` before /resume will treat it as wreckage.
+ *
+ * `executor.isRunning()` is an IN-PROCESS mutex: it says nothing about a second process, or a
+ * second container, executing the same database. To that check, a plan another executor is
+ * actively holding looks exactly like the crash this route exists to recover from — and resuming
+ * it would run the unfinished tail concurrently with the executor that is still working through
+ * it. There is no cross-process heartbeat to consult, so age stands in for one: a plan whose
+ * started_at is minutes old and still unfinished is plausibly a crash, while a plan that started
+ * moments ago is overwhelmingly likely to be alive somewhere. Five minutes is comfortably longer
+ * than any single action (a delete, a trash move, a Jellyfin merge) should take, so a genuinely
+ * crashed plan crosses the line quickly, and the cost of the wait is only that the operator
+ * recovers a few minutes later — against the cost of double-executing destructive actions.
+ */
+const RESUME_MIN_STALENESS_MS = 5 * 60_000
+
 export interface PlanRoutesDeps {
   db: Db
   sessionSecret: string
@@ -121,6 +137,24 @@ export function registerPlanRoutes(app: FastifyInstance, deps: PlanRoutesDeps): 
     if (plan.status !== 'running') {
       return reply.code(409).send({ error: `plan is ${plan.status}, not an interrupted run` })
     }
+    // getPlan's PlanView does not carry started_at, so read it directly. NULL means the plan never
+    // actually entered the executor (a row forced to 'running' by hand, say) — there is no evidence
+    // anything is running it, so there is nothing to wait for and it stays resumable. Likewise an
+    // unparseable timestamp: it is not evidence of a live run, and refusing on it would strand the
+    // plan with no way back.
+    const startedAt = (deps.db.prepare('SELECT started_at FROM plans WHERE id = ?').get(id) as
+      { started_at: string | null } | undefined)?.started_at ?? null
+    const startedMs = startedAt === null ? Number.NaN : Date.parse(startedAt)
+    const ageMs = Date.now() - startedMs
+    if (!Number.isNaN(startedMs) && ageMs < RESUME_MIN_STALENESS_MS) {
+      const ago = ageMs < 0 ? 'in the future' : `${Math.round(ageMs / 1000)}s ago`
+      return reply.code(409).send({
+        error: `plan ${id} started recently (started_at ${startedAt}, ${ago}), so it is more likely still `
+          + `running — possibly in another process — than crashed. Wait until it has been running for at `
+          + `least ${Math.round(RESUME_MIN_STALENESS_MS / 60_000)} minutes, or confirm the executor holding `
+          + `it is really dead, before resuming; resuming a live run would execute its remaining actions twice.`,
+      })
+    }
     deps.db.prepare("UPDATE plans SET status='approved' WHERE id=?").run(id)
     deps.db.prepare("UPDATE plan_actions SET status='pending' WHERE plan_id=? AND status='running'").run(id)
     try {
@@ -148,28 +182,54 @@ export function registerPlanRoutes(app: FastifyInstance, deps: PlanRoutesDeps): 
     if (!row) return reply.code(404).send({ error: 'no such duplicate group' })
     // A double-click or a client retry after a timeout must not re-issue the merge: the ids in
     // members_json may no longer name independent items once the first attempt succeeded, and
-    // mergeVersions has no defined behaviour for that. status='merged' is set only once, in the
-    // same transaction as the audit row below, so this check and that write can never disagree.
+    // mergeVersions has no defined behaviour for that.
     if (row.status === 'merged') {
       return reply.code(409).send({ error: `duplicate group ${groupId} was already merged` })
     }
     const ids = JSON.parse(row.members_json) as string[]
+    // The cheap validations run BEFORE the claim below, so a malformed group is never claimed and
+    // never has to be released.
     if (ids.length < 2) return reply.code(409).send({ error: 'group has fewer than two members' })
-    await deps.jellyfin.mergeVersions(ids)
+    /**
+     * Claim the group BEFORE calling Jellyfin, not after. Reading status and then awaiting
+     * mergeVersions leaves the whole network round-trip between the check and the write: two
+     * concurrent requests — the double-click named above — both read 'open', both pass, and
+     * Jellyfin gets merged twice with ids that no longer name independent items. The UPDATE's own
+     * `AND status != 'merged'` is the check, evaluated atomically with the write by SQLite, so
+     * exactly one of any number of racers sees changes === 1; every loser gets the same 409 a
+     * plain replay gets.
+     */
+    const claimed = deps.db.transaction(() =>
+      deps.db.prepare("UPDATE dupe_groups SET status='merged' WHERE id = ? AND status != 'merged'")
+        .run(groupId).changes,
+    ).immediate()
+    if (claimed !== 1) {
+      return reply.code(409).send({ error: `duplicate group ${groupId} was already merged` })
+    }
+    try {
+      await deps.jellyfin.mergeVersions(ids)
+    } catch (err) {
+      // Release the claim: nothing was merged, so the group must stay mergeable. Without this a
+      // transient Jellyfin outage would wedge it as permanently un-mergeable, with no route that
+      // can undo a status the operator never asked for.
+      deps.db.prepare('UPDATE dupe_groups SET status = ? WHERE id = ?').run(row.status, groupId)
+      throw err
+    }
     const actor = sessionOf(req).username
-    // The status flip and the audit row land together or not at all — the same pairing the
-    // executor's own `settle`+`writeAudit` uses — so this merge can never succeed with zero trace
-    // in the audit log, and the log can never claim a merge that did not actually take.
-    deps.db.transaction(() => {
-      deps.db.prepare("UPDATE dupe_groups SET status='merged' WHERE id=?").run(groupId)
-      writeAudit(deps.db, {
-        actor,
-        actionType: 'merge-versions',
-        subject: groupId,
-        after: { mergedItemIds: ids },
-        outcome: 'done',
-      })
-    })()
+    /**
+     * The merge really happened, so record it. Claiming first trades one exposure for another:
+     * before, a failed bookkeeping write left the group re-mergeable with no audit trace; now it
+     * leaves the group claimed with no audit trace. That is the safer direction — a replayed merge
+     * against ids that no longer name independent items is unrecoverable, while a missing audit row
+     * for a merge that visibly took is a gap in the record, not damage to the library.
+     */
+    writeAudit(deps.db, {
+      actor,
+      actionType: 'merge-versions',
+      subject: groupId,
+      after: { mergedItemIds: ids },
+      outcome: 'done',
+    })
     return reply.send({ merged: ids })
   })
 

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import {
   mkdtempSync, mkdirSync, writeFileSync, existsSync, linkSync, symlinkSync, unlinkSync, statSync,
+  readdirSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
@@ -424,6 +425,122 @@ describe('execute — qBittorrent', () => {
     expect(existsSync(e02)).toBe(true)
   })
 
+  /**
+   * A season pack under one hash, both episodes named, so `guard.torrent-scope` passes. The point
+   * of every test in this block is that "remove the torrent with its data" is a single act that
+   * destroys BOTH files, so it must be atomic with respect to both files' *arr unmonitor — not
+   * just the one the current action happens to name.
+   */
+  function twoEpisodePack(over: {
+    unmonitor?: (p: string) => Promise<unknown>
+    extraFile?: () => boolean
+  } = {}) {
+    const pack = join(root, 'Pack')
+    mkdirSync(pack, { recursive: true })
+    const e01 = join(pack, 'E01.mkv')
+    const e02 = join(pack, 'E02.mkv')
+    const e03 = join(pack, 'E03.mkv')
+    writeFileSync(e01, '1'); writeFileSync(e02, '2'); writeFileSync(e03, '3')
+    const state = { removed: false }
+    const d = deps({
+      qbittorrent: qbit({
+        torrents: async () => (state.removed ? [] : [torrent({ contentPath: '/downloads/Pack', savePath: '/downloads' })]),
+        files: async () => [
+          { index: 0, relPath: 'Pack/E01.mkv', sizeBytes: 1 },
+          { index: 1, relPath: 'Pack/E02.mkv', sizeBytes: 1 },
+          ...(over.extraFile?.() ? [{ index: 2, relPath: 'Pack/E03.mkv', sizeBytes: 1 }] : []),
+        ],
+        // The real client removes the torrent's WHOLE content, which is exactly the hazard.
+        deleteWithData: async (h: string[]) => {
+          calls.push(`qbit.delete:${h.join(',')}`)
+          state.removed = true
+          for (const p of [e01, e02, e03]) if (existsSync(p)) unlinkSync(p)
+        },
+      }),
+      radarr: arrClient('radarr', {
+        inventory: async () => ({
+          records: [
+            arrRecord({ remoteId: 1, title: 'E01', arrPath: '/media/Pack/E01.mkv' }),
+            arrRecord({ remoteId: 2, title: 'E02', arrPath: '/media/Pack/E02.mkv' }),
+            arrRecord({ remoteId: 3, title: 'E03', arrPath: '/media/Pack/E03.mkv' }),
+          ],
+          complete: true,
+        }),
+        unmonitorByPath: over.unmonitor ?? (async (p: string) => {
+          calls.push(`radarr.unmonitor:${p}`)
+          return { outcome: 'unmonitored', recordId: 1 }
+        }),
+      }),
+    })
+    return { d, e01, e02, e03, state }
+  }
+
+  it('refuses to remove a torrent when a SIBLING file it would destroy cannot be unmonitored', async () => {
+    // The order is the whole finding: E01's own unmonitor confirms, so pre-fix its delete-with-data
+    // removed the torrent and both files — and only THEN did E02's unmonitor fail, reporting
+    // "skipped" for a file whose bytes were already gone and which Sonarr was still free to
+    // re-grab. The torrent removal has to be atomic with respect to every file it destroys.
+    const { d, e01, e02, state } = twoEpisodePack({
+      unmonitor: async (p: string) => {
+        calls.push(`radarr.unmonitor:${p}`)
+        return p.endsWith('E02.mkv')
+          ? { outcome: 'lookup-failed', recordId: null }
+          : { outcome: 'unmonitored', recordId: 1 }
+      },
+    })
+    const plan = await planFor(d, [
+      { type: 'delete-media', targetPath: e01 }, { type: 'delete-media', targetPath: e02 },
+    ])
+    const summary = await createExecutor(d).execute(plan.id, 'bob')
+
+    expect(calls.some((c) => c.startsWith('qbit.delete'))).toBe(false)
+    expect(state.removed).toBe(false)
+    expect(existsSync(e01)).toBe(true)
+    expect(existsSync(e02)).toBe(true)
+    expect(summary.done).toBe(0)
+    // E01 skipped on its sibling's account, naming it; E02 then blocks on its own scope, since E01
+    // has dropped out of the plan's eligible paths.
+    const rows = db.prepare('SELECT status, error FROM plan_actions WHERE plan_id=? ORDER BY seq')
+      .all(plan.id) as Array<{ status: string; error: string }>
+    expect(rows[0]!.status).toBe('skipped')
+    expect(rows[0]!.error).toContain(e02)
+    expect(rows[1]!.status).toBe('blocked')
+  })
+
+  it('removes the torrent exactly once when every sibling it would destroy is confirmed unmonitored', async () => {
+    const { d, e01, e02 } = twoEpisodePack()
+    const plan = await planFor(d, [
+      { type: 'delete-media', targetPath: e01 }, { type: 'delete-media', targetPath: e02 },
+    ])
+    const summary = await createExecutor(d).execute(plan.id, 'bob')
+
+    expect(calls.filter((c) => c.startsWith('qbit.delete'))).toEqual(['qbit.delete:H1'])
+    expect(existsSync(e01)).toBe(false)
+    expect(existsSync(e02)).toBe(false)
+    expect(summary.done).toBe(2)
+    expect(summary.skipped + summary.blocked + summary.failed).toBe(0)
+  })
+
+  it('still blocks at guard.torrent-scope when the torrent owns a file no action names', async () => {
+    // The sibling unmonitor covers files the plan NAMES. A file nobody named is a different
+    // question, and it is still `guard.torrent-scope`'s to answer — fail-closed, before any
+    // unmonitor runs at all.
+    let grown = false
+    const { d, e01, e02, e03 } = twoEpisodePack({ extraFile: () => grown })
+    const plan = await planFor(d, [
+      { type: 'delete-media', targetPath: e01 }, { type: 'delete-media', targetPath: e02 },
+    ])
+    grown = true // the same hash owns a third episode by the time the plan runs
+    const summary = await createExecutor(d).execute(plan.id, 'bob')
+
+    expect(summary.blocked).toBe(2)
+    expect(calls.some((c) => c.startsWith('qbit.delete'))).toBe(false)
+    expect(calls.some((c) => c.startsWith('radarr.unmonitor'))).toBe(false)
+    expect(existsSync(e01)).toBe(true)
+    expect(existsSync(e02)).toBe(true)
+    expect(existsSync(e03)).toBe(true)
+  })
+
   it('one failure does not abort the rest of the plan', async () => {
     const other = join(root, 'Other.mkv')
     writeFileSync(other, 'y'.repeat(50))
@@ -454,15 +571,98 @@ describe('execute — guards at execute time', () => {
   })
 
   it('refuses to let an approved override clear guard.protected', async () => {
+    // The override here is legitimately pre-authorised: guard.private-ratio really was blocking
+    // when the operator approved, so buildPlan accepts it. It still cannot clear guard.protected,
+    // which allows no override at all.
     let state = 'stalledUP'
-    const d = deps({ qbittorrent: qbit({ torrents: async () => [torrent({ state })] }) })
+    const d = deps({
+      qbittorrent: qbit({
+        torrents: async () => [torrent({ state, isPrivate: true, ratio: 0.1, seedingTimeSeconds: 60 })],
+      }),
+    })
     const plan = await planFor(d, [
-      { type: 'delete-media', targetPath: media, overrides: ['guard.protected', 'guard.private-ratio'] },
+      { type: 'delete-media', targetPath: media, overrides: ['guard.private-ratio'] },
     ])
-    state = 'moving'
+    state = 'moving' // someone hit re-download between approval and execution
     const summary = await createExecutor(d).execute(plan.id, 'bob')
     expect(summary.blocked).toBe(1)
     expect(existsSync(media)).toBe(true)
+  })
+
+  /**
+   * A season pack whose torrent owns one file at plan time and twelve by execute time. `packed`
+   * flips between the two.
+   */
+  function growingPack() {
+    const pack = join(root, 'Pack')
+    mkdirSync(pack, { recursive: true })
+    const sample = join(pack, 'sample.mkv')
+    writeFileSync(sample, 'junk')
+    for (let i = 0; i < 11; i += 1) writeFileSync(join(pack, `E${i}.mkv`), 'e')
+    const state = { packed: false }
+    const d = deps({
+      qbittorrent: qbit({
+        torrents: async () => [torrent({ contentPath: '/downloads/Pack', savePath: '/downloads' })],
+        files: async () => (state.packed
+          ? [
+            { index: 0, relPath: 'Pack/sample.mkv', sizeBytes: 4 },
+            ...Array.from({ length: 11 }, (_, i) => ({ index: i + 1, relPath: `Pack/E${i}.mkv`, sizeBytes: 1 })),
+          ]
+          : [{ index: 0, relPath: 'Pack/sample.mkv', sizeBytes: 4 }]),
+        // The bytes the operator never saw are only really at stake if the fake takes them, so it does.
+        deleteWithData: async (h: string[]) => {
+          calls.push(`qbit.delete:${h.join(',')}`)
+          for (const name of readdirSync(pack)) unlinkSync(join(pack, name))
+        },
+      }),
+    })
+    return { d, pack, sample, state }
+  }
+
+  it('ignores an override for a guard that was NOT blocking when the plan was approved', async () => {
+    // The operator was shown a clean plan: one torrent, four bytes, guard.torrent-scope passing.
+    // The override rode along on the request anyway. By execute time the same hash owns eleven
+    // episodes and scope blocks — and a pre-granted override for a guard nobody was ever shown
+    // must not clear it, or eleven files no operator saw are destroyed while the audit row says
+    // "overrode guard.torrent-scope", which is true and useless.
+    const { d, pack, sample, state } = growingPack()
+    const plan = await planFor(d, [{ type: 'delete-junk-file', targetPath: sample }])
+    expect(plan.dryRun.torrentsRemoved).toBe(1)
+    expect(plan.actions[0]!.guardVerdicts.find((v) => v.guard === 'guard.torrent-scope')!.outcome).toBe('pass')
+
+    // buildPlan now refuses to MINT a plan carrying this override (see the planner tests); this is
+    // the executor's own second line, which is what protects a plan minted by any other writer.
+    const row = db.prepare('SELECT id, payload_json FROM plan_actions WHERE plan_id=?').get(plan.id) as
+      { id: string; payload_json: string }
+    const payload = JSON.parse(row.payload_json) as Record<string, unknown>
+    payload.overrides = ['guard.torrent-scope']
+    db.prepare('UPDATE plan_actions SET payload_json=? WHERE id=?').run(JSON.stringify(payload), row.id)
+
+    state.packed = true
+    const summary = await createExecutor(d).execute(plan.id, 'bob')
+
+    expect(summary.blocked).toBe(1)
+    expect(calls.some((c) => c.startsWith('qbit.delete'))).toBe(false)
+    expect(existsSync(sample)).toBe(true)
+    expect(existsSync(join(pack, 'E0.mkv'))).toBe(true)
+    const settled = db.prepare('SELECT error FROM plan_actions WHERE id=?').get(row.id) as { error: string }
+    expect(settled.error).toMatch(/guard\.torrent-scope/)
+    expect(settled.error).toMatch(/approved/i)
+  })
+
+  it('honours an override for a guard that DID block when the plan was approved', async () => {
+    // Same shape, one difference that is the whole point: the scope block was on screen when the
+    // operator approved, so the override answers a question they were actually asked.
+    const { d, pack, sample, state } = growingPack()
+    state.packed = true
+    const plan = await planFor(d, [
+      { type: 'delete-junk-file', targetPath: sample, overrides: ['guard.torrent-scope'] },
+    ])
+    expect(plan.actions[0]!.guardVerdicts.find((v) => v.guard === 'guard.torrent-scope')!.outcome).toBe('block')
+    const summary = await createExecutor(d).execute(plan.id, 'bob')
+    expect(summary.done).toBe(1)
+    expect(calls).toContain('qbit.delete:H1')
+    expect(existsSync(join(pack, 'E0.mkv'))).toBe(false)
   })
 
   it('blocks when qBittorrent becomes unreachable between approval and execution', async () => {

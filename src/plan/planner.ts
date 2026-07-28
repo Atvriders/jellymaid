@@ -4,6 +4,7 @@ import type { ActionType, GuardId, GuardVerdict, ActionStatus } from '../core/ty
 import type { FileConfig } from '../config/schema.js'
 import { resolveTarget, snapshotInventory, type ResolveDeps, type Resolution } from './resolve.js'
 import { evaluateGuards, isBlocked } from './guards.js'
+import { previewSweptDirectories } from './sweep.js'
 
 export interface RequestedAction {
   type: ActionType
@@ -38,7 +39,20 @@ export interface PlanView {
   createdAt: string
   approvedBy: string | null
   actions: PlanActionView[]
-  dryRun: { deleteCount: number; bytesFreed: number; torrentsRemoved: number; blockedCount: number }
+  dryRun: {
+    deleteCount: number
+    bytesFreed: number
+    torrentsRemoved: number
+    blockedCount: number
+    /**
+     * How many now-empty parent directories the executor's sweep would take along with the files.
+     * The executor removes the target's whole empty parent chain, stopping at the mapped root, so
+     * an operator approving one episode is really approving `Show/Season 01/` and possibly `Show/`
+     * as well — and nothing else in this dry run said so. Computed by the same stop conditions the
+     * real sweep uses; see `previewSweptDirectories`.
+     */
+    directoriesSwept: number
+  }
 }
 
 export interface PlannerDeps extends ResolveDeps {
@@ -133,6 +147,30 @@ export async function buildPlan(deps: PlannerDeps, request: PlanRequest): Promis
     plannedPaths = next
   }
 
+  // An override is a PRE-AUTHORISATION, and an operator can only pre-authorise something the plan
+  // actually put in front of them. An override naming a guard that does not block THIS action is at
+  // best noise and at worst a blank cheque: the executor re-runs every guard against live state,
+  // and a guard that passes here can block there — a `sample.mkv` whose single-file torrent owns
+  // eleven episodes by execute time is the concrete case — at which point a pre-granted override
+  // would clear a block nobody ever saw. Refused here, at build time, so the operator is asked
+  // again with the block actually on screen rather than having answered a question nobody put to
+  // them. (The executor intersects with the approved snapshot too; this is the half that gives the
+  // caller a 400 and a reason instead of a silently useless override.)
+  for (const entry of resolved) {
+    const requested = entry.action.overrides ?? []
+    if (requested.length === 0) continue
+    const blocking = new Set(entry.verdicts.filter((v) => v.outcome === 'block').map((v) => v.guard))
+    const unearned = requested.filter((g) => !blocking.has(g))
+    if (unearned.length > 0) {
+      throw new Error(
+        `refusing to pre-authorise ${unearned.join(', ')} for `
+        + `${entry.action.targetPath ?? entry.action.type}: ${unearned.length > 1 ? 'those guards do' : 'that guard does'} `
+        + 'not block this action, so there is nothing for the override to clear and it would only '
+        + 'stand ready to clear a block this plan never showed you',
+      )
+    }
+  }
+
   // Only a path whose OWN action will actually run belongs in "this link goes away in this plan":
   // a blocked sibling's link survives execution no matter how many OTHER actions in the plan also
   // name its inode, so it must not count as one of the links being removed.
@@ -195,7 +233,15 @@ export async function buildPlan(deps: PlannerDeps, request: PlanRequest): Promis
     })
   })
 
-  const dryRun = { deleteCount, bytesFreed, torrentsRemoved: torrentHashes.size, blockedCount }
+  const dryRun = {
+    deleteCount,
+    bytesFreed,
+    torrentsRemoved: torrentHashes.size,
+    blockedCount,
+    // Every path an action will actually act on, deletes and folder removals alike — the sweep does
+    // not care which kind emptied the directory, and neither should the number the operator reads.
+    directoriesSwept: previewSweptDirectories(deps.pathMap, executablePaths).length,
+  }
 
   const write = deps.db.transaction(() => {
     deps.db.prepare(
