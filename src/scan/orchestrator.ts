@@ -4,8 +4,9 @@ import { jellyfinPhase } from './phases/jellyfin.js'
 import { filesystemPhase } from './phases/filesystem.js'
 import { qbittorrentPhase } from './phases/qbittorrent.js'
 import { arrPhase } from './phases/arr.js'
+import { rulesPhase } from './phases/rules.js'
 
-export const DEFAULT_PHASES: Phase[] = [jellyfinPhase, filesystemPhase, qbittorrentPhase, arrPhase]
+export const DEFAULT_PHASES: Phase[] = [jellyfinPhase, filesystemPhase, qbittorrentPhase, arrPhase, rulesPhase]
 
 export interface ScanRow {
   id: number

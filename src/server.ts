@@ -10,6 +10,7 @@ import { registerAuthRoutes } from './api/auth.js'
 import { registerHealthRoutes } from './api/health.js'
 import { registerPathMapRoutes } from './api/pathmap.js'
 import { registerScanRoutes } from './api/scan.js'
+import { registerFindingsRoutes } from './api/findings.js'
 
 export interface ServerDeps {
   config: AppConfig
@@ -57,6 +58,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     runner: deps.scanRunner,
     sessionSecret: deps.config.env.sessionSecret,
   })
+  registerFindingsRoutes(app, { db: deps.db, sessionSecret: deps.config.env.sessionSecret })
 
   app.setErrorHandler((err, _req, reply) => {
     deps.logger.error('unhandled route error', { err: (err as Error).message })

@@ -6,7 +6,7 @@ import type { QbitClient } from '../../connectors/qbittorrent.js'
 import type { ArrClient } from '../../connectors/arr.js'
 import type { createHasher } from '../../fs/hasher.js'
 
-export type PhaseName = 'jellyfin' | 'filesystem' | 'qbittorrent' | 'arr'
+export type PhaseName = 'jellyfin' | 'filesystem' | 'qbittorrent' | 'arr' | 'rules'
 
 export interface ScanDeps {
   config: FileConfig
