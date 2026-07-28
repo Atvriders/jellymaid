@@ -78,14 +78,31 @@ export function restoreFromTrash(deps: TrashDeps, trashId: string): { restored: 
   return { restored: true }
 }
 
-export function purgeExpiredTrash(deps: TrashDeps, now = new Date()): number {
+export interface PurgeFailure { id: string; path: string; reason: string }
+export interface PurgeResult { purged: number; failed: PurgeFailure[] }
+
+export function purgeExpiredTrash(deps: TrashDeps, now = new Date()): PurgeResult {
   const rows = deps.db.prepare('SELECT id, trash_path FROM trash WHERE restored_at IS NULL AND purge_after <= ?')
     .all(now.toISOString()) as Array<{ id: string; trash_path: string }>
   let purged = 0
+  const failed: PurgeFailure[] = []
   for (const row of rows) {
-    try { rmSync(row.trash_path, { force: true }) } catch { /* already gone */ }
+    try {
+      rmSync(row.trash_path)
+    } catch (err) {
+      // ENOENT is the only failure that means "already gone" — the legitimate case this
+      // function exists to clean up after. Anything else (EACCES, EBUSY, a read-only mount, …)
+      // means the file is still sitting on disk, and the trash row is the ONLY record that it
+      // exists. Deleting that row here would erase the one trace of an untracked file — leave
+      // the row in place, do not count it as purged, and surface the failure instead of
+      // discarding it, since the trash table and audit log are the sole record of what happened.
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        failed.push({ id: row.id, path: row.trash_path, reason: (err as Error).message })
+        continue
+      }
+    }
     deps.db.prepare('DELETE FROM trash WHERE id = ?').run(row.id)
     purged += 1
   }
-  return purged
+  return { purged, failed }
 }
