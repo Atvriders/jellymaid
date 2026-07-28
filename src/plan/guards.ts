@@ -21,14 +21,30 @@ const BUSY_STATES = new Set([
 const pass = (guard: GuardId, reason: string, evidence: Record<string, unknown> = {}): GuardVerdict =>
   ({ guard, outcome: 'pass', overridable: false, reason, evidence })
 
+export interface GuardContext {
+  /**
+   * Every container path the plan will remove. `guard.torrent-scope` needs it to answer "would
+   * removing this torrent take files nobody named?", and only the plan knows the answer. Defaults
+   * to the target alone, which is the honest reading of a lone action.
+   */
+  plannedPaths?: Iterable<string>
+  /**
+   * Whether this action removes matched torrents WITH THEIR DATA. False for `remove-empty-folder`,
+   * which only ever calls `rmdir` — an empty directory holds no torrent data by definition, so
+   * blocking its cleanup with "this would also delete 11 files" would be both wrong and the kind of
+   * noise that teaches operators to override on reflex. The other three torrent guards still apply.
+   */
+  removesTorrentData?: boolean
+}
+
 /**
- * Runs all four safety guards over a resolved target. Guards are pure functions of `Resolution`
- * and `FileConfig` — no I/O, no network — so every branch here is exhaustively testable, which
- * matters because the caller treats a passing guard set as license to permanently delete bytes or
- * remove a torrent with its data.
+ * Runs all five safety guards over a resolved target. Guards are pure functions of `Resolution`,
+ * `FileConfig` and the plan's own scope — no I/O, no network — so every branch here is
+ * exhaustively testable, which matters because the caller treats a passing guard set as license to
+ * permanently delete bytes or remove a torrent with its data.
  */
-export function evaluateGuards(r: Resolution, config: FileConfig): GuardVerdict[] {
-  return [privateRatio(r, config), crossSeed(r), hardlink(r), protectedState(r, config)]
+export function evaluateGuards(r: Resolution, config: FileConfig, context: GuardContext = {}): GuardVerdict[] {
+  return [privateRatio(r, config), crossSeed(r), hardlink(r), protectedState(r, config), torrentScope(r, context)]
 }
 
 /**
@@ -94,6 +110,14 @@ function crossSeed(r: Resolution): GuardVerdict {
  * would repeat every time this guard fires.
  */
 function hardlink(r: Resolution): GuardVerdict {
+  // Every directory has nlink >= 2 (its own entry plus `.`, and one more per subdirectory), which
+  // is not two links to any bytes. Reporting it as one would put "2 links point at these bytes" in
+  // the audit trail of every empty-folder removal.
+  if (r.isDirectory) {
+    return pass('guard.hardlink', 'target is a directory; its link count does not describe reclaimable bytes', {
+      bytesReclaimed: 0, otherLinks: [], nlink: r.nlink,
+    })
+  }
   const others = r.hardlinks.filter((p) => p !== r.path)
   // `nlink` is the authoritative live-stat fact; `hardlinks` is only as complete as the last scan's
   // fs_entries index. The two can disagree: a sibling link created (or living under a root not yet
@@ -141,8 +165,19 @@ function hardlink(r: Resolution): GuardVerdict {
  */
 function protectedState(r: Resolution, config: FileConfig): GuardVerdict {
   const unverifiable = r.sourcesUnavailable.filter((s) => s === 'qbittorrent' || s === 'radarr' || s === 'sonarr')
-  if (unverifiable.length) {
+  if (unverifiable.length || r.arrUnmappable.count > 0) {
     const parts: string[] = []
+    if (r.arrUnmappable.count > 0) {
+      // The same fail-closed reasoning as a partial inventory, one layer earlier: the inventory
+      // arrived complete, but its paths live in a namespace no path mapping covers, so no record
+      // could ever match this file and "absent" cannot be read as "not managed". The operator fixes
+      // this by adding a mapping, not by overriding the guard — hence the reason names the paths.
+      parts.push(
+        `${r.arrUnmappable.count} *arr record(s) report a path namespace no mapping covers `
+        + `(e.g. ${r.arrUnmappable.samples.join(', ')}), so Jellymaid cannot confirm whether this file is `
+        + '*arr-managed and cannot guarantee it will be unmonitored before deletion',
+      )
+    }
     if (unverifiable.includes('qbittorrent')) {
       parts.push('qBittorrent is unavailable, so torrent state cannot be verified')
     }
@@ -158,7 +193,7 @@ function protectedState(r: Resolution, config: FileConfig): GuardVerdict {
       outcome: 'block',
       overridable: false,
       reason: parts.join('; '),
-      evidence: { sourcesUnavailable: r.sourcesUnavailable },
+      evidence: { sourcesUnavailable: r.sourcesUnavailable, arrUnmappable: r.arrUnmappable },
     }
   }
   const categories = new Set(config.guards.protectedCategories.map((c) => c.toLowerCase()))
@@ -178,6 +213,71 @@ function protectedState(r: Resolution, config: FileConfig): GuardVerdict {
     outcome: 'block',
     overridable: false,
     reason: offenders.map((o) => o.why).join('; '),
+    evidence: { offenders },
+  }
+}
+
+/**
+ * Removing a torrent takes ALL of its data, not just the file that was named. `delete-junk-file`
+ * makes that concrete: a `sample.mkv` inside a season pack resolves to the pack's torrent, and step
+ * 2 of the executor removes it with data — every episode beside it goes too, with nothing in the
+ * dry run saying so (`torrentsRemoved: 1` is technically true and completely uninformative).
+ *
+ * No other guard covers it: cross-seed needs a SECOND torrent, private-ratio needs a private
+ * tracker, protected needs a busy state or a protect-list hit. So this one does, and it blocks
+ * OVERRIDABLY — the operator chose "remove the torrent with its data" on the assumption that one
+ * torrent backs one file, and when that does not hold only they can decide whether the pack goes.
+ *
+ * An unreadable file list blocks too. "How many other files would this take" is unanswerable then,
+ * and unanswerable is not permission — the same fail-closed rule `guard.protected` applies to an
+ * unverifiable source.
+ */
+function torrentScope(r: Resolution, context: GuardContext): GuardVerdict {
+  if (context.removesTorrentData === false) {
+    return pass('guard.torrent-scope', 'this action does not remove any torrent, so no other file can go with it')
+  }
+  // A torrent file that is a HARDLINK of a path this plan removes is not a file the plan overlooked
+  // — it is the same bytes under another name, which is the standard *arr layout: the torrent owns
+  // /downloads/Heat.mkv, the library holds /media/Heat.mkv, one inode. Counting those as
+  // "untargeted" would block essentially every hardlinked delete this product exists to perform.
+  const planned = new Set([...(context.plannedPaths ?? [r.path]), r.path, ...r.hardlinks])
+  const offenders: Array<Record<string, unknown>> = []
+  for (const t of r.torrents) {
+    if (!t.files) {
+      offenders.push({ hash: t.hash, name: t.name, reason: 'file list could not be read' })
+      continue
+    }
+    const targeted = t.files.paths.filter((p) => planned.has(p)).length
+    // Against `count`, not `paths.length`: a file whose path no mapping covers cannot be one this
+    // plan targets, so it belongs on the untargeted side of the ledger.
+    const filesNotInPlan = t.files.count - targeted
+    if (filesNotInPlan > 0) {
+      offenders.push({
+        hash: t.hash,
+        name: t.name,
+        fileCount: t.files.count,
+        filesNotInPlan,
+        examples: t.files.paths.filter((p) => !planned.has(p)).slice(0, 5),
+      })
+    }
+  }
+  if (!offenders.length) {
+    return pass('guard.torrent-scope', 'every file of every matched torrent is in this plan')
+  }
+  const unreadable = offenders.filter((o) => 'reason' in o)
+  const wider = offenders.filter((o) => 'filesNotInPlan' in o)
+  const reasons: string[] = []
+  if (wider.length) {
+    reasons.push(wider.map((o) => `removing ${String(o.name)} would also delete ${String(o.filesNotInPlan)} file(s) this plan does not name`).join('; '))
+  }
+  if (unreadable.length) {
+    reasons.push(`${unreadable.map((o) => String(o.name)).join(', ')}: file list could not be read, so the scope of the delete is unknown`)
+  }
+  return {
+    guard: 'guard.torrent-scope',
+    outcome: 'block',
+    overridable: true,
+    reason: reasons.join('; '),
     evidence: { offenders },
   }
 }

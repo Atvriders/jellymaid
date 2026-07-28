@@ -18,7 +18,7 @@ const torrent = (over: Record<string, unknown> = {}) => ({
 })
 
 function deps(over: Record<string, unknown> = {}) {
-  return {
+  const merged: Record<string, unknown> = {
     db,
     pathMap: createPathMap([
       { role: 'library', jellyfin: '/media/Movies', container: join(dir, 'lib'), qbit: null },
@@ -28,7 +28,19 @@ function deps(over: Record<string, unknown> = {}) {
     radarr: null,
     sonarr: null,
     ...over,
-  } as Parameters<typeof resolveTarget>[0]
+  }
+  // A real qBittorrent always knows its own file list, so every double gets one derived from its
+  // own fixture: one file per torrent, named after its contentPath. Tests that need a multi-file
+  // torrent, or a torrent whose list cannot be read, override `files` explicitly.
+  const qb = merged.qbittorrent as { torrents?: () => Promise<Array<Record<string, unknown>>>; files?: unknown } | null
+  if (qb && !qb.files) {
+    qb.files = async (hash: string) => {
+      const t = (await qb.torrents!()).find((x) => x.hash === hash)
+      const content = t?.contentPath as string | undefined
+      return content ? [{ index: 0, relPath: content.split('/').pop()!, sizeBytes: (t?.sizeBytes as number) ?? 0 }] : []
+    }
+  }
+  return merged as unknown as Parameters<typeof resolveTarget>[0]
 }
 
 beforeEach(() => {
@@ -71,11 +83,11 @@ describe('resolveTarget', () => {
     expect(r.torrents[0]!.matchedBy).toBe('inode')
   })
 
-  it('falls back to path matching when the inode is unknown', async () => {
+  it('matches through the torrent file list when the inode is unknown (the file is not on disk)', async () => {
     const r = await resolveTarget(deps({
       qbittorrent: { torrents: async () => [torrent({ contentPath: '/downloads/Nope.mkv', savePath: '/downloads' })] },
     }), join(dir, 'dl', 'Nope.mkv'))
-    expect(r.torrents.map((t) => t.matchedBy)).toEqual(['path'])
+    expect(r.torrents.map((t) => t.matchedBy)).toEqual(['file'])
   })
 
   it('does not match a torrent that merely shares a save directory with the target', async () => {
@@ -91,14 +103,96 @@ describe('resolveTarget', () => {
     expect(r.torrents).toEqual([])
   })
 
-  it('matches a file inside a multi-file torrent through its content path', async () => {
+  it('matches a file nested inside a multi-file torrent, joining its list against the save path', async () => {
     mkdirSync(join(dir, 'dl', 'Heat'), { recursive: true })
     const inside = join(dir, 'dl', 'Heat', 'CD1.mkv')
     writeFileSync(inside, 'c')
     const r = await resolveTarget(deps({
-      qbittorrent: { torrents: async () => [torrent({ contentPath: '/downloads/Heat', savePath: '/downloads' })] },
+      qbittorrent: {
+        torrents: async () => [torrent({ contentPath: '/downloads/Heat', savePath: '/downloads' })],
+        files: async () => [
+          { index: 0, relPath: 'Heat/CD1.mkv', sizeBytes: 1 }, { index: 1, relPath: 'Heat/CD2.mkv', sizeBytes: 1 },
+        ],
+      },
+    }), inside)
+    expect(r.torrents.map((t) => t.matchedBy)).toEqual(['file'])
+    expect(r.torrents[0]!.files?.count).toBe(2)
+  })
+
+  it('does not match an unrelated file in a multi-file torrent whose contentPath IS its savePath', async () => {
+    // qBittorrent reports content_path === save_path for a multi-file torrent with no single
+    // common root folder, which turns containment back into a bare directory prefix. The torrent's
+    // own file list is the only thing that settles it.
+    const stranger = join(dir, 'dl', 'Unrelated.mkv')
+    writeFileSync(stranger, 'u')
+    const r = await resolveTarget(deps({
+      qbittorrent: {
+        torrents: async () => [torrent({ contentPath: '/downloads', savePath: '/downloads' })],
+        files: async () => [
+          { index: 0, relPath: 'E01.mkv', sizeBytes: 1 }, { index: 1, relPath: 'E02.mkv', sizeBytes: 1 },
+        ],
+      },
+    }), stranger)
+    expect(r.torrents).toEqual([])
+  })
+
+  it('matches a file that IS in the torrent file list, and reports the whole list', async () => {
+    const episode = join(dir, 'dl', 'E02.mkv')
+    writeFileSync(episode, 'e')
+    const r = await resolveTarget(deps({
+      qbittorrent: {
+        torrents: async () => [torrent({ contentPath: '/downloads', savePath: '/downloads' })],
+        files: async () => [
+          { index: 0, relPath: 'E01.mkv', sizeBytes: 1 }, { index: 1, relPath: 'E02.mkv', sizeBytes: 1 },
+        ],
+      },
+    }), episode)
+    expect(r.torrents.map((t) => t.matchedBy)).toEqual(['file'])
+    expect(r.torrents[0]!.files).toEqual({ count: 2, paths: [join(dir, 'dl', 'E01.mkv'), join(dir, 'dl', 'E02.mkv')] })
+  })
+
+  it('prefers the indexed file list over a live fetch, matching on container_path', async () => {
+    const episode = join(dir, 'dl', 'E02.mkv')
+    writeFileSync(episode, 'e')
+    db.prepare('INSERT INTO torrent_files (hash, file_index, rel_path, container_path, size_bytes) VALUES (?,?,?,?,?)')
+      .run('H1', 0, 'E01.mkv', join(dir, 'dl', 'E01.mkv'), 1)
+    db.prepare('INSERT INTO torrent_files (hash, file_index, rel_path, container_path, size_bytes) VALUES (?,?,?,?,?)')
+      .run('H1', 1, 'E02.mkv', episode, 1)
+    const r = await resolveTarget(deps({
+      qbittorrent: {
+        torrents: async () => [torrent({ contentPath: '/downloads', savePath: '/downloads' })],
+        files: async () => { throw new Error('should not be called — the index already knows') },
+      },
+    }), episode)
+    expect(r.torrents.map((t) => t.matchedBy)).toEqual(['file'])
+    expect(r.torrents[0]!.files?.count).toBe(2)
+  })
+
+  it('counts a file whose own path no mapping covers, so the file set is never understated', async () => {
+    const episode = join(dir, 'dl', 'E02.mkv')
+    writeFileSync(episode, 'e')
+    db.prepare('INSERT INTO torrent_files (hash, file_index, rel_path, container_path, size_bytes) VALUES (?,?,?,?,?)')
+      .run('H1', 0, 'E01.mkv', null, 1)
+    db.prepare('INSERT INTO torrent_files (hash, file_index, rel_path, container_path, size_bytes) VALUES (?,?,?,?,?)')
+      .run('H1', 1, 'E02.mkv', episode, 1)
+    const r = await resolveTarget(deps({
+      qbittorrent: { torrents: async () => [torrent({ contentPath: '/downloads', savePath: '/downloads' })], files: async () => [] },
+    }), episode)
+    expect(r.torrents[0]!.files).toEqual({ count: 2, paths: [episode] })
+  })
+
+  it('falls back to path containment, flagged as such, only when the file list cannot be read', async () => {
+    const inside = join(dir, 'dl', 'Heat', 'CD1.mkv')
+    mkdirSync(join(dir, 'dl', 'Heat'), { recursive: true })
+    writeFileSync(inside, 'c')
+    const r = await resolveTarget(deps({
+      qbittorrent: {
+        torrents: async () => [torrent({ contentPath: '/downloads/Heat', savePath: '/downloads' })],
+        files: async () => { throw new Error('qbit 500') },
+      },
     }), inside)
     expect(r.torrents.map((t) => t.matchedBy)).toEqual(['path'])
+    expect(r.torrents[0]!.files).toBeNull()
   })
 
   it('finds two torrents on one inode — the cross-seed case', async () => {
@@ -208,6 +302,41 @@ describe('resolveTarget', () => {
       { kind: 'sonarr', instance: 'sonarr', remoteId: 9, title: 'Heat S1E1', path: media, arrPath: '/media/Movies/Heat.mkv' },
     ])
     expect(r.sourcesUnavailable).toContain('sonarr')
+  })
+
+  it('counts an *arr record whose path namespace no mapping covers, rather than reading it as unmanaged', async () => {
+    // PathMapping has no *arr field: *arr paths are translated through the Jellyfin prefix. A
+    // Radarr that reports a namespace no mapping covers therefore produces no ArrMatch at all,
+    // while `complete` stays true — "not in the list" is indistinguishable from "not managed"
+    // unless the untranslatable records are counted.
+    const r = await resolveTarget(deps({
+      radarr: { inventory: async () => ({
+        records: [
+          { kind: 'radarr', instance: 'radarr', remoteId: 1, title: 'Heat', arrPath: '/data/movies/Heat.mkv', monitored: true, seriesId: null, episodeId: null, episodeFileId: null },
+          { kind: 'radarr', instance: 'radarr', remoteId: 2, title: 'Ronin', arrPath: '/data/movies/Ronin.mkv', monitored: true, seriesId: null, episodeId: null, episodeFileId: null },
+        ],
+        complete: true,
+      }) },
+    }), media)
+    expect(r.arr).toEqual([])
+    expect(r.arrUnmappable.count).toBe(2)
+    expect(r.arrUnmappable.samples).toContain('/data/movies/Heat.mkv')
+  })
+
+  it('reports no unmappable *arr records when every path translates', async () => {
+    const r = await resolveTarget(deps({
+      radarr: { inventory: async () => ({
+        records: [{ kind: 'radarr', instance: 'radarr', remoteId: 1, title: 'Heat', arrPath: '/media/Movies/Heat.mkv', monitored: true, seriesId: null, episodeId: null, episodeFileId: null }],
+        complete: true,
+      }) },
+    }), media)
+    expect(r.arrUnmappable.count).toBe(0)
+  })
+
+  it('marks a directory target as one, so link counts are not reported as if it were a file', async () => {
+    const r = await resolveTarget(deps(), join(dir, 'lib'))
+    expect(r.isDirectory).toBe(true)
+    expect((await resolveTarget(deps(), media)).isDirectory).toBe(false)
   })
 
   it('does not flag radarr/sonarr unavailable when both are simply unconfigured (null is a legitimate "not used")', async () => {

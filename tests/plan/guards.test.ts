@@ -8,13 +8,17 @@ const config = (over = {}) => fileConfigSchema.parse({ guards: { minRatio: 1.0, 
 const torrent = (over = {}) => ({
   hash: 'H1', name: 'Heat', category: null, tags: [] as string[], state: 'stalledUP',
   ratio: 2, seedingTimeSeconds: 30 * 86_400, isPrivate: false, trackerHost: 't.example',
-  privacySource: 'flag' as const, matchedBy: 'inode' as const, ...over,
+  privacySource: 'flag' as const, matchedBy: 'inode' as const,
+  // A single-file torrent owning exactly the resolution's own path: the shape that makes
+  // "remove the torrent with its data" mean what the operator thinks it means.
+  files: { count: 1, paths: ['/mnt/m/Heat.mkv'] }, ...over,
 })
 
 const resolution = (over: Partial<Resolution> = {}): Resolution => ({
   path: '/mnt/m/Heat.mkv', exists: true, sizeBytes: 100, dev: 1, inode: 2, nlink: 1,
   hardlinks: ['/mnt/m/Heat.mkv'], torrents: [], arr: [], root: null, sourcesUnavailable: [],
   jellyfin: { itemId: null, isAlternateVersion: false, siblingPaths: [] },
+  isDirectory: false, arrUnmappable: { count: 0, samples: [] },
   ...over,
 })
 
@@ -194,6 +198,104 @@ describe('guard.protected', () => {
   it('does not block when *arr is simply not configured — sourcesUnavailable stays empty per the resolver', () => {
     const v = verdict(evaluateGuards(resolution({ sourcesUnavailable: [] }), config()), 'guard.protected')
     expect(v.outcome).toBe('pass')
+  })
+})
+
+describe('guard.torrent-scope', () => {
+  const pack = (over = {}) => torrent({
+    files: { count: 12, paths: ['/mnt/m/Heat.mkv', ...Array.from({ length: 11 }, (_, i) => `/mnt/m/E${i}.mkv`)] },
+    ...over,
+  })
+
+  it('passes when the target is the torrent\'s only file', () => {
+    const v = verdict(evaluateGuards(resolution({ torrents: [torrent()] }), config()), 'guard.torrent-scope')
+    expect(v.outcome).toBe('pass')
+  })
+
+  it('blocks when removing the torrent would take files the plan never named', () => {
+    const v = verdict(evaluateGuards(resolution({ torrents: [pack()] }), config()), 'guard.torrent-scope')
+    expect(v.outcome).toBe('block')
+    expect(v.overridable).toBe(true)
+    const offenders = v.evidence.offenders as Array<{ hash: string; fileCount: number; filesNotInPlan: number }>
+    expect(offenders[0]!.hash).toBe('H1')
+    expect(offenders[0]!.fileCount).toBe(12)
+    expect(offenders[0]!.filesNotInPlan).toBe(11)
+  })
+
+  it('passes when every one of the torrent\'s files is targeted by the plan', () => {
+    const files = { count: 2, paths: ['/mnt/m/Heat.mkv', '/mnt/m/Heat-cd2.mkv'] }
+    const v = verdict(
+      evaluateGuards(resolution({ torrents: [torrent({ files })] }), config(), { plannedPaths: files.paths }),
+      'guard.torrent-scope',
+    )
+    expect(v.outcome).toBe('pass')
+  })
+
+  it('blocks when the torrent file list could not be read at all', () => {
+    const v = verdict(evaluateGuards(resolution({ torrents: [torrent({ files: null })] }), config()), 'guard.torrent-scope')
+    expect(v.outcome).toBe('block')
+    expect(v.overridable).toBe(true)
+    expect(v.reason).toMatch(/file list/i)
+  })
+
+  it('counts a file whose path no mapping covers as one the plan does not target', () => {
+    const v = verdict(
+      evaluateGuards(resolution({ torrents: [torrent({ files: { count: 2, paths: ['/mnt/m/Heat.mkv'] } })] }), config()),
+      'guard.torrent-scope',
+    )
+    expect(v.outcome).toBe('block')
+    expect((v.evidence.offenders as Array<{ filesNotInPlan: number }>)[0]!.filesNotInPlan).toBe(1)
+  })
+
+  it('treats a torrent file that is a hardlink of the target as targeted — the standard *arr layout', () => {
+    // The torrent owns /downloads/Heat.mkv, the library holds /mnt/m/Heat.mkv, and they are one
+    // inode. Removing the torrent with its data takes a link to bytes this plan is removing anyway.
+    const v = verdict(evaluateGuards(resolution({
+      nlink: 2,
+      hardlinks: ['/mnt/m/Heat.mkv', '/downloads/Heat.mkv'],
+      torrents: [torrent({ files: { count: 1, paths: ['/downloads/Heat.mkv'] } })],
+    }), config()), 'guard.torrent-scope')
+    expect(v.outcome).toBe('pass')
+  })
+
+  it('passes for an action that removes no torrent data at all', () => {
+    const v = verdict(
+      evaluateGuards(resolution({ torrents: [pack()] }), config(), { removesTorrentData: false }),
+      'guard.torrent-scope',
+    )
+    expect(v.outcome).toBe('pass')
+  })
+
+  it('passes when nothing matched at all', () => {
+    expect(verdict(evaluateGuards(resolution(), config()), 'guard.torrent-scope').outcome).toBe('pass')
+  })
+
+  it('can be overridden — the operator may really want the whole pack gone', () => {
+    const v = evaluateGuards(resolution({ torrents: [pack()] }), config())
+    expect(isBlocked(v, ['guard.torrent-scope']).blocked).toBe(false)
+  })
+})
+
+describe('guard.protected — an *arr namespace no mapping covers', () => {
+  it('blocks, with no override, when *arr records could not be translated', () => {
+    const v = verdict(evaluateGuards(resolution({ arrUnmappable: { count: 3, samples: ['/data/movies/Heat.mkv'] } }), config()), 'guard.protected')
+    expect(v.outcome).toBe('block')
+    expect(v.overridable).toBe(false)
+    expect(v.reason).toMatch(/namespace|mapping/i)
+    expect(isBlocked([v], ['guard.protected']).blocked).toBe(true)
+  })
+
+  it('passes when every *arr path translated', () => {
+    expect(verdict(evaluateGuards(resolution(), config()), 'guard.protected').outcome).toBe('pass')
+  })
+})
+
+describe('guard.hardlink — directories', () => {
+  it('does not report a directory\'s link count as if it were a file\'s', () => {
+    // Every empty directory has nlink 2 (itself and `.`), which is not two links to any bytes.
+    const v = verdict(evaluateGuards(resolution({ isDirectory: true, nlink: 2, sizeBytes: 4096 }), config()), 'guard.hardlink')
+    expect(v.outcome).toBe('pass')
+    expect(v.reason).toMatch(/director/i)
   })
 })
 

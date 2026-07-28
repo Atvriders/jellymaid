@@ -15,6 +15,8 @@ let dir: string
 let root: string
 let media: string
 let calls: string[]
+/** Jellyfin's LIVE MediaSources[] paths per item id, in the Jellyfin namespace. */
+let jellyfinSources: Record<string, string[]>
 
 /**
  * The *arr namespace is deliberately NOT the container namespace: `arrPath` is what Radarr/Sonarr
@@ -35,12 +37,35 @@ const arrRecord = (over: Record<string, unknown> = {}) => ({
   monitored: true, seriesId: null, episodeId: null, episodeFileId: null, ...over,
 })
 
-const qbit = (over: Record<string, unknown> = {}) => ({
-  torrents: async () => { calls.push('qbit.torrents'); return [] },
-  deleteWithData: async (h: string[]) => { calls.push(`qbit.delete:${h.join(',')}`) },
-  awaitGone: async () => { calls.push('qbit.awaitGone'); return true },
-  ...over,
-})
+interface QbitOverrides {
+  torrents?: () => Promise<Array<Record<string, unknown>>>
+  files?: (hash: string) => Promise<Array<{ index: number; relPath: string; sizeBytes: number }>>
+  deleteWithData?: (hashes: string[]) => Promise<void>
+  awaitGone?: (hashes: string[]) => Promise<boolean>
+}
+
+/**
+ * Every call is recorded through the factory, not through the override, so a test that supplies its
+ * own torrent list still logs the read — otherwise the ordering assertion's filter would be
+ * silently vacuous for exactly the tests that matter most.
+ */
+type QbitDouble = NonNullable<Parameters<typeof createExecutor>[0]['qbittorrent']>
+
+const qbit = (over: QbitOverrides = {}): QbitDouble => {
+  const list = over.torrents ?? (async () => [])
+  return {
+    torrents: async () => { calls.push('qbit.torrents'); return list() },
+    // A real qBittorrent always knows its own file list. The default derives a single-file torrent
+    // from the fixture's own contentPath; multi-file tests override it.
+    files: over.files ?? (async (hash: string) => {
+      const t = (await list()).find((x) => x.hash === hash)
+      const content = t?.contentPath as string | undefined
+      return content ? [{ index: 0, relPath: content.split('/').pop()!, sizeBytes: (t?.sizeBytes as number) ?? 0 }] : []
+    }),
+    deleteWithData: over.deleteWithData ?? (async (h: string[]) => { calls.push(`qbit.delete:${h.join(',')}`) }),
+    awaitGone: over.awaitGone ?? (async () => { calls.push('qbit.awaitGone'); return true }),
+  } as unknown as QbitDouble
+}
 
 const arrClient = (label: 'radarr' | 'sonarr', over: Record<string, unknown> = {}) => ({
   inventory: async () => ({ records: [arrRecord({ kind: label, instance: label })], complete: true }),
@@ -64,10 +89,20 @@ function deps(over: Record<string, unknown> = {}) {
       mergeVersions: async (ids: string[]) => { calls.push(`jf.merge:${ids.join(',')}`) },
       splitVersions: async (id: string) => { calls.push(`jf.split:${id}`) },
       refreshLibrary: async () => { calls.push('jf.refresh') },
+      // The LIVE view of the item, which is what gates the item delete. Defaults to a healthy
+      // single-source item; tests that model a merge performed outside Jellymaid change it.
+      getItem: async (id: string) => {
+        calls.push(`jf.getItem:${id}`)
+        const paths = jellyfinSources[id]
+        return paths ? { id, mediaSourcePaths: paths } : null
+      },
     },
     ...over,
   } as Parameters<typeof createExecutor>[0]
 }
+
+/** Reads, not effects: filtered out of the ordering assertion. */
+const effects = () => calls.filter((c) => c !== 'qbit.torrents' && !c.startsWith('jf.getItem'))
 
 async function planFor(d: ReturnType<typeof deps>, actions: Parameters<typeof buildPlan>[1]['actions']) {
   const plan = await buildPlan(d as never, { createdBy: 'bob', actions })
@@ -97,6 +132,7 @@ const trashRows = () => (db.prepare('SELECT COUNT(*) c FROM trash').get() as { c
 
 beforeEach(() => {
   calls = []
+  jellyfinSources = { i1: ['/media/Heat.mkv'] }
   dir = mkdtempSync(join(tmpdir(), 'jm-exec-'))
   db = openDb(join(dir, 'db.sqlite'))
   root = join(dir, 'lib')
@@ -114,13 +150,13 @@ describe('execute — ordering', () => {
     item('i1', media)
     const plan = await planFor(d, [{ type: 'delete-media', targetPath: media }])
     await createExecutor(d).execute(plan.id, 'bob')
-    expect(calls.filter((c) => c !== 'qbit.torrents')).toEqual([
+    expect(effects()).toEqual([
       `radarr.unmonitor:${ARR_PATH}`, 'qbit.delete:H1', 'qbit.awaitGone', 'jf.delete:i1', 'jf.refresh',
     ])
   })
 
   it('re-reads live torrent state before it unmonitors anything — approval is not a licence to act on stale facts', async () => {
-    const d = deps({ qbittorrent: qbit({ torrents: async () => { calls.push('qbit.torrents'); return [torrent()] } }), radarr: arrClient('radarr') })
+    const d = deps({ qbittorrent: qbit({ torrents: async () => [torrent()] }), radarr: arrClient('radarr') })
     const plan = await planFor(d, [{ type: 'delete-media', targetPath: media }])
     calls = []
     await createExecutor(d).execute(plan.id, 'bob')
@@ -269,6 +305,79 @@ describe('execute — qBittorrent', () => {
     expect(calls.some((c) => c.startsWith('qbit.delete'))).toBe(false)
     expect(summary.done).toBe(1)
     expect(existsSync(media)).toBe(true)
+  })
+
+  it('blocks a delete that would take the rest of a multi-file torrent with it', async () => {
+    // The season-pack sample: `sample.mkv` is its own torrent when the plan is approved, and by the
+    // time it runs the same hash owns eleven episodes beside it — "remove the torrent with its
+    // data" would take all of them, and only the operator can say whether that is what they meant.
+    const pack = join(root, 'Pack')
+    mkdirSync(pack, { recursive: true })
+    const sample = join(pack, 'sample.mkv')
+    writeFileSync(sample, 'junk')
+    for (let i = 0; i < 11; i += 1) writeFileSync(join(pack, `E${i}.mkv`), 'e')
+    let packed = false
+    const d = deps({
+      qbittorrent: qbit({
+        torrents: async () => [torrent({ contentPath: '/downloads/Pack', savePath: '/downloads' })],
+        files: async () => (packed
+          ? [
+            { index: 0, relPath: 'Pack/sample.mkv', sizeBytes: 4 },
+            ...Array.from({ length: 11 }, (_, i) => ({ index: i + 1, relPath: `Pack/E${i}.mkv`, sizeBytes: 1 })),
+          ]
+          : [{ index: 0, relPath: 'Pack/sample.mkv', sizeBytes: 4 }]),
+      }),
+    })
+    const plan = await planFor(d, [{ type: 'delete-junk-file', targetPath: sample }])
+    packed = true
+    const summary = await createExecutor(d).execute(plan.id, 'bob')
+    expect(summary.blocked).toBe(1)
+    expect(calls.some((c) => c.startsWith('qbit.delete'))).toBe(false)
+    expect(existsSync(sample)).toBe(true)
+    expect(existsSync(join(pack, 'E0.mkv'))).toBe(true)
+  })
+
+  it('blocks the same delete at PLAN time too, so it never reaches an approval', async () => {
+    const pack = join(root, 'Pack')
+    mkdirSync(pack, { recursive: true })
+    const sample = join(pack, 'sample.mkv')
+    writeFileSync(sample, 'junk')
+    writeFileSync(join(pack, 'E0.mkv'), 'e')
+    const d = deps({
+      qbittorrent: qbit({
+        torrents: async () => [torrent({ contentPath: '/downloads/Pack', savePath: '/downloads' })],
+        files: async () => [
+          { index: 0, relPath: 'Pack/sample.mkv', sizeBytes: 4 },
+          { index: 1, relPath: 'Pack/E0.mkv', sizeBytes: 1 },
+        ],
+      }),
+    })
+    const plan = await buildPlan(d as never, { createdBy: 'bob', actions: [{ type: 'delete-junk-file', targetPath: sample }] })
+    expect(plan.actions[0]!.status).toBe('blocked')
+    expect(plan.dryRun.torrentsRemoved).toBe(0)
+  })
+
+  it('proceeds once the operator overrides the scope block, which is theirs to make', async () => {
+    const pack = join(root, 'Pack')
+    mkdirSync(pack, { recursive: true })
+    const sample = join(pack, 'sample.mkv')
+    writeFileSync(sample, 'junk')
+    writeFileSync(join(pack, 'E0.mkv'), 'e')
+    const d = deps({
+      qbittorrent: qbit({
+        torrents: async () => [torrent({ contentPath: '/downloads/Pack', savePath: '/downloads' })],
+        files: async () => [
+          { index: 0, relPath: 'Pack/sample.mkv', sizeBytes: 4 },
+          { index: 1, relPath: 'Pack/E0.mkv', sizeBytes: 1 },
+        ],
+      }),
+    })
+    const plan = await planFor(d, [
+      { type: 'delete-junk-file', targetPath: sample, overrides: ['guard.torrent-scope'] },
+    ])
+    const summary = await createExecutor(d).execute(plan.id, 'bob')
+    expect(summary.done).toBe(1)
+    expect(calls).toContain('qbit.delete:H1')
   })
 
   it('one failure does not abort the rest of the plan', async () => {
@@ -553,6 +662,7 @@ describe('execute — merged jellyfin versions', () => {
         mergeVersions: async () => {},
         splitVersions: async () => {},
         refreshLibrary: async () => { calls.push('jf.refresh') },
+        getItem: async (id: string) => ({ id, mediaSourcePaths: jellyfinSources[id] ?? [] }),
       },
     })
     const plan = await planFor(d, [{ type: 'delete-media', targetPath: media }])
@@ -575,6 +685,49 @@ describe('execute — merged jellyfin versions', () => {
     db.prepare("UPDATE plan_actions SET status='done' WHERE plan_id=? AND type='merge-versions'").run(plan.id)
     await createExecutor(d).execute(plan.id, 'bob')
     expect(existsSync(media)).toBe(false)
+    expect(calls).not.toContain('jf.delete:i1')
+    expect(calls).toContain('jf.refresh')
+  })
+
+  it('refuses the item delete when the LIVE item still reports another media source', async () => {
+    // A merge performed outside Jellymaid since the last scan: the index still says "primary, no
+    // siblings", but Jellyfin knows better, and deleting the item would take the version kept.
+    unlinkSync(alt)
+    db.prepare('DELETE FROM jellyfin_item_paths').run()
+    jellyfinSources.i1 = ['/media/Heat.mkv', '/media/Heat-remux.mkv']
+    const d = deps()
+    const plan = await planFor(d, [{ type: 'delete-media', targetPath: media }])
+    await createExecutor(d).execute(plan.id, 'bob')
+    expect(existsSync(media)).toBe(false)
+    expect(calls).not.toContain('jf.delete:i1')
+    expect(calls).toContain('jf.refresh')
+  })
+
+  it('refuses the item delete when the live source is a different file than the one removed', async () => {
+    unlinkSync(alt)
+    db.prepare('DELETE FROM jellyfin_item_paths').run()
+    jellyfinSources.i1 = ['/media/Somebody Else.mkv']
+    const d = deps()
+    const plan = await planFor(d, [{ type: 'delete-media', targetPath: media }])
+    await createExecutor(d).execute(plan.id, 'bob')
+    expect(calls).not.toContain('jf.delete:i1')
+    expect(calls).toContain('jf.refresh')
+  })
+
+  it('refuses the item delete when the live check itself fails', async () => {
+    unlinkSync(alt)
+    db.prepare('DELETE FROM jellyfin_item_paths').run()
+    const d = deps({
+      jellyfin: {
+        deleteItem: async (id: string) => { calls.push(`jf.delete:${id}`) },
+        mergeVersions: async () => {},
+        splitVersions: async () => {},
+        refreshLibrary: async () => { calls.push('jf.refresh') },
+        getItem: async () => { throw new Error('jellyfin 503') },
+      },
+    })
+    const plan = await planFor(d, [{ type: 'delete-media', targetPath: media }])
+    await createExecutor(d).execute(plan.id, 'bob')
     expect(calls).not.toContain('jf.delete:i1')
     expect(calls).toContain('jf.refresh')
   })
@@ -688,6 +841,68 @@ describe('execute — bookkeeping', () => {
     const second = await exec.execute(plan.id, 'bob')
     expect(second.done).toBe(0)
     expect(calls.length).toBe(before)
+  })
+
+  it('takes ONE *arr inventory snapshot for the whole run, not one per action', async () => {
+    const other = join(root, 'Other.mkv')
+    writeFileSync(other, 'y')
+    let inventories = 0
+    const d = deps({
+      radarr: arrClient('radarr', {
+        inventory: async () => { inventories += 1; return { records: [arrRecord()], complete: true } },
+      }),
+    })
+    const plan = await planFor(d, [
+      { type: 'delete-media', targetPath: media }, { type: 'delete-media', targetPath: other },
+    ])
+    inventories = 0
+    await createExecutor(d).execute(plan.id, 'bob')
+    expect(inventories).toBe(1)
+  })
+
+  it('still re-reads the torrent list per action — torrent state is what the guards most need fresh', async () => {
+    const other = join(root, 'Other.mkv')
+    writeFileSync(other, 'y')
+    const d = deps()
+    const plan = await planFor(d, [
+      { type: 'delete-media', targetPath: media }, { type: 'delete-media', targetPath: other },
+    ])
+    calls = []
+    await createExecutor(d).execute(plan.id, 'bob')
+    expect(calls.filter((c) => c === 'qbit.torrents')).toHaveLength(2)
+  })
+
+  it('does not credit qBittorrent — or the item delete — for a file that vanished before the plan ran', async () => {
+    item('i1', media)
+    const d = deps()
+    const plan = await planFor(d, [{ type: 'delete-media', targetPath: media }])
+    unlinkSync(media)
+    const summary = await createExecutor(d).execute(plan.id, 'bob')
+    expect(summary.bytesFreed).toBe(0)
+    expect(calls).not.toContain('jf.delete:i1')
+  })
+
+  it('does not credit qBittorrent for a file that vanished while the guards were still running', async () => {
+    // The file is stat'd by resolveTarget and then disappears during its own service calls — long
+    // before qBittorrent is asked to do anything. Attributing that to qBittorrent claims bytes
+    // nothing here freed and unlocks the item delete on a row that is now stale.
+    item('i1', media)
+    const d = deps({
+      qbittorrent: qbit({ torrents: async () => { if (existsSync(media)) unlinkSync(media); return [] } }),
+    })
+    const plan = await planFor(d, [{ type: 'delete-media', targetPath: media }])
+    const summary = await createExecutor(d).execute(plan.id, 'bob')
+    expect(summary.bytesFreed).toBe(0)
+    expect(calls).not.toContain('jf.delete:i1')
+  })
+
+  it('hands the database claim back after a transient failure inside the executor', async () => {
+    const d = deps()
+    const plan = await planFor(d, [{ type: 'delete-media', targetPath: media }])
+    db.exec('DROP TABLE audit') // a transient database fault, not a process death
+    await expect(createExecutor(d).execute(plan.id, 'bob')).rejects.toThrow()
+    expect((db.prepare('SELECT status FROM plans WHERE id=?').get(plan.id) as { status: string }).status).toBe('approved')
+    expect((db.prepare('SELECT status FROM plan_actions WHERE plan_id=?').get(plan.id) as { status: string }).status).toBe('pending')
   })
 
   it('resumes only the unfinished tail of an interrupted plan', async () => {

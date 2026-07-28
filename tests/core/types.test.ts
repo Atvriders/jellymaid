@@ -42,9 +42,9 @@ describe('enumerations', () => {
     ])
   })
 
-  it('covers the four guards', () => {
+  it('covers the five guards', () => {
     expect([...GUARD_IDS].sort()).toEqual([
-      'guard.cross-seed', 'guard.hardlink', 'guard.private-ratio', 'guard.protected',
+      'guard.cross-seed', 'guard.hardlink', 'guard.private-ratio', 'guard.protected', 'guard.torrent-scope',
     ])
   })
 })

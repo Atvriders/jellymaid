@@ -19,7 +19,7 @@ const torrent = (over = {}) => ({
 })
 
 function deps(over: Record<string, unknown> = {}) {
-  return {
+  const merged: Record<string, unknown> = {
     db,
     config: fileConfigSchema.parse({}),
     pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: join(dir, 'lib'), qbit: '/downloads' }]),
@@ -27,7 +27,19 @@ function deps(over: Record<string, unknown> = {}) {
     radarr: null,
     sonarr: null,
     ...over,
-  } as Parameters<typeof buildPlan>[0]
+  }
+  // A real qBittorrent knows its own file list, and guard.torrent-scope reads it: without one every
+  // matched torrent is "scope unknown" and blocks. Each double gets a single-file listing derived
+  // from its own fixture, which is what these torrents are.
+  const qb = merged.qbittorrent as { torrents?: () => Promise<Array<Record<string, unknown>>>; files?: unknown } | null
+  if (qb && !qb.files) {
+    qb.files = async (hash: string) => {
+      const t = (await qb.torrents!()).find((x) => x.hash === hash)
+      const content = t?.contentPath as string | undefined
+      return content ? [{ index: 0, relPath: content.split('/').pop()!, sizeBytes: (t?.sizeBytes as number) ?? 0 }] : []
+    }
+  }
+  return merged as unknown as Parameters<typeof buildPlan>[0]
 }
 
 /**

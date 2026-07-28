@@ -42,7 +42,7 @@ export const ACTION_STATUSES = ['pending', 'running', 'done', 'failed', 'skipped
 export type ActionStatus = (typeof ACTION_STATUSES)[number]
 
 export const GUARD_IDS = [
-  'guard.private-ratio', 'guard.cross-seed', 'guard.hardlink', 'guard.protected',
+  'guard.private-ratio', 'guard.cross-seed', 'guard.hardlink', 'guard.protected', 'guard.torrent-scope',
 ] as const
 export type GuardId = (typeof GUARD_IDS)[number]
 

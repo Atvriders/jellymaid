@@ -131,6 +131,13 @@ export interface JellyfinClient {
   authenticateByName(username: string, password: string): Promise<{ userId: string; token: string; isAdministrator: boolean }>
   virtualFolders(): Promise<JellyfinLibrary[]>
   items(opts: { startIndex: number; limit: number }): Promise<{ items: JellyfinItem[]; totalRecordCount: number }>
+  /**
+   * Jellyfin's LIVE view of one item, or null when it no longer has it. The delete executor gates
+   * `deleteItem` on this: the index is a scan-time snapshot, and a Merge Versions performed outside
+   * Jellymaid since then turns what looks like a sibling-free primary into a merged item whose
+   * other versions `DELETE /Items/{id}` would take with it.
+   */
+  getItem(id: string): Promise<JellyfinItem | null>
   mergeVersions(ids: string[]): Promise<void>
   splitVersions(id: string): Promise<void>
   deleteItem(id: string): Promise<void>
@@ -210,6 +217,20 @@ export function createJellyfinClient(opts: JellyfinClientOptions): JellyfinClien
         items: (raw.Items ?? []).map(normalize),
         totalRecordCount: raw.TotalRecordCount ?? 0,
       }
+    },
+
+    async getItem(id) {
+      // Queried through /Items?Ids=… rather than /Items/{id}: the by-id route is user-scoped on
+      // the Jellyfin versions this project supports, while this is the very endpoint the paged
+      // scan already uses with the same API key, and it returns the same shape `normalize` reads.
+      // IncludeItemTypes is deliberately omitted — the caller asks about a specific id, and a type
+      // filter could answer "no such item" for an item that plainly exists.
+      const qs = new URLSearchParams({
+        Ids: id, Recursive: 'true', Fields: ITEM_FIELDS, EnableTotalRecordCount: 'false',
+      })
+      const raw = await http.request<{ Items?: RawItem[] }>(`/Items?${qs.toString()}`)
+      const first = raw.Items?.[0]
+      return first ? normalize(first) : null
     },
 
     async mergeVersions(ids) {

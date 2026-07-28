@@ -7,7 +7,7 @@ import type { ActionStatus, ActionType, GuardVerdict, PathMapping } from '../cor
 import type { JellyfinClient } from '../connectors/jellyfin.js'
 import type { QbitClient } from '../connectors/qbittorrent.js'
 import type { ArrClient } from '../connectors/arr.js'
-import { resolveTarget, type Resolution } from './resolve.js'
+import { resolveTarget, snapshotInventory, type ResolveDeps, type Resolution } from './resolve.js'
 import { evaluateGuards, isBlocked } from './guards.js'
 import { getPlan, type PlanActionView } from './planner.js'
 import { moveToTrash } from './trash.js'
@@ -17,10 +17,10 @@ export interface ExecutorDeps {
   db: Db
   config: FileConfig
   pathMap: PathMap
-  qbittorrent: Pick<QbitClient, 'torrents' | 'deleteWithData' | 'awaitGone'> | null
+  qbittorrent: Pick<QbitClient, 'torrents' | 'files' | 'deleteWithData' | 'awaitGone'> | null
   radarr: Pick<ArrClient, 'inventory' | 'unmonitorByPath'> | null
   sonarr: Pick<ArrClient, 'inventory' | 'unmonitorByPath'> | null
-  jellyfin: Pick<JellyfinClient, 'deleteItem' | 'mergeVersions' | 'splitVersions' | 'refreshLibrary'>
+  jellyfin: Pick<JellyfinClient, 'deleteItem' | 'getItem' | 'mergeVersions' | 'splitVersions' | 'refreshLibrary'>
 }
 
 export interface ExecutionSummary {
@@ -35,6 +35,17 @@ export interface ExecutionSummary {
 
 /** A directory tree deeper than this below a root is a symptom, not a library. Bounds the sweep. */
 const MAX_SWEEP_DEPTH = 256
+
+/** Everything an action needs from the run it belongs to, rather than from module state. */
+interface RunContext {
+  planId: string
+  /** `deps` with the *arr inventory snapshotted for this run. Never used for the unmonitor call. */
+  resolveDeps: ResolveDeps
+  /** Every container path the plan removes, for `guard.torrent-scope`. */
+  plannedPaths: Set<string>
+  /** Items whose merge state this plan changes, so the index no longer describes them. */
+  mergedItemIds: Set<string>
+}
 
 type TerminalStatus = Extract<ActionStatus, 'done' | 'failed' | 'skipped' | 'blocked'>
 
@@ -164,84 +175,120 @@ export function createExecutor(deps: ExecutorDeps) {
         .flatMap((a) => a.payload.itemIds ?? []),
     )
 
-    // Actions run in `seq` order — the order the planner fixed (merges first) and the operator
-    // approved. The executor never re-sorts and never skips ahead.
-    for (const action of plan.actions) {
-      // Idempotence: an action that already reached a terminal state is not re-run. A resume hands
-      // back only the unfinished tail (the API route flips `running` rows back to `pending`).
-      if (action.status !== 'pending') continue
+    /**
+     * Every path this plan removes, for `guard.torrent-scope`. Taken from the whole approved plan
+     * including actions already done — a resumed plan still "targets" what its first attempt
+     * removed, and forgetting that would block the tail of every resumed multi-file delete.
+     */
+    const plannedPaths = new Set(
+      plan.actions.filter((a) => a.type === 'delete-media' || a.type === 'delete-junk-file')
+        .map((a) => a.payload.targetPath).filter((p): p is string => p !== undefined),
+    )
 
-      markRunning(action.id)
-      let result: ActionOutcome
-      try {
-        result = await runAction(action, planId, mergedItemIds)
-      } catch (err) {
-        result = failure((err as Error).message)
-      }
-
-      summary.bytesFreed += result.bytesFreed
-      needsRefresh ||= result.needsRefresh
-      if (result.status === 'done') summary.done += 1
-      else if (result.status === 'skipped') summary.skipped += 1
-      else if (result.status === 'blocked') summary.blocked += 1
-      else summary.failed += 1
-
-      settle(action.id, result)
-      writeAudit(deps.db, {
-        actor,
-        actionType: action.type,
-        subject: subjectOf(action),
-        before: { guardVerdicts: result.verdicts ?? [], overrides: action.payload.overrides ?? [] },
-        after: { status: result.status, bytesFreed: result.bytesFreed, error: result.error ?? null, ...result.detail },
-        outcome: result.status,
-        planId,
-        planActionId: action.id,
-      })
+    // One *arr inventory for the whole run rather than one per action; see snapshotInventory for
+    // why the unmonitor call and the torrent list are deliberately left un-snapshotted.
+    const resolveDeps: ResolveDeps = {
+      ...deps, radarr: snapshotInventory(deps.radarr), sonarr: snapshotInventory(deps.sonarr),
     }
 
-    // ONE refresh for the whole plan, after every file has settled — never per action.
-    if (needsRefresh) {
-      try {
-        await deps.jellyfin.refreshLibrary()
-        writeAudit(deps.db, { actor, actionType: 'refresh-library', subject: planId, outcome: 'done', planId })
-      } catch (err) {
-        // The bytes are already gone; a stale Jellyfin index is a cosmetic problem the next scan
-        // or a manual refresh fixes, so this is recorded rather than allowed to fail the plan.
-        writeAudit(deps.db, {
-          actor, actionType: 'refresh-library', subject: planId, outcome: 'failed',
-          after: { error: (err as Error).message }, planId,
-        })
-      }
-    }
+    const context: RunContext = { planId, resolveDeps, plannedPaths, mergedItemIds }
 
-    if (summary.failed > 0) summary.status = 'failed'
-    deps.db.prepare('UPDATE plans SET status=?, finished_at=? WHERE id=?').run(summary.status, nowIso(), planId)
-    return summary
+    try {
+      // Actions run in `seq` order — the order the planner fixed (merges first) and the operator
+      // approved. The executor never re-sorts and never skips ahead.
+      for (const action of plan.actions) {
+        // Idempotence: an action that already reached a terminal state is not re-run. A resume hands
+        // back only the unfinished tail (the API route flips `running` rows back to `pending`).
+        if (action.status !== 'pending') continue
+
+        markRunning(action.id)
+        let result: ActionOutcome
+        try {
+          result = await runAction(action, context)
+        } catch (err) {
+          result = failure((err as Error).message)
+        }
+
+        summary.bytesFreed += result.bytesFreed
+        needsRefresh ||= result.needsRefresh
+        if (result.status === 'done') summary.done += 1
+        else if (result.status === 'skipped') summary.skipped += 1
+        else if (result.status === 'blocked') summary.blocked += 1
+        else summary.failed += 1
+
+        // The terminal status and its audit row land together or not at all. The audit log is the
+        // only record of what was done to an operator's files, so an action must never be able to
+        // reach `done` with nothing written about it — if this throws, the row stays `running` and
+        // the catch below hands it back as `pending` for an idempotent re-run.
+        deps.db.transaction(() => {
+          settle(action.id, result)
+          writeAudit(deps.db, {
+            actor,
+            actionType: action.type,
+            subject: subjectOf(action),
+            before: { guardVerdicts: result.verdicts ?? [], overrides: action.payload.overrides ?? [] },
+            after: { status: result.status, bytesFreed: result.bytesFreed, error: result.error ?? null, ...result.detail },
+            outcome: result.status,
+            planId,
+            planActionId: action.id,
+          })
+        })()
+      }
+
+      // ONE refresh for the whole plan, after every file has settled — never per action.
+      if (needsRefresh) {
+        try {
+          await deps.jellyfin.refreshLibrary()
+          writeAudit(deps.db, { actor, actionType: 'refresh-library', subject: planId, outcome: 'done', planId })
+        } catch (err) {
+          // The bytes are already gone; a stale Jellyfin index is a cosmetic problem the next scan
+          // or a manual refresh fixes, so this is recorded rather than allowed to fail the plan.
+          writeAudit(deps.db, {
+            actor, actionType: 'refresh-library', subject: planId, outcome: 'failed',
+            after: { error: (err as Error).message }, planId,
+          })
+        }
+      }
+
+      if (summary.failed > 0) summary.status = 'failed'
+      deps.db.prepare('UPDATE plans SET status=?, finished_at=? WHERE id=?').run(summary.status, nowIso(), planId)
+      return summary
+    } catch (err) {
+      // A throw from OUTSIDE an action's own try — the bookkeeping writes, say, or a SQLite
+      // hiccup. Sticky-by-design is the right answer for a process that died mid-plan, but not for
+      // a transient fault in a process that is still alive: leaving the row `running` would make
+      // every later execute on this database fail with "already running" until an operator noticed.
+      // The claim goes back, the unfinished action returns to `pending` (it never reached a
+      // terminal state, and every action is idempotent and re-guarded), and the error propagates.
+      try {
+        deps.db.prepare("UPDATE plan_actions SET status='pending' WHERE plan_id=? AND status='running'").run(planId)
+        deps.db.prepare("UPDATE plans SET status='approved' WHERE id=? AND status='running'").run(planId)
+      } catch { /* the database itself is the fault: leave the row for the resume route */ }
+      throw err
+    }
   }
 
-  async function runAction(
-    action: PlanActionView, planId: string, mergedItemIds: Set<string>,
-  ): Promise<ActionOutcome> {
+  async function runAction(action: PlanActionView, context: RunContext): Promise<ActionOutcome> {
     const type: string = action.type
     switch (action.type) {
       case 'merge-versions': {
         const ids = action.payload.itemIds ?? []
         if (ids.length < 2) return failure('merge-versions requires at least two item ids')
         await deps.jellyfin.mergeVersions(ids)
-        for (const id of ids) mergedItemIds.add(id)
+        for (const id of ids) context.mergedItemIds.add(id)
         return outcome('done', { detail: { merged: ids } })
       }
       case 'split-versions': {
         const id = action.payload.itemIds?.[0]
         if (!id) return failure('split-versions requires an item id')
         await deps.jellyfin.splitVersions(id)
-        mergedItemIds.add(id)
+        context.mergedItemIds.add(id)
         return outcome('done', { detail: { split: id } })
       }
       case 'delete-media':
       case 'delete-junk-file':
       case 'remove-empty-folder':
-        return runPathAction(action, planId, mergedItemIds)
+        return runPathAction(action, context)
       default:
         return failure(`unknown action type ${type}`)
     }
@@ -253,9 +300,7 @@ export function createExecutor(deps: ExecutorDeps) {
    * `deleteWithData` without them: the three primitives are only ever called downstream of this
    * function.
    */
-  async function runPathAction(
-    action: PlanActionView, planId: string, mergedItemIds: Set<string>,
-  ): Promise<ActionOutcome> {
+  async function runPathAction(action: PlanActionView, context: RunContext): Promise<ActionOutcome> {
     const target = action.payload.targetPath
     if (!target) return failure('action carries no target path')
 
@@ -266,8 +311,12 @@ export function createExecutor(deps: ExecutorDeps) {
       return failure(`refusing to act on a path outside every configured root: ${target}`)
     }
 
-    const resolution = await resolveTarget(deps, target)
-    const verdicts = evaluateGuards(resolution, deps.config)
+    const resolution = await resolveTarget(context.resolveDeps, target)
+    const verdicts = evaluateGuards(resolution, deps.config, {
+      plannedPaths: context.plannedPaths,
+      // rmdir takes nothing but an empty directory; only the delete actions reach deleteWithData.
+      removesTorrentData: action.type !== 'remove-empty-folder',
+    })
     const blocked = isBlocked(verdicts, action.payload.overrides ?? [])
     if (blocked.blocked) {
       const why = verdicts.filter((v) => blocked.by.includes(v.guard)).map((v) => `${v.guard}: ${v.reason}`)
@@ -278,7 +327,7 @@ export function createExecutor(deps: ExecutorDeps) {
     if (action.type === 'remove-empty-folder') {
       result = removeEmptyFolder(target, root)
     } else if (action.type === 'delete-media' || action.type === 'delete-junk-file') {
-      result = await deleteTarget(action.type, target, root, resolution, planId, mergedItemIds)
+      result = await deleteTarget(action.type, target, root, resolution, context)
     } else {
       // Unreachable: `runAction` only routes the three path actions here. Spelled out rather than
       // cast, so adding a sixth action type is a compile error at the guard gate, not a silent
@@ -308,8 +357,7 @@ export function createExecutor(deps: ExecutorDeps) {
     target: string,
     root: PathMapping,
     resolution: Resolution,
-    planId: string,
-    mergedItemIds: Set<string>,
+    context: RunContext,
   ): Promise<ActionOutcome> {
     // The identity of the bytes the guards just cleared, captured before anything is touched and
     // re-checked immediately before the unlink. Steps 1 and 2 below talk to two services and can
@@ -318,7 +366,7 @@ export function createExecutor(deps: ExecutorDeps) {
     // freshly created file routinely REUSES the inode number just freed — so size and mtime are
     // part of the identity. `ctime` deliberately is not: removing a sibling hardlink in step 2
     // bumps it legitimately.
-    let identity: { dev: number; ino: number; size: number; mtimeMs: number } | null = null
+    let identity: { dev: number; ino: number; size: number; mtimeMs: number; nlink: number } | null = null
     if (existsSync(target)) {
       const st = lstatSync(target)
       if (st.isSymbolicLink()) {
@@ -328,7 +376,7 @@ export function createExecutor(deps: ExecutorDeps) {
       if (!resolution.exists || Number(st.dev) !== resolution.dev || Number(st.ino) !== resolution.inode) {
         return skip(`${target} changed identity between the guard check and the delete`)
       }
-      identity = { dev: Number(st.dev), ino: Number(st.ino), size: st.size, mtimeMs: st.mtimeMs }
+      identity = { dev: Number(st.dev), ino: Number(st.ino), size: st.size, mtimeMs: st.mtimeMs, nlink: st.nlink }
     }
 
     // ---- 1. *arr unmonitor. Fail-closed: anything short of a confirmed flip skips the delete.
@@ -393,7 +441,7 @@ export function createExecutor(deps: ExecutorDeps) {
       // Trash covers non-torrent files only. qBittorrent owns the bytes of anything it seeds, and
       // pre-moving them would defeat the point of reclaiming the space.
       if (type === 'delete-junk-file' && hashes.length === 0) {
-        const trashed = moveToTrash(deps, { path: target, planId, sizeBytes: live.size })
+        const trashed = moveToTrash(deps, { path: target, planId: context.planId, sizeBytes: live.size })
         if (trashed.trashed) {
           disposition = 'trashed'
           detail.trashPath = trashed.trashPath
@@ -409,10 +457,13 @@ export function createExecutor(deps: ExecutorDeps) {
         disposition = 'unlinked'
         bytesFreed = lastLink ? live.size : 0
       }
-    } else if (resolution.exists) {
-      // It existed when the guards ran and does not now — qBittorrent's delete-with-data in step 2.
+    } else if (identity !== null && hashes.length > 0) {
+      // It was still there when this action fingerprinted it, and there WAS a torrent to remove, so
+      // step 2 is what took it. Both halves matter: a file that vanished during the guard phase —
+      // or with no torrent involved at all — was taken by something else entirely, and crediting
+      // this action for the bytes would also unlock the item delete on a row that is now stale.
       disposition = 'removed-by-qbittorrent'
-      bytesFreed = resolution.nlink <= 1 ? resolution.sizeBytes : 0
+      bytesFreed = identity.nlink <= 1 ? identity.size : 0
     }
     detail.disposition = disposition
     detail.bytesFreed = bytesFreed
@@ -439,12 +490,17 @@ export function createExecutor(deps: ExecutorDeps) {
       //    may since have been repointed at a different file — one this plan never guarded.
       const reason = jf.isAlternateVersion ? 'alternate-version'
         : survivingSiblings.length > 0 ? 'sibling-version-survives'
-          : mergedItemIds.has(jf.itemId) ? 'merged-in-this-plan'
+          : context.mergedItemIds.has(jf.itemId) ? 'merged-in-this-plan'
             : disposition === 'already-gone' ? 'nothing-was-removed-by-this-action'
               : null
       needsRefresh = true
-      if (reason) {
-        detail.jellyfin = { itemId: jf.itemId, action: 'refresh', reason, survivingSiblings }
+      // The four reasons above all read the INDEX, which is a scan-time snapshot. A Merge Versions
+      // performed outside Jellymaid since that scan makes a merged item look exactly like a
+      // sibling-free primary, so the last word belongs to Jellyfin itself.
+      const live = reason ? null : await verifyItemIsOnlyThisFile(jf.itemId, target)
+      const finalReason = reason ?? live?.reason ?? null
+      if (finalReason) {
+        detail.jellyfin = { itemId: jf.itemId, action: 'refresh', reason: finalReason, survivingSiblings }
       } else {
         try {
           await deps.jellyfin.deleteItem(jf.itemId)
@@ -464,6 +520,35 @@ export function createExecutor(deps: ExecutorDeps) {
     }
 
     return outcome('done', { bytesFreed, needsRefresh, detail })
+  }
+
+  /**
+   * Jellyfin's own answer to "is this item nothing but the file I just removed?". `DELETE /Items`
+   * deletes the item's files, so anything short of a live, unambiguous yes falls through to a
+   * refresh: more than one media source (a merge Jellymaid never saw), a source pointing somewhere
+   * else (the item was repointed), an item Jellyfin no longer has, or a call that failed. A refresh
+   * on a healthy item is harmless; a wrong delete is not.
+   *
+   * Returns null when the delete may proceed, or the reason to refresh instead.
+   */
+  async function verifyItemIsOnlyThisFile(itemId: string, target: string): Promise<{ reason: string } | null> {
+    let live
+    try {
+      live = await deps.jellyfin.getItem(itemId)
+    } catch (err) {
+      return { reason: `live-item-check-failed: ${(err as Error).message}` }
+    }
+    if (!live) return { reason: 'jellyfin-no-longer-has-this-item' }
+    if (live.mediaSourcePaths.length !== 1) {
+      return { reason: `jellyfin-reports-${live.mediaSourcePaths.length}-media-sources` }
+    }
+    const only = live.mediaSourcePaths[0]!
+    // Jellyfin reports its own namespace; the comparison happens in container space, which is the
+    // only space in which "the file I just removed" is a fact rather than a guess.
+    if (deps.pathMap.toContainer(only) !== target) {
+      return { reason: 'jellyfin-media-source-is-a-different-file' }
+    }
+    return null
   }
 
   /**

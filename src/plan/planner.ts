@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type { Db } from '../index/db.js'
 import type { ActionType, GuardId, GuardVerdict, ActionStatus } from '../core/types.js'
 import type { FileConfig } from '../config/schema.js'
-import { resolveTarget, type ResolveDeps, type Resolution } from './resolve.js'
+import { resolveTarget, snapshotInventory, type ResolveDeps, type Resolution } from './resolve.js'
 import { evaluateGuards, isBlocked } from './guards.js'
 
 export interface RequestedAction {
@@ -73,6 +73,20 @@ export async function buildPlan(deps: PlannerDeps, request: PlanRequest): Promis
     }
   }
 
+  // Every path this plan proposes to remove, so `guard.torrent-scope` can tell "this torrent backs
+  // exactly what we asked for" from "this torrent also holds eleven files nobody named". Built from
+  // the REQUEST, not from guard outcomes, which is what keeps it free of circularity — a path stays
+  // in the plan's scope whether or not its own action ends up blocked.
+  const plannedPaths = new Set(
+    ordered.filter((a) => a.type === 'delete-media' || a.type === 'delete-junk-file')
+      .map((a) => a.targetPath).filter((p): p is string => p !== undefined),
+  )
+
+  // One *arr inventory for the whole build, not one per action. See snapshotInventory.
+  const resolveDeps: ResolveDeps = {
+    ...deps, radarr: snapshotInventory(deps.radarr), sonarr: snapshotInventory(deps.sonarr),
+  }
+
   // Pass 1: resolve every target against LIVE state and evaluate its guards, for every action,
   // before any byte accounting happens. This has to be a separate pass — not folded into the
   // accounting loop below — because whether one action's hardlinked sibling will actually run
@@ -90,8 +104,10 @@ export async function buildPlan(deps: PlannerDeps, request: PlanRequest): Promis
       if (!root || !deps.pathMap.isWithinRoot(action.targetPath, root)) {
         throw new Error(`refusing to plan an action outside every configured root: ${action.targetPath}`)
       }
-      resolution = await resolveTarget(deps, action.targetPath)
-      verdicts = evaluateGuards(resolution, deps.config)
+      resolution = await resolveTarget(resolveDeps, action.targetPath)
+      verdicts = evaluateGuards(resolution, deps.config, {
+        plannedPaths, removesTorrentData: action.type !== 'remove-empty-folder',
+      })
       if (isBlocked(verdicts, action.overrides ?? []).blocked) status = 'blocked'
     }
 
