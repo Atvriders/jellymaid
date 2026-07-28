@@ -50,8 +50,20 @@ export interface UnmonitorResult {
   recordId: number | null
 }
 
+/**
+ * `complete` is the same flag Sonarr's internal `load()` computes for `unmonitorByPath`: false
+ * when a per-series fetch was skipped, so the records that ARE here cannot be trusted as the
+ * whole library. A caller doing a wholesale "replace everything for this instance" (the arr scan
+ * phase) must not run that replace on a partial fetch — the rows it would erase describe exactly
+ * the part that was not re-read, and an erased row reads downstream as "not *arr-managed".
+ */
+export interface ArrInventory {
+  records: ArrRecord[]
+  complete: boolean
+}
+
 export interface ArrClient {
-  inventory(): Promise<ArrRecord[]>
+  inventory(): Promise<ArrInventory>
   unmonitorByPath(path: string): Promise<UnmonitorResult>
   ping(): Promise<void>
 }
@@ -87,7 +99,9 @@ export function createRadarrClient(opts: ArrClientOptions): ArrClient {
   }
 
   return {
-    async inventory() { return (await load()).map((x) => x.rec) },
+    // A failed fetch throws (see `load` above) rather than resolving here, so by the time this
+    // returns, everything Radarr has was read: always complete.
+    async inventory() { return { records: (await load()).map((x) => x.rec), complete: true } },
 
     async unmonitorByPath(path) {
       let all
@@ -167,7 +181,7 @@ export function createSonarrClient(opts: ArrClientOptions): ArrClient {
   }
 
   return {
-    async inventory() { return (await load()).records },
+    async inventory() { return load() },
 
     async unmonitorByPath(path) {
       let loaded

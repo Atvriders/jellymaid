@@ -16,12 +16,13 @@ function stub(routes: Record<string, unknown>, spy?: (url: string, init?: Reques
 const base = (f: typeof fetch) => ({ url: 'http://arr', apiKey: 'K', concurrency: 2, minDelayMs: 0, fetchImpl: f })
 
 describe('radarr', () => {
-  it('maps movies to records including the file path', async () => {
+  it('maps movies to records including the file path, and reports the inventory complete', async () => {
     const f = stub({ '/api/v3/movie': [
       { id: 5, title: 'Heat', monitored: true, path: '/movies/Heat', movieFile: { path: '/movies/Heat/Heat.mkv' } },
     ] })
-    const recs = await createRadarrClient(base(f)).inventory()
-    expect(recs[0]).toMatchObject({ kind: 'radarr', remoteId: 5, title: 'Heat', arrPath: '/movies/Heat/Heat.mkv', monitored: true })
+    const res = await createRadarrClient(base(f)).inventory()
+    expect(res.records[0]).toMatchObject({ kind: 'radarr', remoteId: 5, title: 'Heat', arrPath: '/movies/Heat/Heat.mkv', monitored: true })
+    expect(res.complete).toBe(true)
   })
 
   it('sends the api key header', async () => {
@@ -63,16 +64,17 @@ describe('radarr', () => {
 })
 
 describe('sonarr', () => {
-  it('maps episode files to records carrying seriesId and episodeId', async () => {
+  it('maps episode files to records carrying seriesId and episodeId, and reports the inventory complete', async () => {
     const f = stub({
       '/api/v3/series': [{ id: 9, title: 'Show', monitored: true, path: '/tv/Show' }],
       '/api/v3/episodefile': [{ id: 77, seriesId: 9, path: '/tv/Show/S01E01.mkv' }],
       '/api/v3/episode': [{ id: 500, seriesId: 9, episodeFileId: 77, monitored: true, title: 'Pilot' }],
     })
-    const recs = await createSonarrClient(base(f)).inventory()
-    expect(recs.find((r) => r.arrPath === '/tv/Show/S01E01.mkv')).toMatchObject({
+    const res = await createSonarrClient(base(f)).inventory()
+    expect(res.records.find((r) => r.arrPath === '/tv/Show/S01E01.mkv')).toMatchObject({
       kind: 'sonarr', seriesId: 9, episodeId: 500, episodeFileId: 77,
     })
+    expect(res.complete).toBe(true)
   })
 
   it('unmonitors via the episode monitor endpoint', async () => {
@@ -166,11 +168,14 @@ describe('sonarr', () => {
     }) as unknown as typeof fetch
 
     const problems: string[] = []
-    const recs = await createSonarrClient({ ...base(f), onProblem: (m) => problems.push(m) }).inventory()
+    const res = await createSonarrClient({ ...base(f), onProblem: (m) => problems.push(m) }).inventory()
 
-    expect(recs).toHaveLength(1)
-    expect(recs[0]).toMatchObject({ seriesId: 10, arrPath: '/tv/Show/S01E01.mkv' })
-    expect(recs.some((r) => r.seriesId === 9)).toBe(false)
+    expect(res.records).toHaveLength(1)
+    expect(res.records[0]).toMatchObject({ seriesId: 10, arrPath: '/tv/Show/S01E01.mkv' })
+    expect(res.records.some((r) => r.seriesId === 9)).toBe(false)
+    // A skipped series means the inventory did not read the whole library — the phase must not
+    // treat this the same as a genuinely complete fetch, or it will erase rows it never re-read.
+    expect(res.complete).toBe(false)
 
     expect(problems).toHaveLength(1)
     expect(problems[0]).toContain('9')

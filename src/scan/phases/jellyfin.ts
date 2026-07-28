@@ -26,6 +26,12 @@ export const jellyfinPhase: Phase = {
     }
 
     let startIndex = typeof ctx.cursor.startIndex === 'number' ? ctx.cursor.startIndex : 0
+    // The total an earlier, since-cancelled attempt at THIS scan recorded alongside its offset.
+    // If Jellyfin now reports fewer items than that, the library shrank between the cancel and
+    // this resume: items that shifted down into the range the earlier attempt already passed are
+    // observed by neither attempt, so the saved offset can no longer be trusted even if this
+    // attempt's own fetch looks complete against the NEW (smaller) total.
+    const priorTotal = typeof ctx.cursor.total === 'number' ? ctx.cursor.total : null
     let written = 0
     let unmapped = 0
     let total: number | null = null
@@ -65,7 +71,7 @@ export const jellyfinPhase: Phase = {
       writeBatch(rows)
       written += rows.length
       startIndex += page.items.length
-      ctx.saveCursor({ startIndex })
+      ctx.saveCursor({ startIndex, total })
       ctx.progress(written, total)
       if (startIndex >= total) break
     }
@@ -83,6 +89,18 @@ export const jellyfinPhase: Phase = {
     // deliberately not complete either: an empty library and a Jellyfin that has not finished
     // starting look identical from here, and only one of them justifies deleting the snapshot.
     if (ctx.signal.aborted) return { status: 'cancelled', counts: { items: written, unmapped } }
+
+    // A resume whose library shrank underneath it: the cursor offset it trusted no longer maps
+    // to the same rows, so even a fetch that looks complete against the new, smaller total must
+    // not license a sweep.
+    if (priorTotal !== null && total !== null && total < priorTotal) {
+      return {
+        status: 'skipped',
+        reason: `jellyfin now reports ${total} items, fewer than the ${priorTotal} it reported before this scan resumed; the saved cursor offset can no longer be trusted, so the sweep was skipped`,
+        counts: { items: written, unmapped },
+      }
+    }
+
     if (total === null || total <= 0 || fetched < total) {
       return {
         status: 'skipped',

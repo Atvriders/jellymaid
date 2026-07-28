@@ -166,6 +166,38 @@ describe('jellyfinPhase', () => {
     expect(db.prepare('SELECT COUNT(*) c FROM jellyfin_items WHERE scan_id = 1').get()).toEqual({ c: 3 })
     expect(db.prepare("SELECT COUNT(*) c FROM jellyfin_items WHERE id = 'old'").get()).toEqual({ c: 0 })
   })
+
+  it('does not sweep when a resumed fetch reports a total lower than the cursor recorded — the library shrank during the gap', async () => {
+    // Cursor left behind by a cancelled attempt: it had reached offset 1000 out of a
+    // then-reported 5000. Between that cancel and this resume, items below offset 1000 were
+    // deleted from Jellyfin, so items that shift down into [0, 1000) are observed by neither
+    // attempt — yet startIndex (now the smaller library's own total) would still satisfy
+    // `startIndex >= total`, which is exactly the loophole this guards against.
+    seedPriorItem()
+    const jf = {
+      virtualFolders: async () => [],
+      items: async ({ startIndex, limit }: { startIndex: number; limit: number }) => {
+        const total = 4000
+        const count = Math.max(0, Math.min(limit, total - startIndex))
+        return {
+          totalRecordCount: total,
+          items: Array.from({ length: count }, (_v, i) => ({
+            id: `r${startIndex + i}`, type: 'Movie', name: 'x', sortName: null, year: null,
+            seriesId: null, seriesName: null, seasonNo: null, episodeNo: null, providerIds: {},
+            jfPath: null, sizeBytes: null, runtimeTicks: null, container: null, videoCodec: null,
+            audioCodec: null, audioChannels: null, width: null, height: null, bitrate: null,
+            hasPrimaryImage: false, dateCreated: null, mediaSourceId: null,
+          })),
+        }
+      },
+    }
+    const res = await jellyfinPhase.run(ctx({ jellyfin: jf as never }, { startIndex: 1000, total: 5000 }))
+    expect(res.status).toBe('skipped')
+    expect(res.reason).toMatch(/shrank|resum|stale/i)
+    expect(res.counts.stale ?? 0).toBe(0)
+    // Nothing was swept: the prior snapshot survives untouched.
+    expect(db.prepare("SELECT COUNT(*) c FROM jellyfin_items WHERE id = 'old'").get()).toEqual({ c: 1 })
+  })
 })
 
 describe('filesystemPhase', () => {
@@ -522,12 +554,13 @@ describe('arrPhase', () => {
 
   it('writes records from both instances', async () => {
     const c = ctx({
-      radarr: { inventory: async () => [{ kind: 'radarr', instance: 'radarr', remoteId: 1, title: 'Heat', arrPath: '/movies/Heat.mkv', monitored: true, seriesId: null, episodeId: null, episodeFileId: null }] } as never,
-      sonarr: { inventory: async () => [{ kind: 'sonarr', instance: 'sonarr', remoteId: 2, title: 'Ep', arrPath: '/tv/Ep.mkv', monitored: true, seriesId: 9, episodeId: 500, episodeFileId: 2 }] } as never,
+      radarr: { inventory: async () => ({ records: [{ kind: 'radarr', instance: 'radarr', remoteId: 1, title: 'Heat', arrPath: '/movies/Heat.mkv', monitored: true, seriesId: null, episodeId: null, episodeFileId: null }], complete: true }) } as never,
+      sonarr: { inventory: async () => ({ records: [{ kind: 'sonarr', instance: 'sonarr', remoteId: 2, title: 'Ep', arrPath: '/tv/Ep.mkv', monitored: true, seriesId: 9, episodeId: 500, episodeFileId: 2 }], complete: true }) } as never,
     })
     const res = await arrPhase.run(c)
     expect(res.status).toBe('completed')
     expect(db.prepare('SELECT COUNT(*) c FROM arr_records').get()).toEqual({ c: 2 })
+    expect(res.counts.partial).toBe(0)
   })
 
   it('writes NULL — not the raw *arr path — when the path cannot be translated, and counts it', async () => {
@@ -536,7 +569,7 @@ describe('arrPhase', () => {
     // the file it names.
     const c = ctx({
       pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: '/mnt/m', qbit: null }]),
-      radarr: { inventory: async () => [{ kind: 'radarr', instance: 'radarr', remoteId: 1, title: 'Heat', arrPath: '/movies/Heat.mkv', monitored: true, seriesId: null, episodeId: null, episodeFileId: null }] } as never,
+      radarr: { inventory: async () => ({ records: [{ kind: 'radarr', instance: 'radarr', remoteId: 1, title: 'Heat', arrPath: '/movies/Heat.mkv', monitored: true, seriesId: null, episodeId: null, episodeFileId: null }], complete: true }) } as never,
     })
     const res = await arrPhase.run(c)
     expect(res.counts.unmapped).toBe(1)
@@ -544,5 +577,40 @@ describe('arrPhase', () => {
       { arr_path: string; container_path: string | null }
     expect(row.arr_path).toBe('/movies/Heat.mkv')
     expect(row.container_path).toBeNull()
+  })
+
+  it('preserves an instance\'s pre-existing rows when its inventory came back partial, while a complete instance is still replaced wholesale', async () => {
+    // A flaky Sonarr series must not erase its files' rows: the delete executor reads the INDEX
+    // (not unmonitorByPath) to decide whether a file is *arr-managed, and an erased row reads
+    // downstream as "not managed" — licensing a delete the *arr would otherwise have blocked.
+    const insert = db.prepare(`INSERT INTO arr_records (
+      id, kind, instance, remote_id, title, arr_path, container_path, monitored,
+      series_id, episode_id, episode_file_id
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+    insert.run('sonarr:sonarr:999', 'sonarr', 'sonarr', 999, 'Old Show', '/tv/OldShow.mkv', null, 1, 1, 1, 1)
+    insert.run('radarr:radarr:888', 'radarr', 'radarr', 888, 'Old Movie', '/movies/OldMovie.mkv', null, 1, null, null, null)
+
+    const c = ctx({
+      radarr: { inventory: async () => ({
+        records: [{ kind: 'radarr', instance: 'radarr', remoteId: 1, title: 'Heat', arrPath: '/movies/Heat.mkv', monitored: true, seriesId: null, episodeId: null, episodeFileId: null }],
+        complete: true,
+      }) } as never,
+      sonarr: { inventory: async () => ({
+        records: [{ kind: 'sonarr', instance: 'sonarr', remoteId: 2, title: 'Ep', arrPath: '/tv/Ep.mkv', monitored: true, seriesId: 9, episodeId: 500, episodeFileId: 2 }],
+        complete: false,
+      }) } as never,
+    })
+    const res = await arrPhase.run(c)
+    expect(res.status).toBe('completed')
+    expect(res.counts.partial).toBe(1)
+
+    // radarr's fetch was complete: its stale row is gone, replaced wholesale.
+    expect(db.prepare("SELECT COUNT(*) c FROM arr_records WHERE kind = 'radarr' AND remote_id = 888").get()).toEqual({ c: 0 })
+    expect(db.prepare("SELECT COUNT(*) c FROM arr_records WHERE kind = 'radarr' AND remote_id = 1").get()).toEqual({ c: 1 })
+
+    // sonarr's fetch was partial: the old row it never re-read survives...
+    expect(db.prepare("SELECT COUNT(*) c FROM arr_records WHERE kind = 'sonarr' AND remote_id = 999").get()).toEqual({ c: 1 })
+    // ...alongside the row this pass DID fetch.
+    expect(db.prepare("SELECT COUNT(*) c FROM arr_records WHERE kind = 'sonarr' AND remote_id = 2").get()).toEqual({ c: 1 })
   })
 })
