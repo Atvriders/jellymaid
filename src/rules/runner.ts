@@ -87,9 +87,18 @@ export function runRules(opts: {
       // first statement of both the success path and the catch — not in a `finally` — because a
       // `finally` runs only after the catch block's own statements (including recordRun.run below)
       // have already executed, which would make that write itself fail read-only too.
+      //
+      // A rule's optional `persist` step runs inside this same try, immediately after query_only
+      // goes back off: it is the one place a rule is allowed to write, and only after `run()` —
+      // the pure part — has already succeeded. If `persist` throws, control falls into the same
+      // catch as a throwing `run()` and the rule is recorded not-evaluated; that is deliberate,
+      // not an oversight, so a rule's mirror-table write and its findings can never disagree
+      // (findings committed but persist failed, or vice versa).
       db.pragma('query_only = ON')
       try {
         findings = rule.run({ db, config: opts.config, scanId: opts.scanId, now })
+        db.pragma('query_only = OFF')
+        rule.persist?.({ db, config: opts.config, scanId: opts.scanId, now }, findings)
       } catch (err) {
         db.pragma('query_only = OFF')
         const reason = `rule threw: ${(err as Error).message}`
@@ -97,7 +106,6 @@ export function runRules(opts: {
         summary.notEvaluated.push({ ruleId: rule.id, reason })
         continue
       }
-      db.pragma('query_only = OFF')
 
       for (const f of findings) {
         const wasResolved = (countReopened.get(f.id) as { c: number }).c > 0

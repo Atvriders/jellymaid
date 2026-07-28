@@ -23,6 +23,20 @@ export interface Rule {
   class: FindingClass
   requires: SourceName[]
   run(ctx: RuleContext): Finding[]
+  /**
+   * Optional side-effect step for a rule whose result needs a dedicated mirror table beyond the
+   * generic `findings` row — e.g. `dupe.group`'s `dupe_groups`, which the duplicates UI queries
+   * directly for group/member/keeper structure that doesn't fit the flat findings shape. The
+   * runner calls this only after `run()` has returned successfully and `query_only` has been
+   * turned back OFF (see runner.ts) — never while the read-only pragma is active — so `run()`
+   * itself stays pure and this cannot be used to smuggle a write into the part of the pass that
+   * must stay read-only. It receives exactly the findings this rule's own `run()` just produced,
+   * so it never needs to re-derive anything `run()` already worked out; if it throws, the runner
+   * isolates it exactly like a `run()` failure (recorded not-evaluated, nothing from this rule
+   * persisted this pass) rather than leaving generic findings committed with no matching mirror
+   * rows.
+   */
+  persist?(ctx: RuleContext, findings: Finding[]): void
 }
 
 /** Duplicate rules emit links; grouping is a separate concern. */
