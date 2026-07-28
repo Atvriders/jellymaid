@@ -17,6 +17,7 @@ Copied verbatim from `docs/superpowers/specs/2026-07-26-jellymaid-design.md`. Ev
 - **\*arr is unmonitor-only.** No delete endpoint and no blocklist endpoint, ever.
 - Guards are evaluated at plan-build **and re-verified immediately before each action runs**. qBittorrent and \*arr state is never taken from the index for a guard decision.
 - `guard.protected` has **no override**. `guard.private-ratio` and `guard.cross-seed` may be overridden only with an explicit toggle, and the override actor and reason are recorded.
+- `guard.protected` also owns **unverifiable state**, and blocks with no override when: qBittorrent is unreachable, so torrent state cannot be confirmed; or Radarr/Sonarr is unreachable or returned a PARTIAL inventory, so Jellymaid cannot confirm whether the file is \*arr-managed and therefore cannot guarantee the unmonitor-before-delete step. A partial inventory is the dangerous case — the file's `ArrMatch` is simply absent, which is not the same as "not managed", and the executor's fail-closed catch never fires because it never calls `unmonitorByPath` at all. An \*arr that is simply not configured does NOT block.
 - The sweep **never climbs above the mapped library or download root**.
 - Every action is idempotent. The executor holds a mutex — two plans can never run at once.
 - An approved plan is an **immutable snapshot**; edits require a new plan.

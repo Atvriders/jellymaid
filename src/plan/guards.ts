@@ -120,18 +120,44 @@ function hardlink(r: Resolution): GuardVerdict {
 /**
  * The one guard with no override, by design: a torrent mid-operation, in an operator-designated
  * protected category/tag, or whose true state cannot even be determined must never be actioned no
- * matter what the operator claims to know. `sourcesUnavailable` including 'qbittorrent' is the
- * fail-closed path — an empty `torrents` array from a resolver that could not reach qBittorrent is
- * NOT evidence of "no torrents", it is evidence of "unknown", and unknown is never a safe state to
- * delete from.
+ * matter what the operator claims to know. `sourcesUnavailable` is the fail-closed path for BOTH
+ * halves of that "true state":
+ *
+ *  - 'qbittorrent' unavailable: an empty `torrents` array is NOT evidence of "no torrents", it is
+ *    evidence of "unknown", and unknown is never a safe state to delete from.
+ *  - 'radarr'/'sonarr' unavailable (a partial inventory — see `resolveTarget`'s `complete: false`
+ *    handling): an empty/incomplete `arr` array is likewise NOT evidence of "not *arr-managed". The
+ *    real executor unmonitors via *arr before deleting BY ITERATING `resolution.arr` — if the
+ *    record that would prove this file is monitored fell in the unread part of the fetch, `arr` is
+ *    silently missing it, the unmonitor step never runs, and the *arr re-grabs what was just
+ *    deleted. That is invisible to the operator unless something blocks BEFORE approval — which is
+ *    exactly what this guard, and only this guard, already does for qBittorrent.
+ *
+ * Configured-but-unreachable and simply-not-configured are different states, on purpose: a `null`
+ * radarr/sonarr client is a legitimate "not used" and `resolveTarget` never reports it as
+ * unavailable (see `tests/plan/resolve.test.ts`, "does not flag radarr/sonarr unavailable when both
+ * are simply unconfigured"), so an operator with no *arr integration at all is never blocked by
+ * this branch.
  */
 function protectedState(r: Resolution, config: FileConfig): GuardVerdict {
-  if (r.sourcesUnavailable.includes('qbittorrent')) {
+  const unverifiable = r.sourcesUnavailable.filter((s) => s === 'qbittorrent' || s === 'radarr' || s === 'sonarr')
+  if (unverifiable.length) {
+    const parts: string[] = []
+    if (unverifiable.includes('qbittorrent')) {
+      parts.push('qBittorrent is unavailable, so torrent state cannot be verified')
+    }
+    const arrUnavailable = unverifiable.filter((s) => s === 'radarr' || s === 'sonarr')
+    if (arrUnavailable.length) {
+      parts.push(
+        `${arrUnavailable.join(' and ')} could not be verified, so Jellymaid cannot confirm whether this file is `
+        + '*arr-managed and cannot guarantee it will be unmonitored before deletion',
+      )
+    }
     return {
       guard: 'guard.protected',
       outcome: 'block',
       overridable: false,
-      reason: 'qBittorrent is unavailable, so torrent state cannot be verified',
+      reason: parts.join('; '),
       evidence: { sourcesUnavailable: r.sourcesUnavailable },
     }
   }

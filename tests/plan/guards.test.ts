@@ -154,20 +154,45 @@ describe('guard.protected', () => {
     expect(v.overridable).toBe(false)
   })
 
-  // Documents a deliberate scope boundary, not an oversight: none of the four guards read
-  // `Resolution.arr` or check `sourcesUnavailable` for 'radarr'/'sonarr'. A partial *arr inventory
-  // (Sonarr per-series fetch skipped) can leave a genuinely-monitored file's ArrMatch missing from
-  // `resolution.arr` with nothing here to notice. Per the task-2 brief and the global constraints,
-  // "unknown state fails closed" is specified only for qBittorrent/torrent state, which these four
-  // guards exist to police; *arr consistency (unmonitor-before-delete) is the executor's job
-  // (task-5-brief's `deleteTarget`, "1. *arr unmonitor first — fail closed"). Flagged in the task-2
-  // report as a cross-task gap: the executor brief loops `resolution.arr`, a resolve-time snapshot,
-  // rather than re-querying `unmonitorByPath` for the target unconditionally — so a partial
-  // inventory can silently skip the unmonitor step. This test pins today's (gap) behavior so it
-  // fails loudly — pointing back here — the moment someone decides to close it in either guards.ts
-  // or the executor.
-  it('does not block on a partial *arr inventory — arr-consistency is out of these four guards, see task-2-report.md', () => {
+  // Fix round 1: a partial *arr inventory (a Sonarr per-series fetch skipped, `complete: false`)
+  // leaves a genuinely-monitored file's ArrMatch silently absent from `resolution.arr`. The drafted
+  // executor (task-5-brief) only unmonitors records it finds by iterating `resolution.arr`, so an
+  // absent-due-to-partial-fetch record means the unmonitor step never runs and the *arr re-grabs
+  // what was just deleted — invisibly, since nothing failed loudly. Blocking here, before approval,
+  // is where an unverifiable-state concern belongs — the same rationale this guard already applies
+  // to an unreachable qBittorrent.
+  it('blocks when Sonarr could not be verified (partial inventory), naming sonarr and unmonitoring', () => {
     const v = verdict(evaluateGuards(resolution({ sourcesUnavailable: ['sonarr'] }), config()), 'guard.protected')
+    expect(v.outcome).toBe('block')
+    expect(v.overridable).toBe(false)
+    expect(v.reason).toMatch(/sonarr/i)
+    expect(v.reason).toMatch(/unmonitor/i)
+  })
+
+  it('blocks when Radarr could not be verified (partial inventory), naming radarr and unmonitoring', () => {
+    const v = verdict(evaluateGuards(resolution({ sourcesUnavailable: ['radarr'] }), config()), 'guard.protected')
+    expect(v.outcome).toBe('block')
+    expect(v.overridable).toBe(false)
+    expect(v.reason).toMatch(/radarr/i)
+    expect(v.reason).toMatch(/unmonitor/i)
+  })
+
+  it('blocks once, naming both, when qBittorrent and an *arr source are unavailable together', () => {
+    const v = verdict(evaluateGuards(resolution({ sourcesUnavailable: ['qbittorrent', 'radarr'] }), config()), 'guard.protected')
+    expect(v.outcome).toBe('block')
+    expect(v.overridable).toBe(false)
+    expect(v.reason).toMatch(/qbittorrent/i)
+    expect(v.reason).toMatch(/radarr/i)
+  })
+
+  // A `null` radarr/sonarr client (no integration configured at all) is a legitimate "not used",
+  // and `resolveTarget` never reports it as unavailable — verified against the resolver's actual
+  // behavior in `tests/plan/resolve.test.ts`, "does not flag radarr/sonarr unavailable when both
+  // are simply unconfigured (null is a legitimate 'not used')", not assumed here. A `Resolution`
+  // built the way that test proves (`sourcesUnavailable: []`) must not wedge every delete just
+  // because an operator has no *arr integration at all.
+  it('does not block when *arr is simply not configured — sourcesUnavailable stays empty per the resolver', () => {
+    const v = verdict(evaluateGuards(resolution({ sourcesUnavailable: [] }), config()), 'guard.protected')
     expect(v.outcome).toBe('pass')
   })
 })
