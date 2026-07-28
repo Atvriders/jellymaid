@@ -6,7 +6,7 @@
   "engines": { "node": ">=20.11" },
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsc -p tsconfig.json && node -e \"require('fs').cpSync('src/index/migrations','dist/src/index/migrations',{recursive:true})\"",
+    "build": "tsc -p tsconfig.json && node -e \"require('fs').cpSync('src/index/migrations','dist/src/index/migrations',{recursive:true})\" && npm --prefix client install && npm --prefix client run build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"

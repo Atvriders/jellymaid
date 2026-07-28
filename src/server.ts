@@ -1,5 +1,8 @@
 import Fastify, { type FastifyInstance } from 'fastify'
 import cookie from '@fastify/cookie'
+import fastifyStatic from '@fastify/static'
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
 import type { AppConfig } from './config/schema.js'
 import type { Db } from './index/db.js'
 import type { JellyfinClient } from './connectors/jellyfin.js'
@@ -27,6 +30,15 @@ export interface ServerDeps {
   plannerDeps: () => PlannerDeps
   trashDeps: () => TrashDeps
   executor: ReturnType<typeof createExecutor>
+  /**
+   * Where the built SPA (`client/dist`) lives. Optional so every existing route test keeps
+   * building a server without ever having a client build on disk; defaults to the real build
+   * output location so a production run needs nothing extra. Static serving (and the SPA
+   * fallback below) is skipped entirely when this directory does not exist, rather than
+   * registering `@fastify/static` against a missing root — that would make every 404 an error
+   * about a missing directory instead of the API's own 404.
+   */
+  clientDir?: string
 }
 
 export function buildServer(deps: ServerDeps): FastifyInstance {
@@ -76,6 +88,21 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     executor: deps.executor,
     jellyfin: deps.jellyfin,
   })
+
+  const clientDir = deps.clientDir ?? join(process.cwd(), 'client', 'dist')
+  if (existsSync(clientDir)) {
+    app.register(fastifyStatic, { root: clientDir, prefix: '/' })
+    // SPA fallback — anything that is not an API route serves index.html, so a client-side route
+    // like /findings or /plan survives a hard reload. An unknown /api (or /healthz) path must NOT
+    // be swallowed by this: it stays a JSON 404, or a caller hitting a typo'd or removed endpoint
+    // would get an HTML page back instead of an error it can detect.
+    app.setNotFoundHandler((req, reply) => {
+      if (req.url.startsWith('/api') || req.url.startsWith('/healthz')) {
+        return reply.code(404).send({ error: 'not found' })
+      }
+      return reply.sendFile('index.html')
+    })
+  }
 
   app.setErrorHandler((err, _req, reply) => {
     deps.logger.error('unhandled route error', { err: (err as Error).message })
