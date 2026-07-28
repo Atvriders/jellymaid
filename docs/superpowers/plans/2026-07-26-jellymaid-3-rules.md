@@ -15,7 +15,8 @@ Copied verbatim from `docs/superpowers/specs/2026-07-26-jellymaid-design.md`. Ev
 - **Degraded means "not evaluated", never "zero".** Every rule declares its required sources; the runner records `rule_runs.status = 'not-evaluated'` with a reason when they are absent.
 - Every threshold is configuration, never a literal buried in a rule.
 - Finding ids are stable across rescans (`findingId(ruleId, subjectKey)` from Plan 1) — dismissals must survive.
-- Rules are **pure and read-only**. A rule that writes to the database, calls a connector, or touches the filesystem is a defect.
+- Rules are **pure and read-only**, and the runner ENFORCES it rather than trusting it: `PRAGMA query_only = ON` is set around every `rule.run()` call (restored in a `finally`, so a throwing rule cannot leave the connection stuck read-only). A rule that attempts a write fails loudly and is recorded `not-evaluated`, which is the correct outcome.
+- A pass is **atomic**: every `rule_runs` insert, every finding upsert and the trailing resolve happen inside one transaction. A crash mid-pass must not leave a rule with no `rule_runs` row at all — that is the third state this table exists to prevent.
 - `.jellymaid-trash` never appears in a finding; the walker already excluded it, and no rule may reintroduce it.
 - Quality rules are informational only — they never produce a destructive action.
 - TypeScript strict, no `any`. Commit after every task.

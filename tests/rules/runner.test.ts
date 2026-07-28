@@ -97,4 +97,54 @@ describe('runRules', () => {
     expect(summary.created).toBe(1)
     expect(summary.notEvaluated[0]!.reason).toContain('bad sql')
   })
+
+  it('isolates a rule that attempts a write — recorded not-evaluated, others still run, connection writable again', () => {
+    const writer: Rule = {
+      id: 'fs.writer', class: 'filesystem', requires: ['filesystem'],
+      run: (ctx) => {
+        ctx.db.prepare("INSERT INTO kv (key, value_json) VALUES ('should-not-exist', '1')").run()
+        return []
+      },
+    }
+    const summary = runRules({
+      db, config, scanId: 1, availableSources: new Set(['filesystem']),
+      rules: [writer, ruleEmitting('fs.ok', ['/a'])],
+    })
+
+    expect(summary.notEvaluated[0]!.ruleId).toBe('fs.writer')
+    expect(summary.notEvaluated[0]!.reason).toMatch(/readonly|write/i)
+    expect(summary.evaluated).toEqual(['fs.ok'])
+    expect(summary.created).toBe(1)
+
+    // The attempted write never landed.
+    expect(db.prepare("SELECT 1 FROM kv WHERE key = 'should-not-exist'").get()).toBeUndefined()
+
+    // query_only must not leak past the throwing rule, past runRules() returning, or block a
+    // genuine write: prove it with a real insert that persists, not just a pragma readback.
+    expect(db.pragma('query_only', { simple: true })).toBe(0)
+    db.prepare("INSERT INTO kv (key, value_json) VALUES ('probe', '1')").run()
+    expect((db.prepare("SELECT value_json FROM kv WHERE key = 'probe'").get() as { value_json: string }).value_json).toBe('1')
+  })
+
+  it('a throwing rule leaves the whole pass consistent — every rule that ran gets exactly one rule_runs row, no finding half-written', () => {
+    const boom: Rule = { id: 'fs.boom', class: 'filesystem', requires: ['filesystem'], run: () => { throw new Error('kaboom') } }
+    const summary = runRules({
+      db, config, scanId: 1, availableSources: new Set(['filesystem']),
+      rules: [ruleEmitting('fs.first', ['/a']), boom, ruleEmitting('fs.last', ['/b'])],
+    })
+
+    expect([...summary.evaluated].sort()).toEqual(['fs.first', 'fs.last'])
+    expect(summary.notEvaluated.map((n) => n.ruleId)).toEqual(['fs.boom'])
+
+    const runs = db.prepare('SELECT rule_id, status FROM rule_runs WHERE scan_id = 1 ORDER BY rule_id').all()
+    expect(runs).toEqual([
+      { rule_id: 'fs.boom', status: 'not-evaluated' },
+      { rule_id: 'fs.first', status: 'evaluated' },
+      { rule_id: 'fs.last', status: 'evaluated' },
+    ])
+
+    const findingRuleIds = (db.prepare('SELECT rule_id FROM findings ORDER BY rule_id').all() as Array<{ rule_id: string }>)
+      .map((r) => r.rule_id)
+    expect(findingRuleIds).toEqual(['fs.first', 'fs.last'])
+  })
 })
