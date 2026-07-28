@@ -864,6 +864,108 @@ button {
   white-space: normal;
 }
 
+/* Per-row "queue this copy for deletion" checkbox — same shape as `.dupe-keeper-radio` so the two
+   opt-in controls in the member table (who stays, who's a delete candidate) read as one family. */
+.dupe-delete-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5em;
+  cursor: pointer;
+}
+
+/* The explicit "I have verified this" gate a non-exact tier requires before Delete non-keepers can
+   be clicked at all — deliberately plain (no tag styling) so it reads as a form control the
+   operator must act on, not another inspection tag to skim past. */
+.dupe-tier-ack {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.dupe-hidden-notice {
+  align-items: center;
+}
+
+.dupe-hidden-notice .btn {
+  margin-left: 0.4em;
+}
+
+/* The receipt a Delete non-keepers click leaves behind: a positive-tint echo of exactly what was
+   queued, in the same "printed slip" language as `.alert`, but never the danger tint — the danger
+   color is reserved for the button itself and for `.alert`'s own default (error) meaning. */
+.dupe-queued-note {
+  display: flex;
+  gap: 0.6em;
+  align-items: baseline;
+  background: var(--ok-tint);
+  border: 1px solid var(--ok-line);
+  border-left: 3px solid var(--ok);
+  border-radius: var(--radius);
+  color: var(--ok);
+  padding: 0.75em 0.9em;
+  margin: 0;
+  font-size: 13.5px;
+}
+
+/* ---------- Explorer ----------
+   The ground-truth fallback: an operator who does not trust a finding comes here to see the
+   mounted tree itself. Read-only — the table borrows the same shape as Findings/Duplicates, and a
+   flagged row's checkbox only ever queues an action for the Plan screen, never acts directly. */
+
+.explorer-breadcrumb {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.1rem;
+  margin-bottom: 1rem;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+.explorer-crumb {
+  display: inline-flex;
+  align-items: center;
+}
+
+.explorer-crumb-sep {
+  color: var(--ink-faint);
+  margin: 0 0.1em;
+}
+
+.explorer-crumb-current {
+  padding: 0.6em 0.5em;
+  color: var(--ink);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.explorer-dir {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: normal;
+  padding: 0.2em 0.4em;
+}
+
+.explorer-up-row td {
+  border-bottom: 1px dashed var(--line);
+}
+
+.explorer-flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3em;
+}
+
+.explorer-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 1rem;
+}
+
 /* ---------- Misc ---------- */
 
 .empty {
