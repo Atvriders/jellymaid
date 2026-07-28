@@ -7,7 +7,7 @@ import { createRadarrClient, createSonarrClient } from './connectors/arr.js'
 import { createPathMap } from './fs/pathmap.js'
 import { createExecutor } from './plan/executor.js'
 import type { PlannerDeps } from './plan/planner.js'
-import type { TrashDeps } from './plan/trash.js'
+import { purgeExpiredTrash, type TrashDeps } from './plan/trash.js'
 import { buildServer } from './server.js'
 import { createScanRunner } from './scan/runner.js'
 import { createScheduler } from './scan/scheduler.js'
@@ -89,7 +89,27 @@ const scheduler = createScheduler({
 })
 scheduler.start()
 
-const app = buildServer({ config, db, jellyfin, logger, scanRunner, plannerDeps, trashDeps, executor, pathMap })
+// A separate scheduler, not a step tacked onto the scan: the two run on independent cadences and
+// a purge must not wait behind (or block) a scan. `isRunning: () => false` is safe because
+// purgeExpiredTrash is entirely synchronous work (better-sqlite3 + sync fs calls) wrapped in an
+// async `run` — there is nothing for a second tick to overlap with.
+const purgeScheduler = createScheduler({
+  cron: '30 4 * * *',
+  isRunning: () => false,
+  run: async () => {
+    const { purged, failed } = purgeExpiredTrash(trashDeps())
+    if (purged) logger.info('purged expired trash', { purged })
+    // A file that could not be removed keeps its trash row deliberately — the row is the
+    // only record that it exists. Say so, or the operator never learns it is stuck.
+    if (failed.length) logger.warn('some trash entries could not be purged', { failed })
+  },
+  onError: (err) => logger.error('scheduled trash purge tick failed', { err: (err as Error).message }),
+})
+purgeScheduler.start()
+
+const app = buildServer({
+  config, db, jellyfin, qbittorrent, radarr, sonarr, logger, scanRunner, plannerDeps, trashDeps, executor, pathMap,
+})
 app.listen({ port: config.env.port, host: '0.0.0.0' })
   .then(() => logger.info('jellymaid listening', { port: config.env.port }))
   .catch((err) => { logger.error('failed to start', { err: (err as Error).message }); process.exit(1) })

@@ -6,6 +6,8 @@ import { join } from 'node:path'
 import type { AppConfig } from './config/schema.js'
 import type { Db } from './index/db.js'
 import type { JellyfinClient } from './connectors/jellyfin.js'
+import type { QbitClient } from './connectors/qbittorrent.js'
+import type { ArrClient } from './connectors/arr.js'
 import type { Logger } from './core/logger.js'
 import type { ScanRunner } from './scan/runner.js'
 import type { PlannerDeps } from './plan/planner.js'
@@ -25,6 +27,17 @@ export interface ServerDeps {
   config: AppConfig
   db: Db
   jellyfin: JellyfinClient
+  /**
+   * Only `/healthz` reads these three directly today — the planner and executor reach the same
+   * underlying instances through `plannerDeps`/`executor` instead, since they need narrower
+   * (`Pick`-restricted) views. Radarr/Sonarr are `null` exactly when the operator never
+   * configured that optional instance (src/index.ts); qBittorrent is mandatory config, so it is
+   * never null in production, but the type stays as permissive as Radarr/Sonarr's so tests do not
+   * need a real client.
+   */
+  qbittorrent: Pick<QbitClient, 'ping'>
+  radarr: Pick<ArrClient, 'ping'> | null
+  sonarr: Pick<ArrClient, 'ping'> | null
   logger: Logger
   scanRunner: ScanRunner
   /** Thunk, not a value: the planner needs a fresh *arr/qBittorrent view for every build, and a
@@ -58,7 +71,13 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   })
   app.register(cookie)
 
-  registerHealthRoutes(app, { db: deps.db, jellyfin: deps.jellyfin })
+  registerHealthRoutes(app, {
+    db: deps.db,
+    jellyfin: deps.jellyfin,
+    qbittorrent: deps.qbittorrent,
+    radarr: deps.radarr,
+    sonarr: deps.sonarr,
+  })
   registerAuthRoutes(app, {
     jellyfin: deps.jellyfin,
     sessionSecret: deps.config.env.sessionSecret,

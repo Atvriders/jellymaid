@@ -24,6 +24,9 @@ function testDeps(clientDir: string) {
     },
     db: openDb(join(dir, 'db.sqlite')),
     jellyfin: { ping: async () => {} } as never,
+    qbittorrent: { ping: async () => {} },
+    radarr: null,
+    sonarr: null,
     logger: createLogger({ level: 'error', sink: () => {} }),
     scanRunner: {
       start: () => ({ scanId: 1 }), cancel: () => false, isRunning: () => false,

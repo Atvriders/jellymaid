@@ -42,6 +42,9 @@ function app(items?: (opts: { startIndex: number; limit: number }) => Promise<{ 
       ping: async () => {},
       items: items ?? (async () => ({ items: [], totalRecordCount: 0 })),
     } as never,
+    qbittorrent: { ping: async () => {} },
+    radarr: null,
+    sonarr: null,
     logger: createLogger({ level: 'error', sink: () => {} }),
     scanRunner: fakeScanRunner() as never,
     // Unused by these path-map tests — plans.test.ts covers the plan/execute/trash routes.

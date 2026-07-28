@@ -10,7 +10,14 @@ import { createLogger } from '../../src/core/logger.js'
 import { fileConfigSchema } from '../../src/config/schema.js'
 import { createPathMap } from '../../src/fs/pathmap.js'
 
-function testDeps(pingImpl: () => Promise<void>) {
+type Pingable = { ping: () => Promise<void> } | null
+
+/**
+ * Builds the same stub ServerDeps every route test in this file needs, with each of the four
+ * connectors independently swappable. `null` means "not configured" — the same shape production
+ * uses for an omitted optional Radarr/Sonarr instance (src/index.ts).
+ */
+function depsWith(connectors: { jellyfin: Pingable; qbittorrent: Pingable; radarr: Pingable; sonarr: Pingable }) {
   const dir = mkdtempSync(join(tmpdir(), 'jm-srv-'))
   return {
     config: {
@@ -23,7 +30,10 @@ function testDeps(pingImpl: () => Promise<void>) {
       file: fileConfigSchema.parse({}),
     },
     db: openDb(join(dir, 'db.sqlite')),
-    jellyfin: { ping: pingImpl } as never,
+    jellyfin: connectors.jellyfin as never,
+    qbittorrent: connectors.qbittorrent as never,
+    radarr: connectors.radarr as never,
+    sonarr: connectors.sonarr as never,
     logger: createLogger({ level: 'error', sink: () => {} }),
     scanRunner: {
       start: () => ({ scanId: 1 }), cancel: () => false, isRunning: () => false,
@@ -36,6 +46,14 @@ function testDeps(pingImpl: () => Promise<void>) {
     pathMap: createPathMap([]),
   }
 }
+
+/** Only Jellyfin varies; qBittorrent is "configured and healthy", Radarr/Sonarr are unused. */
+const testDeps = (pingImpl: () => Promise<void>) => depsWith({
+  jellyfin: { ping: pingImpl },
+  qbittorrent: { ping: async () => {} },
+  radarr: null,
+  sonarr: null,
+})
 
 describe('GET /healthz', () => {
   it('reports ok with schema version and a reachable jellyfin', async () => {
@@ -90,11 +108,56 @@ describe('GET /healthz', () => {
     registerHealthRoutes(app, {
       db: openDb(join(dir, 'db.sqlite')),
       jellyfin: { ping: async () => { pings += 1 } },
+      qbittorrent: null,
+      radarr: null,
+      sonarr: null,
       now: () => t,
     })
     await app.inject({ method: 'GET', url: '/healthz' })
     t = 10_000
     await app.inject({ method: 'GET', url: '/healthz' })
     expect(pings).toBe(2)
+  })
+})
+
+describe('GET /healthz — all connectors', () => {
+  it('reports every configured connector', async () => {
+    const app = buildServer(depsWith({
+      jellyfin: { ping: async () => {} },
+      qbittorrent: { ping: async () => {} },
+      radarr: { ping: async () => {} },
+      sonarr: null,
+    }))
+    const body = (await app.inject({ method: 'GET', url: '/healthz' })).json()
+    expect(body.connectors).toEqual({ jellyfin: 'ok', qbittorrent: 'ok', radarr: 'ok', sonarr: 'not-configured' })
+  })
+
+  it('distinguishes not-configured from unreachable', async () => {
+    const app = buildServer(depsWith({
+      jellyfin: { ping: async () => {} },
+      qbittorrent: { ping: async () => { throw Object.assign(new Error('x'), { kind: 'unreachable' }) } },
+      radarr: null,
+      sonarr: null,
+    }))
+    const body = (await app.inject({ method: 'GET', url: '/healthz' })).json()
+    expect(body.connectors.qbittorrent).toBe('unreachable')
+    expect(body.connectors.radarr).toBe('not-configured')
+    expect(body.status).toBe('degraded')
+  })
+
+  it('an unconfigured optional connector does not make the service degraded', async () => {
+    const app = buildServer(depsWith({
+      jellyfin: { ping: async () => {} },
+      qbittorrent: { ping: async () => {} },
+      radarr: null,
+      sonarr: null,
+    }))
+    expect((await app.inject({ method: 'GET', url: '/healthz' })).json().status).toBe('ok')
+  })
+
+  it('reports index row counts so an empty index is visible at a glance', async () => {
+    const app = buildServer(depsWith({ jellyfin: { ping: async () => {} }, qbittorrent: { ping: async () => {} }, radarr: null, sonarr: null }))
+    const body = (await app.inject({ method: 'GET', url: '/healthz' })).json()
+    expect(body.indexCounts).toMatchObject({ jellyfinItems: 0, fsEntries: 0, findings: 0 })
   })
 })
