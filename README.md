@@ -320,6 +320,14 @@ the logs rather than being silently forgotten.
   run Auto-detect again) until Verify reports the full sample resolved, then re-scan. This gate
   applies to the scheduled scan too, so an unattended nightly scan will simply not run — check
   `/healthz`'s `lastScan` if scans seem to have stopped.
+- **The container reads healthy while a connector is down.** Deliberate. The Docker `HEALTHCHECK`
+  is *liveness-only*: it passes as long as the process is up and `/healthz` answers with a
+  well-formed body, and ignores the value of `status`. Making a `degraded` connector mark the
+  container unhealthy would let an unreachable — and entirely optional — Radarr get Jellymaid
+  restarted by autoheal or an Unraid monitor **in the middle of executing a plan**, which is how
+  you end up with the stuck `running` plan described below. Connector health is a condition for
+  you to see and act on in the UI, not a reason to kill a process that deletes files. Watch
+  `connectors` in `/healthz` (or the Settings screen) rather than the container's health state.
 - **"qBittorrent unreachable" blocking deletes.** This is deliberate, not a bug: `guard.protected`
   has no override, and an unreachable qBittorrent means Jellymaid cannot confirm a torrent isn't
   mid-download, cross-seeded, or otherwise unsafe to touch. Fix the qBittorrent connection; there
