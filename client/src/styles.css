@@ -777,6 +777,81 @@ button {
   margin-top: 1rem;
 }
 
+/* ---------- Duplicates ----------
+   The highest-stakes screen: an operator picks a permanent keeper here. Merge and delete are
+   given deliberately different visual weight — Merge stays the ordinary primary-action color,
+   Delete gets the one reserved destructive fill — and each carries its own reversibility tag
+   right next to the button, not in a tooltip, so the two are never mistaken for each other at the
+   point of decision. */
+
+.dupe-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+}
+
+.dupe-group-header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  border-bottom: none;
+  padding-bottom: 0;
+  margin-bottom: 0;
+}
+
+.dupe-group-header h3 {
+  font-size: 15px;
+  margin: 0;
+}
+
+.dupe-table {
+  margin-top: 0.25rem;
+}
+
+.dupe-keeper-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5em;
+  cursor: pointer;
+}
+
+.dupe-why-table {
+  margin-top: -0.25rem;
+  background: var(--panel-alt);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.dupe-why-table caption {
+  caption-side: top;
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-muted);
+  padding: 0.6em 0.75em 0;
+}
+
+.dupe-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1.25rem;
+  border-top: 1px solid var(--line);
+  padding-top: 0.9rem;
+}
+
+.dupe-action {
+  display: flex;
+  align-items: center;
+  gap: 0.6em;
+}
+
+.dupe-action-note {
+  white-space: normal;
+}
+
 /* ---------- Misc ---------- */
 
 .empty {
