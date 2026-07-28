@@ -3,8 +3,11 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Duplicates } from '../src/screens/Duplicates.js'
 
+// Default `matchedBy` is a genuine hash match (`dupe.identical-file`) — the one matcher that ever
+// compares file content at all — so every test below that doesn't care about match evidence still
+// gets the "no acknowledgement needed" baseline. Tests that DO care override `matchedBy` explicitly.
 const group = (over = {}) => ({
-  id: 'g1', tier: 'exact', keeperItemId: 'b',
+  id: 'g1', tier: 'exact', keeperItemId: 'b', matchedBy: ['dupe.identical-file'],
   scores: { a: { total: 900, breakdown: { resolution: 500 } }, b: { total: 1800, breakdown: { resolution: 1000 } } },
   members: [
     { id: 'a', name: 'Heat', container_path: '/mnt/m/Heat-1080.mkv', size_bytes: 8_000_000_000, height: 1080, bitrate: 8_000_000, video_codec: 'h264', library_name: 'Movies' },
@@ -196,8 +199,72 @@ describe('Duplicates', () => {
     expect(onQueue).toHaveBeenCalledWith([{ type: 'delete-media', targetPath: '/mnt/m/Heat-1080.mkv' }])
   })
 
-  it('does not require an acknowledgement for an exact-tier group', async () => {
-    render(<Duplicates api={api()} onQueue={() => {}} />)
+  it('does not require an acknowledgement for a hash-verified exact-tier group', async () => {
+    render(<Duplicates api={api({
+      duplicates: async () => ({ groups: [group({ matchedBy: ['dupe.identical-file'] })] }),
+    })} onQueue={() => {}} />)
+    expect(await screen.findByText('exact')).toBeInTheDocument()
+    expect(screen.queryByRole('checkbox', { name: /verified this is a real duplicate/i })).not.toBeInTheDocument()
+  })
+
+  // MAJOR 1: `tier === 'exact'` alone does NOT mean byte-verified — `dupe.provider-id` and
+  // `dupe.series-episode` both emit 'exact' from pure metadata (a shared TMDB/IMDB id, or a shared
+  // series/season/episode key), never comparing file content. Only `dupe.identical-file` ever
+  // compares files at all (and only via a sampled head/tail hash). So the acknowledgement gate must
+  // key off `matchedBy` (the evidence), not off the tier label.
+
+  it('requires an acknowledgement for an exact-tier group matched by provider ID alone, a metadata-only match', async () => {
+    const onQueue = vi.fn()
+    render(<Duplicates api={api({
+      duplicates: async () => ({ groups: [group({ matchedBy: ['dupe.provider-id'] })] }),
+    })} onQueue={onQueue} />)
+    expect(await screen.findByText('exact')).toBeInTheDocument()
+    await userEvent.click(await screen.findByRole('checkbox', { name: /delete .*Heat-1080/i }))
+    const deleteBtn = screen.getByRole('button', { name: /delete non-keepers/i })
+    expect(deleteBtn).toBeDisabled()
+    expect(screen.getByRole('checkbox', { name: /verified this is a real duplicate/i })).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('checkbox', { name: /verified this is a real duplicate/i }))
+    expect(deleteBtn).toBeEnabled()
+    await userEvent.click(deleteBtn)
+    expect(onQueue).toHaveBeenCalledWith([{ type: 'delete-media', targetPath: '/mnt/m/Heat-1080.mkv' }])
+  })
+
+  it('requires an acknowledgement for an exact-tier group matched by series/episode alone, a metadata-only match', async () => {
+    render(<Duplicates api={api({
+      duplicates: async () => ({ groups: [group({ matchedBy: ['dupe.series-episode'] })] }),
+    })} onQueue={() => {}} />)
+    expect(await screen.findByRole('checkbox', { name: /verified this is a real duplicate/i })).toBeInTheDocument()
+  })
+
+  it('still requires an acknowledgement when a hash match is diluted by a weaker link in the same group', async () => {
+    // `buildDupeGroups` sets a group's tier to the MAXIMUM confidence over every link after
+    // transitive union-find, so one weak fuzzy-title link can drag an unrelated title into a
+    // component that a real hash match also touches — the whole group still reads 'exact'. Only a
+    // group whose EVERY contributing matcher is `dupe.identical-file` may skip the acknowledgement.
+    render(<Duplicates api={api({
+      duplicates: async () => ({ groups: [group({ matchedBy: ['dupe.identical-file', 'dupe.fuzzy-title'] })] }),
+    })} onQueue={() => {}} />)
+    expect(await screen.findByRole('checkbox', { name: /verified this is a real duplicate/i })).toBeInTheDocument()
+  })
+
+  it('surfaces which matcher(s) actually produced a group, so an operator can see a weak link riding along a strong one', async () => {
+    render(<Duplicates api={api({
+      duplicates: async () => ({ groups: [group({ matchedBy: ['dupe.provider-id', 'dupe.fuzzy-title'] })] }),
+    })} onQueue={() => {}} />)
+    // The plain-fact "Matched by: ..." line — distinct from the warning-style caveat paragraph,
+    // which also mentions the matcher names but is worded as a warning, not a neutral fact.
+    const matchedByLine = await screen.findByText(/^matched by: /i)
+    expect(matchedByLine).toHaveTextContent(/provider id/i)
+    expect(matchedByLine).toHaveTextContent(/fuzzy title/i)
+  })
+
+  it('states plainly that a file-hash match is a sampled comparison, not proof of a full byte-for-byte match', async () => {
+    render(<Duplicates api={api({
+      duplicates: async () => ({ groups: [group({ matchedBy: ['dupe.identical-file'] })] }),
+    })} onQueue={() => {}} />)
+    expect(await screen.findByText(/sampled/i)).toBeInTheDocument()
+    expect(screen.getByText(/byte-for-byte/i)).toBeInTheDocument()
+    // The whole point: this is the one case that must NOT require the acknowledgement.
     expect(screen.queryByRole('checkbox', { name: /verified this is a real duplicate/i })).not.toBeInTheDocument()
   })
 
@@ -318,6 +385,27 @@ describe('Duplicates', () => {
     expect(dismissFinding).not.toHaveBeenCalled()
   })
 
+  it('agrees the verb with the noun when a single hidden group is the only one on the board', async () => {
+    // MINOR 3: "All 1 duplicate group are hidden for this session." — plural verb, singular noun.
+    render(<Duplicates api={api()} onQueue={() => {}} />)
+    await userEvent.click(await screen.findByRole('button', { name: /hide.*session/i }))
+    expect(await screen.findByText(/all 1 duplicate group is hidden for this session/i)).toBeInTheDocument()
+    expect(screen.queryByText(/all 1 duplicate group are hidden/i)).not.toBeInTheDocument()
+  })
+
+  it('keeps the plural verb when every one of several groups is hidden', async () => {
+    render(<Duplicates api={api({
+      duplicates: async () => ({ groups: [group(), group({ id: 'g2', members: [
+        { id: 'c', name: 'Other', container_path: '/mnt/m/Other-1080.mkv', size_bytes: 1, height: 1080, library_name: 'Movies' },
+        { id: 'd', name: 'Other', container_path: '/mnt/m/Other-2160.mkv', size_bytes: 1, height: 2160, library_name: 'Movies' },
+      ], keeperItemId: 'd', scores: { c: { total: 900, breakdown: {} }, d: { total: 1800, breakdown: {} } } })] }),
+    })} onQueue={() => {}} />)
+    const hideButtons = await screen.findAllByRole('button', { name: /hide.*session/i })
+    await userEvent.click(hideButtons[0]!)
+    await userEvent.click((await screen.findAllByRole('button', { name: /hide.*session/i }))[0]!)
+    expect(await screen.findByText(/all 2 duplicate groups are hidden for this session/i)).toBeInTheDocument()
+  })
+
   it('lets the operator un-hide groups they hid earlier this session', async () => {
     render(<Duplicates api={api()} onQueue={() => {}} />)
     await userEvent.click(await screen.findByRole('button', { name: /hide.*session/i }))
@@ -349,7 +437,15 @@ describe('Duplicates', () => {
     expect(onQueue).toHaveBeenCalledTimes(1)
   })
 
-  it('re-enables Delete non-keepers once the checked selection changes after queueing', async () => {
+  it('re-enables Delete non-keepers once the checked selection changes after queueing, and sends only the newly-checked path, never a repeat of what is already queued', async () => {
+    // MINOR 2 regression: a superset re-queue used to re-send every already-queued path too (the
+    // selection-key guard only ever blocked a byte-identical repeat of the WHOLE selection), so
+    // checking A, queueing, then also checking C and queueing again sent [A, C] the second time —
+    // duplicating A. `buildPlan` tolerates the repeated path for byte accounting, but
+    // `deleteCount` is incremented per action, so the plan summary overstated the file count, the
+    // same path was listed twice for approval, and the second execution attempt failed on a file
+    // the first had already removed. The fix tracks queued PATHS per group and sends only the
+    // not-yet-queued difference.
     const onQueue = vi.fn()
     render(<Duplicates api={api({
       duplicates: async () => ({ groups: [group({
@@ -365,15 +461,17 @@ describe('Duplicates', () => {
     const deleteBtn = screen.getByRole('button', { name: /delete non-keepers/i })
     await userEvent.click(deleteBtn)
     expect(onQueue).toHaveBeenCalledTimes(1)
+    expect(onQueue).toHaveBeenLastCalledWith([{ type: 'delete-media', targetPath: '/mnt/m/Heat-1080.mkv' }])
     expect(deleteBtn).toBeDisabled()
     await userEvent.click(await screen.findByRole('checkbox', { name: /delete .*Heat-720/i }))
     expect(deleteBtn).toBeEnabled()
     await userEvent.click(deleteBtn)
     expect(onQueue).toHaveBeenCalledTimes(2)
-    expect(onQueue).toHaveBeenLastCalledWith([
-      { type: 'delete-media', targetPath: '/mnt/m/Heat-1080.mkv' },
-      { type: 'delete-media', targetPath: '/mnt/m/Heat-720.mkv' },
-    ])
+    // Only the newly-checked path, never Heat-1080 again.
+    expect(onQueue).toHaveBeenLastCalledWith([{ type: 'delete-media', targetPath: '/mnt/m/Heat-720.mkv' }])
+    // Every path ever handed to onQueue across both clicks, flattened, has no duplicate.
+    const allPaths = (onQueue.mock.calls.flat(2) as Array<{ targetPath: string }>).map((a) => a.targetPath)
+    expect(new Set(allPaths).size).toBe(allPaths.length)
   })
 
   it('clears a stale delete confirmation when the keeper choice changes afterward', async () => {

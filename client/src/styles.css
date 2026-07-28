@@ -884,6 +884,15 @@ button {
   color: var(--ink);
 }
 
+/* The plain-fact "Matched by: ..." line (`matchedByLine` in Duplicates.tsx) — deliberately not a
+   tag or an alert, since it is background provenance the operator can check, never a verdict this
+   screen is asserting on its own account. Sits directly under the tier tag it corroborates. */
+.dupe-matched-by {
+  font-size: 12px;
+  color: var(--ink-muted);
+  margin: -0.3rem 0 0;
+}
+
 .dupe-hidden-notice {
   align-items: center;
 }

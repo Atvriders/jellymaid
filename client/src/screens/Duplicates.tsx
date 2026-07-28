@@ -59,60 +59,119 @@ function memberDisplayPath(m: DupeMember): string {
 /**
  * A group's `tier` is the MAXIMUM confidence over every link in it (see `buildDupeGroups` in
  * src/rules/grouping.ts) after transitive union-find, so this is a statement about the group's
- * strongest evidence, never its weakest. Two things fall out of that which this screen leans on
- * directly:
+ * strongest evidence, never its weakest — and never a statement about what kind of evidence that
+ * was. In particular `tier === 'exact'` does NOT mean any bytes were ever compared:
+ * `dupe.provider-id` (shared TMDB/IMDB id) and `dupe.series-episode` (shared series/season/episode
+ * key) both emit `'exact'` from pure metadata, and `dupe.identical-file` — the only matcher that
+ * ever looks at file content — only ever hashes a SAMPLE (head + tail, `src/fs/hasher.ts`), never
+ * the whole file. `tier === 'possible'` is the one tier this screen can still narrow exactly:
+ * `dupe.fuzzy-title` is the only matcher that ever emits `'possible'`, so a `possible` group is, by
+ * construction, matched by title-similarity alone.
  *
- *   - `tier === 'exact'` means at least one pairwise link was byte-verified (provider id, series
- *     episode key, or identical file hash — the only three matchers in `src/rules/dupes/index.ts`
- *     that ever emit `'exact'`).
- *   - `tier === 'possible'` means NO link in the group reached `'strong'` or `'exact'` — and
- *     `dupe.fuzzy-title` is the only matcher that ever emits `'possible'` — so a `possible` group
- *     is, by construction, matched by title-similarity alone. That is a structural fact of the
- *     rule set, not the (unavailable) per-link `matchedBy` data — see the note on
- *     `/api/duplicates`'s response shape below.
+ * `matchedBy` (`/api/duplicates`, joined from the `dupe.group` finding's evidence — see
+ * src/api/findings.ts) is what actually answers "what kind of match is this": the deduplicated set
+ * of matcher ids that contributed a link anywhere in this group. It is used below to gate the
+ * acknowledgement on real evidence instead of the tier label, and is always shown to the operator
+ * directly (`matchedByLine`) rather than left implicit in a badge that cannot carry it.
  *
- * This screen never trusts the shared `<TierBadge>` for this tag: that component renders
- * `possible` with the same quiet, muted tint as an unrelated "info" severity — visually calmer
- * than `strong`, even though `possible` is the LEAST confirmed of the three tiers. Escalating
- * rather than de-escalating, `possible` gets the same warning weight as `strong` here; only
- * `exact` — actual byte/ID proof — earns the calm, positive tag.
+ * This screen never trusts the shared `<TierBadge>` for the tier tag itself: that component
+ * renders `possible` with the same quiet, muted tint as an unrelated "info" severity — visually
+ * calmer than `strong`, even though `possible` is the LEAST confirmed of the three tiers.
+ * Escalating rather than de-escalating, `possible` gets the same warning weight as `strong` here.
+ * `exact` still keeps the calm tag — it remains an accurate report of the tier the server computed
+ * — but, per the acknowledgement gate below, is no longer trusted to mean the match was verified.
  */
 function tierTagClass(tier: string): string {
   if (tier === 'exact') return 'tag tag-ok'
   return 'tag tag-warn'
 }
 
+/** Friendly display names for `matchedBy` entries (`src/rules/dupes/index.ts` rule ids). Falls
+ * back to the raw id for anything unmapped, so an unrecognised matcher still renders rather than
+ * silently vanishing from the audit trail — same policy as `SCORE_LABELS` above. */
+const MATCHER_LABELS: Record<string, string> = {
+  'dupe.provider-id': 'provider ID',
+  'dupe.series-episode': 'series & episode',
+  'dupe.identical-file': 'file hash',
+  'dupe.title-year': 'title & year',
+  'dupe.runtime': 'runtime',
+  'dupe.fuzzy-title': 'fuzzy title similarity',
+}
+
+function matcherLabel(ruleId: string): string {
+  return MATCHER_LABELS[ruleId] ?? ruleId
+}
+
+/** The one matcher that ever compares file content — `src/rules/dupes/index.ts`'s
+ * `dupe.identical-file`, bucketing on `size|quick_hash`. `quick_hash` samples the first and last
+ * megabyte of the file (`src/fs/hasher.ts`), so even this is strong evidence, not proof of an exact
+ * byte-for-byte match — see `matchedByLine` below for the wording shown to the operator. */
+const HASH_MATCHER = 'dupe.identical-file'
+
 /**
- * A non-exact tier's plain-language caveat, shown next to the tag so the operator reads it before
- * ever reaching the delete controls. Worded per the reasoning in `tierTagClass` above: `possible`
- * can be named exactly ("title similarity only") because that is the only rule that ever produces
- * it; `strong` cannot be narrowed to one matcher (title/year and runtime both emit it, and a group
- * can carry links from either or both), so its caveat stays general rather than guessing.
- *
- * Note on `matchedBy`: `src/rules/dupes/adapter.ts` computes a per-finding `matchedBy` list, but
- * `/api/duplicates` (src/api/findings.ts) reads from the separate `dupe_groups` table, which only
- * ever stores `id, tier, members_json, keeper_item_id, scores_json, status` — `matchedBy` never
- * reaches this screen. Rather than inventing a field the wire shape does not carry, this caveat is
- * derived only from `tier`, which the client does have and which — per the reasoning above — is
- * itself sufficient to say what it says truthfully.
+ * True only when EVERY matcher that contributed a link to this group was `dupe.identical-file`.
+ * Any other matcher present — even alongside a hash match — means at least one pairwise link in
+ * this component is metadata-only or a title-similarity guess, which is exactly how
+ * `buildDupeGroups`'s max-confidence tier can drag an unrelated title into a component this screen
+ * would otherwise still call `exact`. An empty `matchedBy` (no corresponding open `dupe.group`
+ * finding to join against) is treated as unverified, never as a free pass.
  */
-function tierCaveat(tier: string): string | null {
+function isHashVerified(matchedBy: string[]): boolean {
+  return matchedBy.length > 0 && matchedBy.every((id) => id === HASH_MATCHER)
+}
+
+/**
+ * Plain-fact line always shown when there is `matchedBy` data: which matcher(s) actually produced
+ * this group, so an operator sees a case like "matched by provider ID, fuzzy title similarity" —
+ * a weak link riding along a strong one — that the tier badge alone hides (see the module doc
+ * comment's `matchedBy` paragraph). When a file-hash match is among them, the sampling caveat is
+ * spelled out here rather than assumed, since "file hash" alone reads as a full comparison.
+ */
+function matchedByLine(matchedBy: string[]): string | null {
+  if (matchedBy.length === 0) return null
+  const labels = matchedBy.map(matcherLabel).join(', ')
+  const hashNote = matchedBy.includes(HASH_MATCHER)
+    ? ' File hash here means a sampled hash of each file\'s first and last portion, not the whole file — strong evidence, but not proof of a full byte-for-byte match.'
+    : ''
+  return `Matched by: ${labels}.${hashNote}`
+}
+
+/**
+ * A caveat for whichever tier/evidence combination requires the acknowledgement (see `needsAck`
+ * below) — shown next to the tag so the operator reads it before ever reaching the delete
+ * controls. `possible` and `strong` are unaffected by the `matchedBy` fix: `dupe.fuzzy-title` is
+ * the only matcher that ever emits `'possible'`, and `dupe.title-year`/`dupe.runtime` are the only
+ * two that ever emit `'strong'`, so both caveats can still be worded exactly from `tier` alone.
+ * `exact` reaching this function at all means (per `needsAck`) it was NOT hash-verified — either no
+ * matcher touched file content, or one did but a weaker link also rode along — so its caveat is
+ * derived from `matchedBy`, never asserted from the tier label.
+ */
+function evidenceCaveat(tier: string, matchedBy: string[]): string {
   if (tier === 'possible') {
     return 'Matched by title similarity only (dupe.fuzzy-title) — a hypothesis, not a confirmed duplicate. Verify manually before deleting anything.'
   }
   if (tier === 'strong') {
     return 'Matched by title/year proximity or runtime similarity, not a provider ID or file hash — verify before deleting.'
   }
-  return null
+  const labels = matchedBy.length > 0 ? matchedBy.map(matcherLabel).join(', ') : 'no recorded matcher'
+  return matchedBy.includes(HASH_MATCHER)
+    ? `Matched by ${labels} — a file-hash link exists somewhere in this group, but at least one member was pulled in by a weaker match that never compared file content. Verify manually before deleting anything.`
+    : `Matched by ${labels} — shared metadata, not a file comparison, so this is not the byte-verified proof an "exact" tier might otherwise suggest. Verify manually before deleting anything.`
 }
 
-function tierAckLabel(tier: string): string {
-  const suffix = tier === 'possible' ? 'title-similarity guess' : 'title/runtime coincidence'
-  return `I have verified this is a real duplicate, not just a ${suffix}.`
+/** Mirrors `evidenceCaveat`'s reasoning for the acknowledgement checkbox's own label text. */
+function ackSuffix(tier: string, matchedBy: string[]): string {
+  if (tier === 'possible') return 'title-similarity guess'
+  if (tier === 'strong') return 'title/runtime coincidence'
+  const labels = matchedBy.length > 0 ? matchedBy.map(matcherLabel).join(' + ') : 'metadata-only'
+  return `${labels} match with no file comparison behind it`
+}
+
+function tierAckLabel(tier: string, matchedBy: string[]): string {
+  return `I have verified this is a real duplicate, not just a ${ackSuffix(tier, matchedBy)}.`
 }
 
 interface QueuedConfirmation {
-  selectionKey: string
   paths: string[]
   skipped: number
 }
@@ -137,10 +196,16 @@ interface QueuedConfirmation {
  *      acts only on rows the operator explicitly checked. That is what makes the cross-library
  *      warning below actionable — an operator can delete one stray copy while explicitly keeping
  *      another that lives in a different, intentional library — instead of merely advisory.
- *   4. A less-than-exact tier requires an explicit, separate acknowledgement before Delete
- *      non-keepers can be clicked at all, on top of the per-row checkboxes: confidence and consent
- *      to delete are gated independently, since a fuzzy title match is a much weaker basis for a
- *      permanent action than a provider-id or file-hash match.
+ *   4. Deletion requires an explicit, separate acknowledgement before Delete non-keepers can be
+ *      clicked at all, on top of the per-row checkboxes — UNLESS `matchedBy` shows every
+ *      contributing matcher was `dupe.identical-file` (`isHashVerified`). The tier label alone
+ *      never grants that: `tier === 'exact'` also covers `dupe.provider-id` and
+ *      `dupe.series-episode`, both pure metadata, so confidence and consent to delete are gated on
+ *      the actual evidence, not on how confident the grouping algorithm's strongest link was.
+ *   5. A path already handed to `onQueue` for a group is never handed to it again from that group,
+ *      even after the operator adds more rows and clicks Delete non-keepers a second time: only the
+ *      not-yet-queued difference is sent (`queuedPathsByGroup`), tracked by path rather than by the
+ *      checked-selection as a whole.
  */
 export function Duplicates({ api, onQueue }: { api: DuplicatesApi; onQueue: (actions: RequestedAction[]) => void }) {
   const list = useAsync(api.duplicates)
@@ -153,6 +218,14 @@ export function Duplicates({ api, onQueue }: { api: DuplicatesApi; onQueue: (act
   const [deleteSelections, setDeleteSelections] = useState<Record<string, Set<string>>>({})
   const [tierAck, setTierAck] = useState<Record<string, boolean>>({})
   const [queuedFor, setQueuedFor] = useState<Record<string, QueuedConfirmation>>({})
+  // Every path this group has ever handed to `onQueue`, across however many Delete non-keepers
+  // clicks — the MINOR 2 fix. Keyed by group id, not by a snapshot of the checked selection, so a
+  // later click that ALSO includes an already-queued path never re-sends it (see `handleDelete
+  // NonKeepers` below): `buildPlan` tolerates a repeated path for byte accounting, but
+  // `deleteCount` is incremented per action, so a resend overstates the plan's file count, lists
+  // the same path twice for approval, and fails execution the second time on a file the first
+  // attempt already removed.
+  const [queuedPathsByGroup, setQueuedPathsByGroup] = useState<Record<string, Set<string>>>({})
 
   // A fresh fetch — the initial load, or any later reload — must never carry forward a stale
   // per-row selection, tier acknowledgement, or "already queued" guard from a previous render of
@@ -163,6 +236,7 @@ export function Duplicates({ api, onQueue }: { api: DuplicatesApi; onQueue: (act
     setDeleteSelections({})
     setTierAck({})
     setQueuedFor({})
+    setQueuedPathsByGroup({})
   }, [list.data])
 
   function chooseKeeper(group: DupeGroup, memberId: string) {
@@ -246,18 +320,31 @@ export function Duplicates({ api, onQueue }: { api: DuplicatesApi; onQueue: (act
     }
   }
 
-  function handleDeleteNonKeepers(group: DupeGroup, targets: DupeMember[], skipped: number, selectionKey: string) {
-    const actions: RequestedAction[] = targets.map((m) => ({
+  /**
+   * `notYetQueued` is always the not-yet-queued difference for this group (see `notYetQueued`
+   * below, computed from `queuedPathsByGroup`) — never the raw checked selection — so a click that
+   * includes a path already sent to `onQueue` on an earlier click for this same group never sends
+   * it again. Typed with `container_path` narrowed to `string` (via `queueableNonKeepers`'s type
+   * predicate) rather than cast, so a missing path can never silently reach the action list.
+   */
+  function handleDeleteNonKeepers(
+    group: DupeGroup,
+    notYetQueued: Array<DupeMember & { container_path: string }>,
+    skipped: number,
+  ) {
+    const actions: RequestedAction[] = notYetQueued.map((m) => ({
       type: 'delete-media',
-      // `targets` is always built from members whose `container_path` was already checked
-      // non-null (see `queueableNonKeepers` below) — never from `deleteSelections` directly — so
-      // this can never silently coerce a missing path into the action list.
-      targetPath: m.container_path as string,
+      targetPath: m.container_path,
     }))
     onQueue(actions)
+    setQueuedPathsByGroup((prev) => {
+      const next = new Set(prev[group.id] ?? [])
+      for (const m of notYetQueued) next.add(m.container_path)
+      return { ...prev, [group.id]: next }
+    })
     setQueuedFor((prev) => ({
       ...prev,
-      [group.id]: { selectionKey, paths: targets.map(memberDisplayPath), skipped },
+      [group.id]: { paths: notYetQueued.map(memberDisplayPath), skipped },
     }))
   }
 
@@ -289,7 +376,7 @@ export function Duplicates({ api, onQueue }: { api: DuplicatesApi; onQueue: (act
               // the one control that undoes it, in the same message rather than a separate banner
               // that would otherwise duplicate this sentence.
               <p className="alert alert-warn dupe-hidden-notice" role="status">
-                All {allGroups.length} duplicate group{allGroups.length === 1 ? '' : 's'} are hidden for this session.{' '}
+                All {allGroups.length} duplicate group{allGroups.length === 1 ? '' : 's'} {allGroups.length === 1 ? 'is' : 'are'} hidden for this session.{' '}
                 <button type="button" className="btn btn-quiet" onClick={unhideAll}>Show hidden</button>
               </p>
             ) : (
@@ -319,14 +406,30 @@ export function Duplicates({ api, onQueue }: { api: DuplicatesApi; onQueue: (act
               const unqueueableCount = nonKeepers.length - queueableNonKeepers.length
               const selected = deleteSelections[group.id] ?? new Set<string>()
               const checkedQueueable = queueableNonKeepers.filter((m) => selected.has(m.id))
-              const selectionKey = checkedQueueable.map((m) => m.id).sort().join(',')
-              const needsAck = group.tier !== 'exact'
+              // `matchedBy` is not guaranteed non-empty at runtime (an older group with no
+              // corresponding open `dupe.group` finding reports it empty) — defaulted here rather
+              // than trusted, same policy as `resolveKeeper` above.
+              const matchedBy = group.matchedBy ?? []
+              // MAJOR 1: the acknowledgement gate is evidence-based, never inferred from the tier
+              // label alone. `possible`/`strong` are unaffected (dupe.fuzzy-title always emits
+              // 'possible'; dupe.title-year/dupe.runtime always emit 'strong' — neither ever
+              // touches file content) and still always require it. `tier === 'exact'` also covers
+              // pure-metadata matchers (dupe.provider-id, dupe.series-episode), so it may ONLY skip
+              // the acknowledgement when `matchedBy` shows every contributing matcher was a genuine
+              // file-hash match (`isHashVerified`).
+              const needsAck = group.tier !== 'exact' || !isHashVerified(matchedBy)
               const ackGiven = tierAck[group.id] === true
-              const caveat = tierCaveat(group.tier)
+              const caveat = needsAck ? evidenceCaveat(group.tier, matchedBy) : null
+              const matchedByText = matchedByLine(matchedBy)
               const queuedHere = queuedFor[group.id]
-              const alreadyQueuedForSelection = selectionKey !== '' && queuedHere?.selectionKey === selectionKey
-              const canDelete = checkedQueueable.length > 0 && (!needsAck || ackGiven) && !alreadyQueuedForSelection
-              const deleteLabel = alreadyQueuedForSelection
+              // MINOR 2: only the not-yet-queued difference is ever sent to `onQueue` — a path this
+              // group has already queued (`queuedPathsByGroup`) is never re-sent just because a
+              // later click's checked selection happens to be a superset that still includes it.
+              const alreadyQueuedPaths = queuedPathsByGroup[group.id] ?? new Set<string>()
+              const notYetQueued = checkedQueueable.filter((m) => !alreadyQueuedPaths.has(m.container_path))
+              const allCheckedAlreadyQueued = checkedQueueable.length > 0 && notYetQueued.length === 0
+              const canDelete = notYetQueued.length > 0 && (!needsAck || ackGiven)
+              const deleteLabel = allCheckedAlreadyQueued
                 ? 'Queued for deletion'
                 : checkedQueueable.length > 0
                   ? `Delete non-keepers (${checkedQueueable.length})`
@@ -342,6 +445,10 @@ export function Duplicates({ api, onQueue }: { api: DuplicatesApi; onQueue: (act
                     {/* A title comes straight from Jellyfin metadata — a text node only. */}
                     <h3>{group.members[0]?.name ?? group.id}</h3>
                   </header>
+
+                  {matchedByText ? (
+                    <p className="dupe-matched-by">{matchedByText}</p>
+                  ) : null}
 
                   {crossLibrary ? (
                     <p className="alert alert-warn" role="status">
@@ -454,7 +561,7 @@ export function Duplicates({ api, onQueue }: { api: DuplicatesApi; onQueue: (act
                   {needsAck ? (
                     <label className="dupe-tier-ack">
                       <input type="checkbox" checked={ackGiven} onChange={() => toggleTierAck(group.id)} />
-                      {tierAckLabel(group.tier)}
+                      {tierAckLabel(group.tier, matchedBy)}
                     </label>
                   ) : null}
 
@@ -478,7 +585,7 @@ export function Duplicates({ api, onQueue }: { api: DuplicatesApi; onQueue: (act
                         className="btn btn-danger"
                         disabled={!canDelete}
                         aria-describedby={deleteNoteId}
-                        onClick={() => handleDeleteNonKeepers(group, checkedQueueable, unqueueableCount, selectionKey)}
+                        onClick={() => handleDeleteNonKeepers(group, notYetQueued, unqueueableCount)}
                       >
                         {deleteLabel}
                       </button>
