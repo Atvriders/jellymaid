@@ -3,11 +3,22 @@ import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { App } from '../src/App.js'
 import { ApiError } from '../src/api.js'
+import type { Finding, PlanView } from '../src/api.js'
 
+// Dashboard is the default landing screen, so every test below that reaches the shell needs at
+// least enough of the api for IT to render without throwing (health/findingsSummary/scanStatus are
+// all called unconditionally on mount — see src/screens/Dashboard.tsx). `findingsSummary` reports
+// `evaluated: false` so Dashboard's own render stays a one-line empty state instead of pulling in
+// the class-tile logic these tests have no reason to exercise.
 const api = (over: Record<string, unknown> = {}) => ({
   me: vi.fn(async () => { throw new ApiError(401, 'not authenticated') }),
   logout: vi.fn(async () => ({ ok: true as const })),
   login: vi.fn(async () => ({ username: 'bob' })),
+  health: vi.fn(async () => ({ status: 'ok' as const, schemaVersion: 1, connectors: {} })),
+  findingsSummary: vi.fn(async () => ({
+    evaluated: false, basedOn: null, latestAttempt: null, byClass: {}, reclaimableBytes: 0, notEvaluated: [],
+  })),
+  scanStatus: vi.fn(async () => ({ running: false, scanId: null, phase: null, done: 0, total: null, lastScan: null })),
   ...over,
 } as never)
 
@@ -43,5 +54,137 @@ describe('App', () => {
     render(<App api={api({ me: vi.fn(async () => ({ username: '<img src=x onerror=alert(1)>', userId: 'u1' })) })} />)
     expect(await screen.findByText('<img src=x onerror=alert(1)>')).toBeInTheDocument()
     expect(document.querySelector('img')).toBeNull()
+  })
+
+  // --- Task 6 shell wiring -------------------------------------------------------------------
+  // Dashboard, Findings, Duplicates and Explorer were built (and fully tested in isolation) in
+  // Tasks 3-5, but nothing before this task ever imported them into App — every nav tab rendered
+  // the same "not wired up yet" placeholder no matter which one was clicked. The tests below prove
+  // the wiring, not just the screens: clicking a tab must reach the REAL component, and the queue
+  // those screens feed must survive being lifted up into App and handed back down to Plan.
+
+  const planStub = (over: Partial<PlanView> = {}): PlanView => ({
+    id: 'p1', status: 'draft', createdBy: 'bob', createdAt: 'T', approvedBy: null,
+    dryRun: { deleteCount: 1, bytesFreed: 0, torrentsRemoved: 0, blockedCount: 0 },
+    actions: [{
+      id: 'a1', seq: 0, type: 'delete-media', status: 'pending',
+      payload: { type: 'delete-media', targetPath: '/mnt/m/Orphan.mkv' }, guardVerdicts: [], error: null, isAlternateVersion: null,
+    }],
+    ...over,
+  })
+
+  /** Every method any of the seven screens could call, once, so a test that walks the whole nav
+   * bar never hits an undefined function. Individual tests override only what they need.
+   * `approvePlan`/`executePlan` transition status the same way the real routes do (draft ->
+   * approved -> completed), rather than echoing back a fixed 'draft' plan forever — a test that
+   * clicks Approve then Execute needs the mock to actually move for the Execute button to ever
+   * appear, the same as it would need the real server to. */
+  const fullApi = (over: Record<string, unknown> = {}) => api({
+    findings: vi.fn(async () => ({ findings: [], total: 0 })),
+    dismissFinding: vi.fn(async () => ({ ok: true as const })),
+    duplicates: vi.fn(async () => ({ groups: [] })),
+    mergeGroup: vi.fn(async () => ({ merged: [] })),
+    explorer: vi.fn(async () => ({ path: '', parent: null, entries: [] })),
+    createPlan: vi.fn(async () => planStub()),
+    getPlan: vi.fn(async () => planStub({ status: 'approved' })),
+    approvePlan: vi.fn(async () => planStub({ status: 'approved' })),
+    executePlan: vi.fn(async () => ({ planId: 'p1', status: 'completed' as const, done: 1, failed: 0, skipped: 0, blocked: 0, bytesFreed: 1_048_576 })),
+    resumePlan: vi.fn(async () => ({ planId: 'p1', status: 'completed' as const, done: 1, failed: 0, skipped: 0, blocked: 0, bytesFreed: 0 })),
+    plans: vi.fn(async () => ({ plans: [] })),
+    audit: vi.fn(async () => ({ entries: [] })),
+    restoreTrash: vi.fn(async () => ({ restored: true })),
+    trash: vi.fn(async () => ({ entries: [] })),
+    pathmapGet: vi.fn(async () => ({ mappings: [] })),
+    pathmapPut: vi.fn(async (mappings: unknown[]) => ({ mappings })),
+    pathmapVerify: vi.fn(async () => ({ sampled: 0, resolved: 0, failures: [] })),
+    pathmapDetect: vi.fn(async () => ({ proposed: [] })),
+    me: vi.fn(async () => ({ username: 'bob', userId: 'u1' })),
+    ...over,
+  })
+
+  it('renders the real screen for every nav item, never the placeholder', async () => {
+    render(<App api={fullApi()} />)
+    await screen.findByRole('button', { name: /sign out/i })
+
+    // Dashboard is already active — its own panel heading, not a placeholder.
+    expect(await screen.findByText('Connectors')).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: /^findings$/i }))
+    expect(await screen.findByLabelText(/class/i)).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: /^duplicates$/i }))
+    expect(await screen.findByText(/no duplicate groups found/i)).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: /^explorer$/i }))
+    expect(await screen.findByText(/nothing here/i)).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: /^plan$/i }))
+    expect(await screen.findByText(/nothing queued/i)).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: /^history$/i }))
+    expect(await screen.findByText('Audit trail')).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: /^settings$/i }))
+    expect(await screen.findByText('Path mappings')).toBeInTheDocument()
+
+    // Never once, across any tab, the Task-1-era stand-in this task was asked to delete.
+    expect(document.querySelector('.screen-placeholder')).toBeNull()
+    expect(screen.queryByText(/not wired up yet/i)).not.toBeInTheDocument()
+  })
+
+  it('keeps a queue built on Findings intact after navigating away and back to Plan', async () => {
+    const orphan: Finding = {
+      id: 'f1', ruleId: 'fs.orphan-media', class: 'filesystem', severity: 'warning', confidence: 'strong',
+      subjects: [{ kind: 'path', path: '/mnt/m/Orphan.mkv', label: 'Orphan.mkv' }],
+      evidence: {}, reclaimableBytes: 1_000, status: 'open', firstSeen: 'T', lastSeen: 'T',
+      dismissedReason: null, dismissedBy: null,
+    }
+    const createPlan = vi.fn(async () => planStub())
+    render(<App api={fullApi({
+      findings: vi.fn(async () => ({ findings: [orphan], total: 1 })),
+      createPlan,
+      // What a real audit log would hold once this exact plan executed — the last leg of the DoD
+      // flow ("… approve → execute → see it in history") that this test walks end to end.
+      audit: vi.fn(async () => ({
+        entries: [{
+          ts: 'T', actor: 'bob', actionType: 'delete-media', subject: '/mnt/m/Orphan.mkv',
+          outcome: 'done', planId: 'p1', afterJson: JSON.stringify({ bytesFreed: 1_048_576 }),
+        }],
+      })),
+    })} />)
+    await screen.findByRole('button', { name: /sign out/i })
+
+    await userEvent.click(screen.getByRole('button', { name: /^findings$/i }))
+    await userEvent.click(await screen.findByRole('checkbox', { name: /select finding/i }))
+    await userEvent.click(screen.getByRole('button', { name: /add to plan/i }))
+
+    // Visit two OTHER screens — each mount/unmount is exactly the moment a queue held inside a
+    // screen component instead of the App shell would have been lost — before ever opening Plan.
+    await userEvent.click(screen.getByRole('button', { name: /^dashboard$/i }))
+    await screen.findByText('Connectors')
+    await userEvent.click(screen.getByRole('button', { name: /^duplicates$/i }))
+    await screen.findByText(/no duplicate groups found/i)
+
+    await userEvent.click(screen.getByRole('button', { name: /^plan$/i }))
+    expect(screen.queryByText(/nothing queued/i)).not.toBeInTheDocument()
+    expect(await screen.findByText(/1 action queued/i)).toBeInTheDocument()
+
+    await userEvent.click(await screen.findByRole('button', { name: /build plan/i }))
+    expect(createPlan).toHaveBeenCalledWith([{ type: 'delete-media', targetPath: '/mnt/m/Orphan.mkv' }])
+
+    // The rest of the funnel this task exists to gate: approval is still a separate, deliberate
+    // click from building the plan, and execute is a separate click again from approving it — at
+    // no point does building or approving a plan silently run it.
+    expect(screen.queryByRole('button', { name: /^execute/i })).not.toBeInTheDocument()
+    await userEvent.click(await screen.findByRole('button', { name: /^approve/i }))
+    await userEvent.click(await screen.findByRole('button', { name: /^execute/i }))
+    expect(await screen.findByText(/1 done/i)).toBeInTheDocument()
+
+    // "… see it in history": the final leg of the DoD flow. The audit row is server state (this
+    // test's mock stands in for it), not something the click above pushes into History directly —
+    // this proves History reads from the same `api.audit()` contract, not a screen-local copy.
+    await userEvent.click(screen.getByRole('button', { name: /^history$/i }))
+    expect(await screen.findByText('/mnt/m/Orphan.mkv')).toBeInTheDocument()
+    expect(screen.getByText('done')).toBeInTheDocument()
   })
 })

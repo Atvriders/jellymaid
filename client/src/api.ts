@@ -144,6 +144,28 @@ export interface VerifyReport {
   failures: Array<{ jellyfinPath: string; reason: string }>
 }
 
+export interface TrashEntry {
+  id: string
+  originalPath: string
+  sizeBytes: number
+  deletedAt: string
+  purgeAfter: string
+  /** null means still restorable; a restored entry stays listed rather than disappearing. */
+  restoredAt: string | null
+  planId: string | null
+}
+
+/** Read-only — see GET /api/config/thresholds. There is no PUT: these numbers come from the
+ * config file, not from a Jellymaid API call, so Settings can only ever display them. */
+export interface Thresholds {
+  minRatio: number
+  minSeedTimeDays: number
+  protectedCategories: string[]
+  protectedTags: string[]
+  trashMaxBytes: number
+  trashRetentionDays: number
+}
+
 export interface DupeMember {
   id: string
   name: string
@@ -288,6 +310,9 @@ export function createApi(opts: { baseUrl: string; fetchImpl?: typeof fetch }) {
       call<{ mappings: PathMapping[] }>('/api/pathmap', { method: 'PUT', body: JSON.stringify({ mappings }) }),
     pathmapVerify: () => post<VerifyReport>('/api/pathmap/verify'),
     pathmapDetect: (mountRoots: string[]) => post<{ proposed: PathMapping[] }>('/api/pathmap/detect', { mountRoots }),
+
+    trash: () => call<{ entries: TrashEntry[] }>('/api/trash'),
+    configThresholds: () => call<Thresholds>('/api/config/thresholds'),
 
     // Task 5 wires the server side of this (src/api/explorer.ts is not registered yet); the
     // wrapper is built now so no later screen ever hand-rolls the fetch, per this task's own

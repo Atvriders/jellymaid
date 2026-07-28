@@ -298,3 +298,53 @@ describe('POST /api/trash/:id/restore', () => {
     expect(res.json().restored).toBe(false)
   })
 })
+
+describe('GET /api/trash', () => {
+  it('requires a session', async () => {
+    expect((await build().inject({ method: 'GET', url: '/api/trash' })).statusCode).toBe(401)
+  })
+
+  it('lists trash entries newest first, including ones already restored', async () => {
+    const pathMap = createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }])
+    const trashed = moveToTrash({ db, config: fileConfigSchema.parse({}), pathMap }, { path: media, planId: 'p1', sizeBytes: 1 })
+    if (!trashed.trashed) throw new Error(`test setup failed: ${JSON.stringify(trashed)}`)
+    const id = (db.prepare('SELECT id FROM trash').get() as { id: string }).id
+
+    const res = await build().inject({ method: 'GET', url: '/api/trash', headers: auth() })
+    expect(res.statusCode).toBe(200)
+    const entry = res.json().entries[0]
+    expect(entry.id).toBe(id)
+    expect(entry.originalPath).toBe(media)
+    expect(entry.sizeBytes).toBe(1)
+    expect(entry.planId).toBe('p1')
+    // Not yet restored — restoredAt must read as genuinely unknown, not coerced to some sentinel.
+    expect(entry.restoredAt).toBeNull()
+
+    await build().inject({ method: 'POST', url: `/api/trash/${id}/restore`, headers: auth() })
+    const afterRestore = (await build().inject({ method: 'GET', url: '/api/trash', headers: auth() })).json().entries[0]
+    // Still listed — a restored entry is not erased from the record, only no longer restorable.
+    expect(afterRestore.id).toBe(id)
+    expect(afterRestore.restoredAt).not.toBeNull()
+  })
+})
+
+describe('GET /api/config/thresholds', () => {
+  it('requires a session', async () => {
+    expect((await build().inject({ method: 'GET', url: '/api/config/thresholds' })).statusCode).toBe(401)
+  })
+
+  it('reports the guard and trash thresholds actually in force, never a value that could edit them', async () => {
+    const res = await build().inject({ method: 'GET', url: '/api/config/thresholds', headers: auth() })
+    expect(res.statusCode).toBe(200)
+    const body = res.json()
+    const parsed = fileConfigSchema.parse({})
+    expect(body).toEqual({
+      minRatio: parsed.guards.minRatio,
+      minSeedTimeDays: parsed.guards.minSeedTimeDays,
+      protectedCategories: parsed.guards.protectedCategories,
+      protectedTags: parsed.guards.protectedTags,
+      trashMaxBytes: parsed.trash.maxBytes,
+      trashRetentionDays: parsed.trash.retentionDays,
+    })
+  })
+})

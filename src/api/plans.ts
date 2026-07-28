@@ -246,4 +246,40 @@ export function registerPlanRoutes(app: FastifyInstance, deps: PlanRoutesDeps): 
     const result = restoreFromTrash(deps.trashDeps(), (req.params as { id: string }).id)
     return result.restored ? reply.send(result) : reply.code(409).send(result)
   })
+
+  /**
+   * History (Plan 5, Task 6) needs somewhere to read the trash back from: `restoreFromTrash` only
+   * ever takes an id it is handed, and until now nothing handed the operator one. Every row,
+   * restored or not — a restored entry's Restore button is not offered a second time (the same
+   * `restored_at IS NULL` replay guard `restoreFromTrash` itself enforces), but hiding it entirely
+   * would erase the one record that a file was ever moved there and later put back.
+   */
+  app.get('/api/trash', guard, async (_req, reply) => {
+    const entries = deps.db.prepare(
+      `SELECT id, original_path AS originalPath, size_bytes AS sizeBytes, deleted_at AS deletedAt,
+              purge_after AS purgeAfter, restored_at AS restoredAt, plan_id AS planId
+       FROM trash ORDER BY deleted_at DESC LIMIT 200`,
+    ).all()
+    return reply.send({ entries })
+  })
+
+  /**
+   * Read-only, and deliberately narrow: only the numbers Settings needs to explain WHY a guard
+   * fired (min ratio / seed days, the protected category and tag lists) or why a delete went to
+   * the trash instead of being unlinked outright (the trash size ceiling and retention window).
+   * Nothing here can be written back through this route — editing these values is a config-file
+   * change, not a Jellymaid API call — so there is no risk of this becoming a second, competing
+   * way to set what `evaluateGuards`/`moveToTrash` actually enforce.
+   */
+  app.get('/api/config/thresholds', guard, async (_req, reply) => {
+    const { guards, trash } = deps.plannerDeps().config
+    return reply.send({
+      minRatio: guards.minRatio,
+      minSeedTimeDays: guards.minSeedTimeDays,
+      protectedCategories: guards.protectedCategories,
+      protectedTags: guards.protectedTags,
+      trashMaxBytes: trash.maxBytes,
+      trashRetentionDays: trash.retentionDays,
+    })
+  })
 }

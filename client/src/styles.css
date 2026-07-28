@@ -966,6 +966,177 @@ button {
   margin-top: 1rem;
 }
 
+/* An alert that confirms rather than blocks or cautions — e.g. "mappings saved" — reuses the same
+   reject-slip shape as .alert/.alert-warn but in the positive tint, same family as
+   .dupe-queued-note's receipt. */
+.alert-ok {
+  background: var(--ok-tint);
+  border-color: var(--ok-line);
+  border-left-color: var(--ok);
+  color: var(--ok);
+}
+
+/* ---------- Plan ----------
+   The approval gate: a queued list becomes a plan, a plan's guard verdicts and dry run are read
+   BEFORE approval is even offered, and execution's outcome is reported in the same breath as the
+   summary that preceded it, never as a separate silent success. */
+
+.plan-queue-list {
+  list-style: none;
+  margin: 0 0 1rem;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.plan-queue-actions,
+.plan-actions-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.plan-caution {
+  font-size: 13px;
+  color: var(--ink-muted);
+  background: var(--panel-alt);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.75em 0.9em;
+  margin: 0 0 0.9em;
+}
+
+.plan-note {
+  font-size: 13.5px;
+  color: var(--ink);
+  margin: 0 0 1.1em;
+}
+
+.plan-dry-run {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: 0.75rem;
+  margin: 0 0 1.1em;
+}
+
+.plan-dry-run > div {
+  background: var(--panel-alt);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.6em 0.75em;
+}
+
+.plan-dry-run dt {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-muted);
+  margin: 0 0 0.2em;
+}
+
+.plan-dry-run dd {
+  margin: 0;
+  font-size: 15px;
+}
+
+.plan-execution-summary {
+  margin: 1rem 0 0;
+  font-size: 13.5px;
+}
+
+.plan-actions-table .guards {
+  margin: 0;
+}
+
+/* ---------- Settings ---------- */
+
+.settings-mapping-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin: 1rem 0;
+}
+
+.settings-mappings-table input,
+.settings-mappings-table select {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  padding: 0.4em 0.5em;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--panel);
+  color: var(--ink);
+  width: 100%;
+  min-width: 10rem;
+}
+
+.settings-verify-failures {
+  margin: 0.5em 0 0;
+  padding-left: 1.1em;
+  font-size: 13px;
+}
+
+.settings-proposed-table caption {
+  caption-side: top;
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-muted);
+  padding: 0 0 0.5em;
+}
+
+.settings-thresholds-note {
+  font-size: 13px;
+  color: var(--ink-muted);
+}
+
+.settings-thresholds {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: 0.75rem;
+}
+
+.settings-thresholds > div {
+  background: var(--panel-alt);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.6em 0.75em;
+}
+
+.settings-thresholds dt {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-muted);
+  margin: 0 0 0.2em;
+}
+
+.settings-thresholds dd {
+  margin: 0;
+  font-size: 13.5px;
+}
+
+/* ---------- History ---------- */
+
+.history-section {
+  margin-bottom: 1.5rem;
+}
+
+/* A restore refusal (a replayed restore, a purged file, a path already occupied) reported right
+   under the row it happened to, in the same voice as .guard-reason — informational, not a fresh
+   alert banner on top of a table that is already the record of what happened. */
+.history-restore-note {
+  margin: 0.35em 0 0;
+  font-size: 12.5px;
+  color: var(--ink-muted);
+}
+
 /* ---------- Misc ---------- */
 
 .empty {

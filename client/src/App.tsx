@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { Api } from './api.js'
+import type { Api, RequestedAction } from './api.js'
 import { Login } from './screens/Login.js'
+import { Dashboard } from './screens/Dashboard.js'
+import { Findings } from './screens/Findings.js'
+import { Duplicates } from './screens/Duplicates.js'
+import { Explorer } from './screens/Explorer.js'
+import { PlanScreen } from './screens/PlanScreen.js'
+import { History } from './screens/History.js'
+import { Settings } from './screens/Settings.js'
 
 const NAV_ITEMS = ['Dashboard', 'Findings', 'Duplicates', 'Explorer', 'Plan', 'History', 'Settings'] as const
 type NavItem = (typeof NAV_ITEMS)[number]
@@ -18,6 +25,25 @@ type AuthState =
 export function App({ api }: { api: Api }) {
   const [auth, setAuth] = useState<AuthState>({ kind: 'checking' })
   const [screen, setScreen] = useState<NavItem>('Dashboard')
+
+  /**
+   * The queue Findings, Duplicates and Explorer all feed and the Plan screen builds from — lifted
+   * here, one level above every screen that touches it, for exactly one reason: switching nav tabs
+   * mounts and unmounts the screen components (see the single-branch render below), and a queue
+   * held in any one of THEM would silently evaporate the moment the operator looked at another
+   * screen before visiting Plan. A queue that empties itself on navigation would make the whole
+   * queue-then-plan discipline this app is built on untrustworthy, so the one piece of state that
+   * must outlive every screen switch lives in the component that itself never unmounts.
+   *
+   * `addToQueue` APPENDS rather than replaces: an operator building one plan out of a duplicate
+   * queued on the Duplicates screen and a stray file queued on Explorer needs both to still be
+   * there when they reach Plan, not just whichever screen queued something most recently.
+   */
+  const [queued, setQueued] = useState<RequestedAction[]>([])
+  const addToQueue = useCallback((actions: RequestedAction[]) => {
+    setQueued((prev) => [...prev, ...actions])
+  }, [])
+  const clearQueue = useCallback(() => setQueued([]), [])
 
   const checkSession = useCallback(() => {
     setAuth({ kind: 'checking' })
@@ -74,22 +100,17 @@ export function App({ api }: { api: Api }) {
         </div>
       </header>
       <main className="main">
-        <ScreenPlaceholder name={screen} />
+        {/* Exactly one branch renders at a time — switching tabs unmounts the previous screen
+            rather than merely hiding it, which is why `queued` above cannot live inside any of
+            these components. */}
+        {screen === 'Dashboard' ? <Dashboard api={api} /> : null}
+        {screen === 'Findings' ? <Findings api={api} onQueue={addToQueue} /> : null}
+        {screen === 'Duplicates' ? <Duplicates api={api} onQueue={addToQueue} /> : null}
+        {screen === 'Explorer' ? <Explorer api={api} onQueue={addToQueue} /> : null}
+        {screen === 'Plan' ? <PlanScreen api={api} queued={queued} onClear={clearQueue} /> : null}
+        {screen === 'History' ? <History api={api} onQueue={addToQueue} /> : null}
+        {screen === 'Settings' ? <Settings api={api} /> : null}
       </main>
-    </div>
-  )
-}
-
-/**
- * Dashboard, Findings, Duplicates, Explorer, Plan, History and Settings are built in later tasks
- * of this same plan (Tasks 3-6). This keeps the shell honest about what is wired up rather than
- * hiding the gap, instead of a screen that looks finished but does nothing.
- */
-function ScreenPlaceholder({ name }: { name: NavItem }) {
-  return (
-    <div className="screen-placeholder">
-      <h2>{name}</h2>
-      <p className="empty">This screen is not wired up yet.</p>
     </div>
   )
 }
