@@ -104,12 +104,17 @@ const mixedContent: Rule = {
   },
 }
 
-const MOVIE_FOLDER = /\((?:19|20)\d{2}\)\/[^/]+$/
-const EPISODE_TOKEN = /s\d{1,2}[ ._-]?e\d{1,3}/i
-
 const badNaming: Rule = {
   id: 'meta.bad-naming', class: 'metadata', requires: ['jellyfin'],
   run(ctx) {
+    const cfg = ctx.config.rules['meta.bad-naming']
+    if (!cfg.enabled) return []
+    // Compiled per pass from config, not module-level constants: the expected naming scheme is a
+    // house style, not a fact about media (see the schema entry). A pattern that does not compile
+    // throws here and the runner records the rule not-evaluated with the RegExp error — visible,
+    // rather than a silently disabled check or a scan-wide crash.
+    const MOVIE_FOLDER = new RegExp(cfg.moviePattern)
+    const EPISODE_TOKEN = new RegExp(cfg.episodePattern, 'i')
     const out: Finding[] = []
     for (const r of ctx.db.prepare(ALL).all() as Row[]) {
       if (!r.jf_path) continue

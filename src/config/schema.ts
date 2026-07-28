@@ -72,13 +72,26 @@ export const fileConfigSchema = z.object({
       enabled: z.boolean().default(true),
       floorsKbpsByHeight: z.record(z.string(), z.number()).default({ '480': 1000, '720': 2500, '1080': 5000, '2160': 15000 }),
     }).default({}),
-    'quality.tiny-file': z.object({ enabled: z.boolean().default(true), peerRatio: z.number().min(0).max(1).default(0.4) }).default({}),
+    // `minPeers` is the size a same-resolution cohort must reach before its median is treated as
+    // meaningful enough to call one member "tiny". Two files are not a distribution.
+    'quality.tiny-file': z.object({
+      enabled: z.boolean().default(true),
+      peerRatio: z.number().min(0).max(1).default(0.4),
+      minPeers: z.number().int().min(2).default(3),
+    }).default({}),
     'quality.transcode-risk': z.object({
       enabled: z.boolean().default(true),
       allowedVideoCodecs: z.array(z.string()).default(['h264', 'hevc', 'av1']),
       allowedContainers: z.array(z.string()).default(['mkv', 'mp4']),
     }).default({}),
     'quality.biggest': z.object({ enabled: z.boolean().default(true), topN: z.number().int().min(1).default(50) }).default({}),
+    // Which sidecar extensions count as "this file has external subtitles". An operator whose
+    // library uses .vtt, or who burns subtitles in and does not want the rule at all, had no way
+    // to say so while the list and the rule's very existence were compiled in.
+    'quality.missing-subs': z.object({
+      enabled: z.boolean().default(true),
+      extensions: z.array(z.string()).default(['.srt', '.ass', '.sub']),
+    }).default({}),
     // Case-insensitive regex SOURCES (compiled by the rule, not stored compiled): a hardcoded
     // `/sample/i` flags a real title like "Sample City" for every operator, with no way to turn
     // it off. `zeroByteIsJunk` is its own flag because a 0-byte file mid-write from a slow network
@@ -92,6 +105,17 @@ export const fileConfigSchema = z.object({
     }).default({}),
     'fs.stray-sidecar': z.object({
       extensions: z.array(z.string()).default(['.srt', '.sub', '.idx', '.ass', '.nfo', '.jpg', '.png']),
+    }).default({}),
+    // Regex SOURCES for "does this path follow the expected naming scheme", compiled by the rule.
+    // Hardcoded, these encoded one house style — the Jellyfin-recommended `Title (Year)/` movie
+    // folder and an `S01E01` episode token — and flagged every library organized any other way,
+    // every scan, with no way to correct or silence them. `moviePattern` is matched
+    // case-sensitively (it only concerns digits and brackets) and `episodePattern`
+    // case-insensitively, preserving each expression's original behaviour exactly.
+    'meta.bad-naming': z.object({
+      enabled: z.boolean().default(true),
+      moviePattern: z.string().default('\\((?:19|20)\\d{2}\\)/[^/]+$'),
+      episodePattern: z.string().default('s\\d{1,2}[ ._-]?e\\d{1,3}'),
     }).default({}),
   }).default({}),
 })

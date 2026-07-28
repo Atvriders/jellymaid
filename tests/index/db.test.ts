@@ -167,6 +167,15 @@ describe('migrations', () => {
     const tables = upgraded.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()
       .map((t) => (t as { name: string }).name)
     expect(tables).toContain('jellyfin_item_paths')
+    // 004 likewise: an item row written before the quality-signal columns existed must read back
+    // with video_range NULL — an absent signal, which the keeper score must not fill in with a
+    // guess — rather than the migration failing or defaulting it to something assertable.
+    const itemCols = (upgraded.prepare('PRAGMA table_info(jellyfin_items)').all() as Array<{ name: string }>)
+      .map((c) => c.name)
+    expect(itemCols).toEqual(expect.arrayContaining(['video_range', 'has_subtitles']))
+    upgraded.prepare("INSERT INTO jellyfin_items (id, scan_id, type, name) VALUES ('i','1','Movie','M')").run()
+    expect(upgraded.prepare("SELECT video_range, has_subtitles FROM jellyfin_items WHERE id='i'").get())
+      .toEqual({ video_range: null, has_subtitles: 0 })
     upgraded.close()
 
     // And reopening applies nothing further — no version bump, no second ALTER TABLE (which

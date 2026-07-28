@@ -67,7 +67,7 @@ const tinyFile: Rule = {
     }
     const out: Finding[] = []
     for (const peers of byHeight.values()) {
-      if (peers.length < 3) continue
+      if (peers.length < cfg.minPeers) continue
       const sizes = peers.map((p) => p.size_bytes!).sort((a, b) => a - b)
       const median = sizes[Math.floor(sizes.length / 2)]!
       for (const r of peers) {
@@ -125,6 +125,15 @@ const transcodeRisk: Rule = {
 const missingSubs: Rule = {
   id: 'quality.missing-subs', class: 'quality', requires: ['jellyfin', 'filesystem'],
   run(ctx) {
+    const cfg = ctx.config.rules['quality.missing-subs']
+    if (!cfg.enabled) return []
+    // Bound placeholders, not an interpolated list: these come from operator-supplied config.
+    // An empty list would make `lower(f.ext) IN ()` a syntax error, and semantically there is no
+    // extension that could satisfy the check, so every item would be flagged — configure the rule
+    // off instead of configuring it to match nothing.
+    const extensions = cfg.extensions.map((e) => e.toLowerCase())
+    if (!extensions.length) return []
+    const placeholders = extensions.map(() => '?').join(',')
     const rows = ctx.db.prepare(`SELECT i.id AS id, i.type AS type, i.name AS name,
       i.container_path AS container_path, i.height AS height, i.bitrate AS bitrate,
       i.container AS container, i.video_codec AS video_codec, i.audio_codec AS audio_codec,
@@ -135,9 +144,11 @@ const missingSubs: Rule = {
         AND NOT EXISTS (
           SELECT 1 FROM fs_entries f
           WHERE f.parent_path = mine.parent_path
-            AND lower(f.ext) IN ('.srt', '.ass', '.sub')
-        )`).all() as Row[]
-    return rows.map((r) => itemFinding(ctx, 'quality.missing-subs', r, { hasExternalSubtitles: false }))
+            AND lower(f.ext) IN (${placeholders})
+        )`).all(...extensions) as Row[]
+    return rows.map((r) => itemFinding(ctx, 'quality.missing-subs', r, {
+      hasExternalSubtitles: false, extensions,
+    }))
   },
 }
 

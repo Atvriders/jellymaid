@@ -22,6 +22,7 @@ function ctx(
   let saved = cursor
   return {
     db, scanId: 1, cursor: saved, signal: over.signal ?? new AbortController().signal,
+    priorResults: {},
     saveCursor: over.saveCursor ?? ((c) => { saved = c }),
     progress: over.progress ?? (() => {}),
     deps: {
@@ -71,6 +72,38 @@ describe('jellyfinPhase', () => {
     await jellyfinPhase.run(c)
     const row = db.prepare('SELECT container_path FROM jellyfin_items').get() as { container_path: string }
     expect(row.container_path).toBe('/mnt/m/M0.mkv')
+  })
+
+  it('stores the reported video range and subtitle presence, and NULL rather than a guess when the range is absent', async () => {
+    const jf = {
+      virtualFolders: async () => [],
+      items: async () => ({
+        totalRecordCount: 2,
+        items: [
+          {
+            id: 'hdr', type: 'Movie', name: 'H', sortName: null, year: 2000, seriesId: null, seriesName: null,
+            seasonNo: null, episodeNo: null, providerIds: {}, jfPath: '/media/Movies/H.mkv',
+            mediaSourcePaths: [], sizeBytes: 1, runtimeTicks: 1, container: 'mkv', videoCodec: 'hevc',
+            audioCodec: 'aac', audioChannels: 2, width: 3840, height: 2160, bitrate: 1,
+            videoRange: 'HDR10', hasSubtitles: true, hasPrimaryImage: true, dateCreated: null, mediaSourceId: 'm',
+          },
+          {
+            id: 'unknown', type: 'Movie', name: 'U', sortName: null, year: 2000, seriesId: null, seriesName: null,
+            seasonNo: null, episodeNo: null, providerIds: {}, jfPath: '/media/Movies/U.mkv',
+            mediaSourcePaths: [], sizeBytes: 1, runtimeTicks: 1, container: 'mkv', videoCodec: 'hevc',
+            audioCodec: 'aac', audioChannels: 2, width: 3840, height: 2160, bitrate: 1,
+            videoRange: null, hasSubtitles: false, hasPrimaryImage: true, dateCreated: null, mediaSourceId: 'm',
+          },
+        ],
+      }),
+    }
+    await jellyfinPhase.run(ctx({ jellyfin: jf as never }))
+    const rows = db.prepare('SELECT id, video_range, has_subtitles FROM jellyfin_items ORDER BY id').all() as
+      Array<{ id: string; video_range: string | null; has_subtitles: number }>
+    expect(rows).toEqual([
+      { id: 'hdr', video_range: 'HDR10', has_subtitles: 1 },
+      { id: 'unknown', video_range: null, has_subtitles: 0 },
+    ])
   })
 
   it('skips with a reason when jellyfin is unreachable, and writes no rows', async () => {

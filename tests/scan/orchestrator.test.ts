@@ -90,6 +90,43 @@ describe('runScan', () => {
     expect(second.status).toBe('completed')
   })
 
+  it('hands each phase every earlier phase\'s own verdict, skips included', async () => {
+    let seen: Record<string, unknown> = {}
+    const phases = [
+      fakePhase('jellyfin', async () => ({ status: 'skipped', reason: 'unreachable: down', counts: {} })),
+      fakePhase('filesystem', async () => ({ status: 'completed', counts: { entries: 3 } })),
+      fakePhase('rules', async (c) => { seen = { ...c.priorResults }; return { status: 'completed', counts: {} } }),
+    ]
+    await runScan({ db, deps: deps() as never, signal: new AbortController().signal, phases })
+    expect(seen).toMatchObject({
+      jellyfin: { status: 'skipped', reason: 'unreachable: down' },
+      filesystem: { status: 'completed' },
+    })
+  })
+
+  it('restores prior phase results across a resume, so the rules phase does not read an interrupted scan as "no phase reported anything"', async () => {
+    const controller = new AbortController()
+    const first = await runScan({
+      db, deps: deps() as never, signal: controller.signal,
+      phases: [
+        fakePhase('jellyfin', async () => ({ status: 'skipped', reason: 'unreachable: down', counts: {} })),
+        fakePhase('filesystem', async () => { controller.abort(); return { status: 'cancelled', counts: {} } }),
+      ],
+    })
+
+    let seen: Record<string, unknown> = {}
+    await runScan({
+      db, deps: deps() as never, signal: new AbortController().signal, scanId: first.scanId,
+      phases: [
+        fakePhase('jellyfin', async () => ({ status: 'completed', counts: {} })),
+        fakePhase('filesystem', async () => ({ status: 'completed', counts: {} })),
+        fakePhase('rules', async (c) => { seen = { ...c.priorResults }; return { status: 'completed', counts: {} } }),
+      ],
+    })
+    // jellyfin ran only in the first attempt and skipped there; the resume must still see that.
+    expect(seen).toMatchObject({ jellyfin: { status: 'skipped' }, filesystem: { status: 'completed' } })
+  })
+
   it('reports progress with the phase name', async () => {
     const seen: Array<{ phase: string; done: number }> = []
     await runScan({

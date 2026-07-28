@@ -107,6 +107,56 @@ describe('GET /api/findings/summary', () => {
   })
 })
 
+describe('GET /api/findings/summary — what the numbers are based on', () => {
+  const scan = (id: number, status: string, finishedAt: string | null = 'F') =>
+    db.prepare('INSERT INTO scans (id, started_at, finished_at, status) VALUES (?,?,?,?)').run(id, 'T', finishedAt, status)
+  const ruleRun = (scanId: number, ruleId: string, status = 'not-evaluated', reason: string | null = 'r') =>
+    db.prepare('INSERT INTO rule_runs (scan_id, rule_id, status, reason, found) VALUES (?,?,?,?,0)')
+      .run(scanId, ruleId, status, reason)
+  const summary = async () =>
+    (await build().inject({ method: 'GET', url: '/api/findings/summary', headers: auth() })).json()
+
+  it('reports the scan the findings actually came from, and surfaces a newer failed attempt that never reached the rules phase', async () => {
+    scan(41, 'completed', 'F41')
+    ruleRun(41, 'dupe.identical-file', 'not-evaluated', 'hashes disabled')
+    scan(42, 'failed', 'F42')
+
+    const body = await summary()
+    expect(body.evaluated).toBe(true)
+    expect(body.basedOn).toMatchObject({ scanId: 41, status: 'completed', finishedAt: 'F41' })
+    expect(body.latestAttempt).toMatchObject({ scanId: 42, status: 'failed' })
+    // The not-evaluated list must come from scan 41, not be empty because 42 died first.
+    expect(body.notEvaluated).toEqual([{ ruleId: 'dupe.identical-file', reason: 'hashes disabled' }])
+  })
+
+  it('says so explicitly when no scan has ever reached the rules phase, instead of an empty clean-looking summary', async () => {
+    insertFinding({ id: 'a', class: 'filesystem', reclaimable_bytes: 100 })
+    scan(1, 'failed', null)
+
+    const body = await summary()
+    expect(body.evaluated).toBe(false)
+    expect(body.basedOn).toBeNull()
+    expect(body.latestAttempt).toMatchObject({ scanId: 1, status: 'failed' })
+  })
+
+  it('reports no newer attempt when the latest scan is itself the one that ran the rules', async () => {
+    scan(9, 'completed', 'F9')
+    ruleRun(9, 'fs.junk', 'evaluated', null)
+
+    const body = await summary()
+    expect(body.basedOn).toMatchObject({ scanId: 9, status: 'completed' })
+    expect(body.latestAttempt).toBeNull()
+  })
+
+  it('reports evaluated:false and no attempt at all on a database that has never scanned', async () => {
+    const body = await summary()
+    expect(body.evaluated).toBe(false)
+    expect(body.basedOn).toBeNull()
+    expect(body.latestAttempt).toBeNull()
+    expect(body.notEvaluated).toEqual([])
+  })
+})
+
 describe('GET /api/duplicates', () => {
   it('returns groups with their members, tier and keeper', async () => {
     db.prepare(`INSERT INTO dupe_groups (id, tier, members_json, keeper_item_id, scores_json, status)

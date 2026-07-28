@@ -238,7 +238,18 @@ export function createApi(opts: { baseUrl: string; fetchImpl?: typeof fetch }) {
 
     findings: (f: { class?: string; severity?: string; confidence?: string; status?: string; ruleId?: string; limit?: number; offset?: number } = {}) =>
       call<{ findings: Finding[]; total: number }>(`/api/findings${qs(f)}`),
-    findingsSummary: () => call<{ byClass: Record<string, number>; reclaimableBytes: number; notEvaluated: Array<{ ruleId: string; reason: string }> }>('/api/findings/summary'),
+    // `evaluated`/`basedOn`/`latestAttempt` are not decoration: `byClass` and `reclaimableBytes`
+    // describe the last scan that actually reached the rules phase (`basedOn`), which is NOT
+    // necessarily the newest scan. The Dashboard must say which scan it is reporting on, and must
+    // surface `latestAttempt` when a newer scan failed before rules ran ("these results are from
+    // scan 41; scan 42 failed") — otherwise a dead scan renders as a clean pass.
+    findingsSummary: () => call<{
+      evaluated: boolean
+      basedOn: { scanId: number; status: string; finishedAt: string | null } | null
+      latestAttempt: { scanId: number; status: string } | null
+      byClass: Record<string, number>; reclaimableBytes: number
+      notEvaluated: Array<{ ruleId: string; reason: string }>
+    }>('/api/findings/summary'),
     dismissFinding: (id: string, reason: string) => post<{ ok: true }>(`/api/findings/${id}/dismiss`, { reason }),
     reopenFinding: (id: string) => post<{ ok: true }>(`/api/findings/${id}/reopen`),
 
@@ -656,7 +667,7 @@ import { Dashboard } from '../src/screens/Dashboard.js'
 const api = (over = {}) => ({
   health: async () => ({ status: 'ok', schemaVersion: 1, connectors: { jellyfin: 'ok' } }),
   scanStatus: async () => ({ running: false, scanId: null, phase: null, done: 0, total: null, lastScan: null }),
-  findingsSummary: async () => ({ byClass: { duplicate: 3, filesystem: 7 }, reclaimableBytes: 3_221_225_472, notEvaluated: [] }),
+  findingsSummary: async () => ({ evaluated: true, basedOn: { scanId: 41, status: 'completed', finishedAt: 'T' }, latestAttempt: null, byClass: { duplicate: 3, filesystem: 7 }, reclaimableBytes: 3_221_225_472, notEvaluated: [] }),
   scanStart: vi.fn(async () => ({ scanId: 1 })),
   scanCancel: vi.fn(async () => ({ cancelled: true })),
   ...over,
@@ -677,7 +688,7 @@ describe('Dashboard', () => {
 
   it('surfaces rules that were not evaluated', async () => {
     render(<Dashboard api={api({
-      findingsSummary: async () => ({ byClass: {}, reclaimableBytes: 0, notEvaluated: [{ ruleId: 'dupe.identical-file', reason: 'hashes disabled' }] }),
+      findingsSummary: async () => ({ evaluated: true, basedOn: { scanId: 41, status: 'completed', finishedAt: 'T' }, latestAttempt: null, byClass: {}, reclaimableBytes: 0, notEvaluated: [{ ruleId: 'dupe.identical-file', reason: 'hashes disabled' }] }),
     })} />)
     expect(await screen.findByText(/hashes disabled/)).toBeInTheDocument()
   })

@@ -4,6 +4,31 @@ import type { Finding, FindingClass, RuleId } from '../core/types.js'
 
 export type SourceName = 'jellyfin' | 'filesystem' | 'qbittorrent' | 'arr' | 'hashes'
 
+/**
+ * Why a source is not usable this pass, keyed by source. Only unavailable sources appear. Carried
+ * alongside the availability set (never derived from it) so the operator-facing `rule_runs.reason`
+ * can name the phase that failed and what it said, rather than the bare source name — "couldn't
+ * check" is only useful if it also says why.
+ */
+export type SourceReasons = Partial<Record<SourceName, string>>
+
+/**
+ * The one place the "which sources may a rule trust this pass" sentence is written, shared by the
+ * runner (which gates whole rules) and by `dupe.group`'s adapter (which gates individual matchers
+ * inside one rule). Sharing the function, not just the convention, is what stops those two from
+ * ever disagreeing about whether a source counts, or phrasing the same verdict two different ways.
+ */
+export function unavailableSourcesReason(
+  requires: SourceName[],
+  available: Set<SourceName>,
+  reasons?: SourceReasons,
+): string | null {
+  const missing = requires.filter((r) => !available.has(r))
+  if (!missing.length) return null
+  const described = missing.map((m) => (reasons?.[m] ? `${m} (${reasons[m]})` : m))
+  return `required sources unavailable: ${described.join(', ')}`
+}
+
 export interface RuleContext {
   /**
    * The index database. Rules are pure and read-only — the runner enforces this rather than
@@ -16,6 +41,16 @@ export interface RuleContext {
   config: FileConfig
   scanId: number
   now: string
+  /**
+   * The sources THIS scan actually observed — not what happens to be sitting in the index. A phase
+   * that skipped leaves the previous scan's rows in place (phases only sweep on a complete
+   * observation), so "the table has rows" answers a different question than "we looked this time".
+   * A rule reads this only to gate sub-units of work it runs internally; the runner has already
+   * gated the rule itself on its own `requires`.
+   */
+  availableSources: Set<SourceName>
+  /** Why each unavailable source is unavailable; see `SourceReasons`. */
+  sourceReasons?: SourceReasons
 }
 
 /**

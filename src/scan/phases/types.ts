@@ -24,6 +24,19 @@ export interface PhaseContext {
   cursor: Record<string, unknown>
   signal: AbortSignal
   deps: ScanDeps
+  /**
+   * What every phase before this one in THIS scan actually reported — including the ones that
+   * skipped. A phase that skipped is still pushed onto the orchestrator's `completed` list and
+   * later phases still run, so without this a downstream phase cannot tell "the jellyfin phase
+   * observed the library and it looks like this" from "the jellyfin phase never got an answer and
+   * what you are reading is the previous scan's snapshot". The rules phase turns exactly that
+   * distinction into per-rule `evaluated` vs `not-evaluated`, which is what keeps a stale snapshot
+   * from manufacturing orphan findings that a later plan would queue for deletion.
+   *
+   * Only phases that have already run this scan appear. A resumed scan restores it from the
+   * cursor, so results observed before the interruption are not lost.
+   */
+  priorResults: Partial<Record<PhaseName, PhaseResult>>
   saveCursor(cursor: Record<string, unknown>): void
   progress(done: number, total: number | null): void
 }

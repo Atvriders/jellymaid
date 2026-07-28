@@ -66,14 +66,46 @@ export function registerFindingsRoutes(app: FastifyInstance, deps: { db: Db; ses
       "SELECT COALESCE(SUM(reclaimable_bytes), 0) s FROM findings WHERE status = 'open'",
     ).get() as { s: number }).s
 
-    const latest = deps.db.prepare('SELECT id FROM scans ORDER BY id DESC LIMIT 1').get() as { id: number } | undefined
-    const notEvaluated = latest
+    // "The latest scan" is the wrong anchor for a not-evaluated list. A scan that failed or was
+    // cancelled before it ever reached the rules phase has no `rule_runs` rows at all, so anchoring
+    // here would return an empty `notEvaluated` — rendering identically to a clean, fully evaluated
+    // pass — while `byClass` and `reclaimableBytes` above quietly keep showing the LAST SUCCESSFUL
+    // pass's findings. The summary would then say "everything is fine" about a scan that never
+    // checked anything. Anchor instead on the latest scan that actually reached the rules phase
+    // (`EXISTS` a rule_runs row), report which scan that was, and report a newer attempt separately
+    // so a consumer can say "these results are from scan 41; scan 42 failed".
+    const basedOnRow = deps.db.prepare(
+      `SELECT s.id, s.status, s.finished_at FROM scans s
+       WHERE EXISTS (SELECT 1 FROM rule_runs r WHERE r.scan_id = s.id)
+       ORDER BY s.id DESC LIMIT 1`,
+    ).get() as { id: number; status: string; finished_at: string | null } | undefined
+
+    const latestRow = deps.db.prepare(
+      'SELECT id, status FROM scans ORDER BY id DESC LIMIT 1',
+    ).get() as { id: number; status: string } | undefined
+
+    const notEvaluated = basedOnRow
       ? (deps.db.prepare(
           "SELECT rule_id AS ruleId, reason FROM rule_runs WHERE scan_id = ? AND status = 'not-evaluated'",
-        ).all(latest.id) as Array<{ ruleId: string; reason: string }>)
+        ).all(basedOnRow.id) as Array<{ ruleId: string; reason: string }>)
       : []
 
-    return reply.send({ byClass, reclaimableBytes: reclaimable, notEvaluated })
+    return reply.send({
+      // Explicit, rather than inferred from an empty `notEvaluated`: false means no scan has ever
+      // completed a rules pass, so the counts below describe nothing at all.
+      evaluated: Boolean(basedOnRow),
+      basedOn: basedOnRow
+        ? { scanId: basedOnRow.id, status: basedOnRow.status, finishedAt: basedOnRow.finished_at }
+        : null,
+      // Only when it differs from `basedOn` — i.e. there is a newer attempt whose results are not
+      // what is being reported here.
+      latestAttempt: latestRow && latestRow.id !== basedOnRow?.id
+        ? { scanId: latestRow.id, status: latestRow.status }
+        : null,
+      byClass,
+      reclaimableBytes: reclaimable,
+      notEvaluated,
+    })
   })
 
   app.post('/api/findings/:id/dismiss', guard, async (req, reply) => {

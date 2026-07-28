@@ -6,10 +6,12 @@ import { join } from 'node:path'
 import { openDb, type Db } from '../../src/index/db.js'
 import { QUALITY_RULES } from '../../src/rules/quality/index.js'
 import { fileConfigSchema } from '../../src/config/schema.js'
+import type { SourceName } from '../../src/rules/types.js'
 import type { Subject } from '../../src/core/types.js'
 
 let db: Db
-const ctx = (config = fileConfigSchema.parse({})) => ({ db, config, scanId: 1, now: 'T' })
+const ALL_SOURCES = new Set<SourceName>(['jellyfin', 'filesystem', 'qbittorrent', 'arr', 'hashes'])
+const ctx = (config = fileConfigSchema.parse({})) => ({ db, config, scanId: 1, now: 'T', availableSources: ALL_SOURCES })
 const rule = (id: string) => QUALITY_RULES.find((r) => r.id === id)!
 // `Subject` is a discriminated union ('item' | 'path'); only the 'item' arm carries `id`. Narrow
 // explicitly rather than casting, so a rule that ever emitted a bare path subject here would fail
@@ -72,6 +74,14 @@ describe('quality.tiny-file', () => {
     item({ id: 'a', size_bytes: 100 })
     expect(rule('quality.tiny-file').run(ctx())).toHaveLength(0)
   })
+  it('honours a configured minPeers instead of a hardcoded floor of three', () => {
+    item({ id: 'a', size_bytes: 20_000_000_000 })
+    item({ id: 'b', size_bytes: 300_000_000 })
+    // Two peers: silent at the default of 3, reported once the operator lowers it to 2.
+    expect(rule('quality.tiny-file').run(ctx())).toHaveLength(0)
+    const cfg = fileConfigSchema.parse({ rules: { 'quality.tiny-file': { minPeers: 2 } } })
+    expect(rule('quality.tiny-file').run(ctx(cfg)).map((x) => itemId(x.subjects[0]!))).toEqual(['b'])
+  })
 })
 
 describe('quality.transcode-risk', () => {
@@ -106,6 +116,22 @@ describe('quality.missing-subs', () => {
     // directory, so we cannot judge whether a sidecar is missing from it.
     item({ container_path: '/mnt/m/Ghost.mkv' })
     expect(rule('quality.missing-subs').run(ctx())).toHaveLength(0)
+  })
+  it('can be turned off in config', () => {
+    item({ container_path: '/mnt/m/Heat.mkv' })
+    fsEntry({ container_path: '/mnt/m/Heat.mkv' })
+    const cfg = fileConfigSchema.parse({ rules: { 'quality.missing-subs': { enabled: false } } })
+    expect(rule('quality.missing-subs').run(ctx(cfg))).toHaveLength(0)
+  })
+  it('accepts a configured sidecar extension the default list does not cover', () => {
+    item({ container_path: '/mnt/m/Heat.mkv' })
+    fsEntry({ container_path: '/mnt/m/Heat.mkv' })
+    fsEntry({ container_path: '/mnt/m/Heat.vtt', name: 'Heat.vtt', ext: '.VTT' })
+    // .vtt is not in the default list, so by default this still reads as "no subtitles"...
+    expect(rule('quality.missing-subs').run(ctx())).toHaveLength(1)
+    // ...and matching is case-insensitive on the stored extension once configured.
+    const cfg = fileConfigSchema.parse({ rules: { 'quality.missing-subs': { extensions: ['.vtt'] } } })
+    expect(rule('quality.missing-subs').run(ctx(cfg))).toHaveLength(0)
   })
 })
 

@@ -5,10 +5,12 @@ import { join } from 'node:path'
 import { openDb, type Db } from '../../src/index/db.js'
 import { DUPE_RULES } from '../../src/rules/dupes/index.js'
 import { fileConfigSchema } from '../../src/config/schema.js'
+import type { SourceName } from '../../src/rules/types.js'
 
 let db: Db
 const config = fileConfigSchema.parse({})
-const ctx = () => ({ db, config, scanId: 1, now: 'T' })
+const ALL_SOURCES = new Set<SourceName>(['jellyfin', 'filesystem', 'qbittorrent', 'arr', 'hashes'])
+const ctx = () => ({ db, config, scanId: 1, now: 'T', availableSources: ALL_SOURCES })
 const rule = (id: string) => DUPE_RULES.find((r) => r.id === id)!
 
 function item(over: Partial<Record<string, unknown>> = {}) {

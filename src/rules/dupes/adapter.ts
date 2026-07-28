@@ -1,6 +1,7 @@
 import type { Finding, Subject } from '../../core/types.js'
 import { findingId } from '../../core/types.js'
 import type { DupeLink, DupeRule, Rule, RuleContext, SubRun } from '../types.js'
+import { unavailableSourcesReason } from '../types.js'
 import { DUPE_RULES } from './index.js'
 import { buildDupeGroups } from '../grouping.js'
 import { DEFAULT_KEEPER_WEIGHTS, pickKeeper, type MemberFacts } from '../keeper.js'
@@ -9,6 +10,23 @@ interface MemberRow {
   id: string; name: string; container_path: string | null; size_bytes: number | null
   height: number | null; bitrate: number | null; video_codec: string | null
   audio_channels: number | null; library_name: string | null
+  video_range: string | null; has_subtitles: number
+}
+
+/**
+ * HDR from the signal Jellyfin actually reported, never from the codec and resolution.
+ *
+ * NULL is "this row predates the column, or this Jellyfin does not report a range" — an absent
+ * signal, worth nothing, not a licence to guess. `Unknown` is Jellyfin's own literal spelling of
+ * the same absence and is treated identically: reading it as "not SDR, therefore HDR" would
+ * reintroduce exactly the fabricated bonus this replaced. Everything else that is not SDR is a real
+ * HDR flavour (HDR10, HDR10+, HLG, Dolby Vision, DOVI, …), so it is matched by exclusion rather
+ * than by an allow-list nobody would remember to extend.
+ */
+export function isHdrRange(videoRange: string | null): boolean {
+  if (videoRange === null) return false
+  const range = videoRange.trim().toLowerCase()
+  return range !== '' && range !== 'sdr' && range !== 'unknown'
 }
 
 /**
@@ -29,11 +47,6 @@ interface DupeGroupEvidence extends Record<string, unknown> {
   crossLibrary: boolean
 }
 
-function hasHashes(ctx: RuleContext): boolean {
-  const row = ctx.db.prepare('SELECT COUNT(*) c FROM fs_entries WHERE quick_hash IS NOT NULL').get() as { c: number }
-  return row.c > 0
-}
-
 /** The two matchers with a config `enabled` flag; every other matcher id has none. */
 function configEnabled(ctx: RuleContext, ruleId: string): boolean | null {
   switch (ruleId) {
@@ -45,17 +58,47 @@ function configEnabled(ctx: RuleContext, ruleId: string): boolean | null {
 
 /**
  * Why a matcher would contribute nothing this pass, or `null` if there's no known reason it
- * shouldn't run. Shared by `run()` (which silently skips an unavailable matcher's links) and
- * `subRuns()` (which reports the same judgement as a `rule_runs` row) so the two can never
- * disagree about which matchers actually ran.
+ * shouldn't run. Shared by `run()` (which skips an unavailable matcher's links) and `subRuns()`
+ * (which reports the same judgement as a `rule_runs` row) so the two can never disagree about
+ * which matchers actually ran.
+ *
+ * Checks the matcher's OWN `requires` against the availability the scan actually observed, via the
+ * same helper the runner uses on whole rules. An earlier version special-cased only `hashes`, with
+ * a hardcoded "hashing is disabled or has not completed" message — so a wholly failed filesystem
+ * phase (no fs_entries observation at all, hashing entirely beside the point) reported that the
+ * problem was hashing, pointing the operator at the wrong knob. Now the reason names whichever
+ * source is actually missing and why.
  */
 function unavailableReason(ctx: RuleContext, matcher: DupeRule): string | null {
-  if (matcher.requires.includes('hashes') && !hasHashes(ctx)) {
-    return 'no fs_entries row has a quick_hash yet — hashing is disabled or has not completed'
-  }
+  const missing = unavailableSourcesReason(matcher.requires, ctx.availableSources, ctx.sourceReasons)
+  if (missing) return missing
   if (configEnabled(ctx, matcher.id) === false) return 'disabled in config'
   return null
 }
+
+/**
+ * What one matcher did during `run()`, remembered so `subRuns()` can report it without doing the
+ * work a second time.
+ */
+type MatcherOutcome =
+  | { status: 'evaluated'; found: number }
+  | { status: 'not-evaluated'; reason: string }
+
+/**
+ * The link counts `run()` observed, keyed by the scan they belong to.
+ *
+ * `subRuns()` used to re-invoke every matcher's `link()` purely to report how many links each
+ * produced — immediately after `run()` had already invoked all six for real. That doubled the cost
+ * of the most expensive rule in the system (the fuzzy-title matcher is an O(n²) trigram comparison
+ * within each first-letter bucket) to produce numbers `run()` had already computed and discarded.
+ * `run()` now records each matcher's outcome here and `subRuns()` reads it.
+ *
+ * Module-scoped rather than passed through `RuleContext` because `Rule.subRuns` and `Rule.run` are
+ * separate entry points on the shared interface with no per-pass object between them, and cleared
+ * on every `run()` so this holds at most one scan's worth of counts — it is a hand-off between two
+ * calls in the same pass, not a cache that accumulates.
+ */
+const lastPassOutcomes = new Map<number, Map<string, MatcherOutcome>>()
 
 /**
  * One rule that runs every duplicate matcher, groups the links, scores keepers, and emits a
@@ -77,10 +120,29 @@ export const dupeGroupRule: Rule = {
   class: 'duplicate',
   requires: ['jellyfin'],
   run(ctx: RuleContext): Finding[] {
+    // Every matcher runs exactly once per pass, here. Its outcome — link count, or the reason it
+    // contributed nothing — is recorded for `subRuns()` to report rather than recompute.
+    const outcomes = new Map<string, MatcherOutcome>()
+    lastPassOutcomes.clear()
+    lastPassOutcomes.set(ctx.scanId, outcomes)
+
     const links = DUPE_RULES.flatMap((matcher) => {
       // A matcher whose extra sources are absent contributes nothing rather than failing the group rule.
-      if (unavailableReason(ctx, matcher)) return []
-      try { return matcher.link(ctx) } catch { return [] }
+      const reason = unavailableReason(ctx, matcher)
+      if (reason) {
+        outcomes.set(matcher.id, { status: 'not-evaluated', reason })
+        return []
+      }
+      try {
+        const matcherLinks = matcher.link(ctx)
+        outcomes.set(matcher.id, { status: 'evaluated', found: matcherLinks.length })
+        return matcherLinks
+      } catch (err) {
+        // A matcher that throws is isolated (the group rule still runs on the others), but it is
+        // NOT silently a zero: `subRuns` reports it not-evaluated, with what it threw.
+        outcomes.set(matcher.id, { status: 'not-evaluated', reason: `matcher threw: ${(err as Error).message}` })
+        return []
+      }
     })
     const groups = buildDupeGroups(links)
     if (!groups.length) return []
@@ -89,7 +151,8 @@ export const dupeGroupRule: Rule = {
     for (const group of groups) {
       const placeholders = group.memberIds.map(() => '?').join(',')
       const rows = ctx.db.prepare(`SELECT id, name, container_path, size_bytes, height, bitrate,
-        video_codec, audio_channels, library_name FROM jellyfin_items WHERE id IN (${placeholders})`)
+        video_codec, audio_channels, library_name, video_range, has_subtitles
+        FROM jellyfin_items WHERE id IN (${placeholders})`)
         .all(...group.memberIds) as MemberRow[]
       if (rows.length < 2) continue
 
@@ -99,8 +162,8 @@ export const dupeGroupRule: Rule = {
         bitrate: r.bitrate,
         videoCodec: r.video_codec,
         audioChannels: r.audio_channels,
-        isHdr: (r.video_codec ?? '').toLowerCase().includes('hevc') && (r.height ?? 0) >= 2160,
-        hasSubtitles: false,
+        isHdr: isHdrRange(r.video_range),
+        hasSubtitles: r.has_subtitles === 1,
         sizeBytes: r.size_bytes,
       }))
       const { keeperId, scores } = pickKeeper(facts, DEFAULT_KEEPER_WEIGHTS)
@@ -167,18 +230,28 @@ export const dupeGroupRule: Rule = {
    * `dupe.group` is the only registered `Rule` for all six duplicate matchers, so without this,
    * `rule_runs` can never distinguish "dupe.identical-file ran and found nothing" from "hashing is
    * off, dupe.identical-file never ran" — the exact ambiguity `rule_runs` exists to prevent. One
-   * entry per matcher, using the same `unavailableReason` judgement `run()` itself acts on, so the
-   * two can't disagree; an available matcher reports the number of links it actually produced.
+   * entry per matcher, reporting what `run()` — which the runner always calls first, in the same
+   * pass — already observed, so the two cannot disagree and no matcher runs twice.
+   *
+   * Called without a preceding `run()` for this scan (a caller invoking it standalone, or a `run()`
+   * that threw before recording anything), there is nothing to report: that is `not-evaluated` with
+   * a reason, never a zero, because "we did not observe this" and "we observed nothing" are the two
+   * states this table exists to keep apart.
    */
   subRuns(ctx: RuleContext): SubRun[] {
+    const outcomes = lastPassOutcomes.get(ctx.scanId)
     return DUPE_RULES.map((matcher): SubRun => {
-      const reason = unavailableReason(ctx, matcher)
-      if (reason) return { ruleId: matcher.id, status: 'not-evaluated', reason }
-      try {
-        return { ruleId: matcher.id, status: 'evaluated', found: matcher.link(ctx).length }
-      } catch (err) {
-        return { ruleId: matcher.id, status: 'not-evaluated', reason: `matcher threw: ${(err as Error).message}` }
+      const outcome = outcomes?.get(matcher.id)
+      if (!outcome) {
+        return {
+          ruleId: matcher.id,
+          status: 'not-evaluated',
+          reason: 'dupe.group did not run this matcher in this pass, so its link count is unknown',
+        }
       }
+      return outcome.status === 'evaluated'
+        ? { ruleId: matcher.id, status: 'evaluated', found: outcome.found }
+        : { ruleId: matcher.id, status: 'not-evaluated', reason: outcome.reason }
     })
   },
 }

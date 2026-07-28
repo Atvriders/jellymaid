@@ -123,6 +123,11 @@ export async function runScan(opts: {
         cursor: cursor[phase.name] ?? {},
         signal: opts.signal,
         deps: opts.deps,
+        // Every earlier phase's own verdict, not just the fact that it finished. `results` is
+        // already persisted into the cursor, so a resumed scan hands the rules phase the same
+        // judgements the first attempt made rather than an empty record that would read as
+        // "no phase reported anything".
+        priorResults: results,
         saveCursor: (c) => { cursor[phase.name] = c; persistCursor() },
         progress: (done, total) => opts.onProgress?.({ phase: phase.name, done, total }),
       })

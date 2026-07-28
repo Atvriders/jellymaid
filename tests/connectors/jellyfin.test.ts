@@ -120,6 +120,43 @@ describe('items', () => {
     })
   })
 
+  it('captures the video range and the presence of a subtitle stream', async () => {
+    const f = stub({
+      '/Items': {
+        TotalRecordCount: 1,
+        Items: [{
+          Id: 'i1', Type: 'Movie', Name: 'Heat',
+          MediaSources: [{
+            MediaStreams: [
+              { Type: 'Video', Codec: 'hevc', Height: 2160, VideoRange: 'HDR', VideoRangeType: 'HDR10' },
+              { Type: 'Audio', Codec: 'dts', Channels: 6 },
+              { Type: 'Subtitle', Codec: 'subrip' },
+            ],
+          }],
+        }],
+      },
+    })
+    const { items } = await createJellyfinClient(opts(f)).items({ startIndex: 0, limit: 1 })
+    expect(items[0]).toMatchObject({ videoRange: 'HDR', hasSubtitles: true })
+  })
+
+  it('falls back to VideoRangeType only when VideoRange is absent, and reports null when neither is', async () => {
+    const f = stub({
+      '/Items': {
+        TotalRecordCount: 2,
+        Items: [
+          { Id: 'a', Type: 'Movie', Name: 'A', MediaSources: [{ MediaStreams: [{ Type: 'Video', VideoRangeType: 'DOVI' }] }] },
+          { Id: 'b', Type: 'Movie', Name: 'B', MediaSources: [{ MediaStreams: [{ Type: 'Video', Codec: 'hevc', Height: 2160 }] }] },
+        ],
+      },
+    })
+    const { items } = await createJellyfinClient(opts(f)).items({ startIndex: 0, limit: 2 })
+    expect(items[0]!.videoRange).toBe('DOVI')
+    // A 4K HEVC stream with no range reported is NOT inferred to be HDR here or anywhere else.
+    expect(items[1]!.videoRange).toBeNull()
+    expect(items[1]!.hasSubtitles).toBe(false)
+  })
+
   it('lowercases provider id keys so rules can match on one spelling', async () => {
     const f = stub({ '/Items': { TotalRecordCount: 1, Items: [{ Id: 'i', Type: 'Movie', Name: 'X', ProviderIds: { TvDb: '55' } }] } })
     const { items } = await createJellyfinClient(opts(f)).items({ startIndex: 0, limit: 1 })

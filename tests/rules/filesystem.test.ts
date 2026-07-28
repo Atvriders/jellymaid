@@ -5,10 +5,12 @@ import { join } from 'node:path'
 import { openDb, type Db } from '../../src/index/db.js'
 import { FILESYSTEM_RULES } from '../../src/rules/filesystem/index.js'
 import { fileConfigSchema } from '../../src/config/schema.js'
+import type { SourceName } from '../../src/rules/types.js'
 
 let db: Db
 const config = fileConfigSchema.parse({})
-const ctx = (cfg: typeof config = config) => ({ db, config: cfg, scanId: 1, now: 'T' })
+const ALL_SOURCES = new Set<SourceName>(['jellyfin', 'filesystem', 'qbittorrent', 'arr', 'hashes'])
+const ctx = (cfg: typeof config = config) => ({ db, config: cfg, scanId: 1, now: 'T', availableSources: ALL_SOURCES })
 const rule = (id: string) => FILESYSTEM_RULES.find((r) => r.id === id)!
 
 function entry(over: Record<string, unknown>) {

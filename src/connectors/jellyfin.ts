@@ -32,6 +32,14 @@ export interface JellyfinItem {
   width: number | null
   height: number | null
   bitrate: number | null
+  /**
+   * The video stream's colour range exactly as Jellyfin reports it — 'SDR', 'HDR10', 'HLG',
+   * 'Dolby Vision', … — or null when this Jellyfin does not report one. Never inferred from the
+   * codec or the resolution: an absent signal is absent, and the keeper score treats it as such.
+   */
+  videoRange: string | null
+  /** Whether the item carries any subtitle stream (embedded), per Jellyfin's own stream list. */
+  hasSubtitles: boolean
   hasPrimaryImage: boolean
   dateCreated: string | null
   mediaSourceId: string | null
@@ -52,7 +60,10 @@ const ITEM_TYPES = 'Movie,Episode,Series,Season'
 const CLIENT_HEADER =
   'MediaBrowser Client="Jellymaid", Device="Jellymaid", DeviceId="jellymaid-server", Version="1.0.0"'
 
-interface RawStream { Type?: string; Codec?: string; Width?: number; Height?: number; Channels?: number }
+interface RawStream {
+  Type?: string; Codec?: string; Width?: number; Height?: number; Channels?: number
+  VideoRange?: string; VideoRangeType?: string
+}
 interface RawSource { Id?: string; Path?: string; Size?: number; Container?: string; Bitrate?: number; MediaStreams?: RawStream[] }
 interface RawItem {
   Id: string; Type?: string; Name?: string; SortName?: string; ProductionYear?: number
@@ -66,6 +77,15 @@ function normalize(raw: RawItem): JellyfinItem {
   const streams = source?.MediaStreams ?? []
   const video = streams.find((s) => s.Type === 'Video')
   const audio = streams.find((s) => s.Type === 'Audio')
+  // `VideoRange` ('SDR' | 'HDR') is the field every supported Jellyfin reports; `VideoRangeType`
+  // ('HDR10' | 'HLG' | 'DOVI' | 'Unknown' | …) is the newer, more specific one and is only used as
+  // a fallback. Deliberately not the other way round: some versions report a useful VideoRange
+  // alongside VideoRangeType='Unknown', and preferring the more specific field there would replace
+  // a real answer with a placeholder that reads as "not SDR" downstream. Empty strings are
+  // normalized to null — "not reported" and "reported as nothing" are the same absent signal.
+  const videoRange = [video?.VideoRange, video?.VideoRangeType]
+    .map((v) => v?.trim())
+    .find((v) => Boolean(v)) ?? null
   const providerIds: Record<string, string> = {}
   for (const [k, v] of Object.entries(raw.ProviderIds ?? {})) providerIds[k.toLowerCase()] = v
   // Every physical file behind this item, not just the primary. Order doesn't matter downstream
@@ -99,6 +119,8 @@ function normalize(raw: RawItem): JellyfinItem {
     width: video?.Width ?? null,
     height: video?.Height ?? null,
     bitrate: source?.Bitrate ?? null,
+    videoRange,
+    hasSubtitles: streams.some((s) => s.Type === 'Subtitle'),
     hasPrimaryImage: Boolean(raw.ImageTags?.Primary),
     dateCreated: raw.DateCreated ?? null,
     mediaSourceId: source?.Id ?? null,

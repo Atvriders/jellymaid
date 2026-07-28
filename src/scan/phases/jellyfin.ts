@@ -12,9 +12,9 @@ export const jellyfinPhase: Phase = {
     const insert = ctx.db.prepare(`INSERT OR REPLACE INTO jellyfin_items (
       id, scan_id, type, name, sort_name, year, series_id, series_name, season_no, episode_no,
       provider_ids_json, jf_path, container_path, size_bytes, runtime_ticks, container,
-      video_codec, audio_codec, audio_channels, width, height, bitrate, has_primary_image,
-      library_id, library_name, date_created, media_source_id
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      video_codec, audio_codec, audio_channels, width, height, bitrate, video_range, has_subtitles,
+      has_primary_image, library_id, library_name, date_created, media_source_id
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     // One row per physical file behind an item (see 003_jellyfin_item_paths.sql) — every
     // MediaSources[] path, not just the primary `jf_path` already carried on jellyfin_items.
     // Keyed on (item_id, jf_path): an item legitimately has more than one path once versions are
@@ -93,7 +93,12 @@ export const jellyfinPhase: Phase = {
           i.id, ctx.scanId, i.type, i.name, i.sortName, i.year, i.seriesId, i.seriesName, i.seasonNo, i.episodeNo,
           JSON.stringify(i.providerIds), i.jfPath, containerPath,
           i.sizeBytes, i.runtimeTicks, i.container, i.videoCodec, i.audioCodec, i.audioChannels,
-          i.width, i.height, i.bitrate, i.hasPrimaryImage ? 1 : 0,
+          i.width, i.height, i.bitrate,
+          // Both are real reported signals or nothing at all — see 004_item_quality_signals.sql.
+          // A test double (or an older Jellyfin) that omits videoRange stores NULL rather than a
+          // codec-derived guess, and the keeper score reads NULL as "no HDR evidence", not "HDR".
+          i.videoRange ?? null, i.hasSubtitles ? 1 : 0,
+          i.hasPrimaryImage ? 1 : 0,
           lib?.id ?? null, lib?.name ?? null, i.dateCreated, i.mediaSourceId,
         ])
         for (const jfPath of i.mediaSourcePaths ?? []) {

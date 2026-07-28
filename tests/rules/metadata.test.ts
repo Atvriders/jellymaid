@@ -6,10 +6,12 @@ import { join } from 'node:path'
 import { openDb, type Db } from '../../src/index/db.js'
 import { METADATA_RULES } from '../../src/rules/metadata/index.js'
 import { fileConfigSchema } from '../../src/config/schema.js'
+import type { SourceName } from '../../src/rules/types.js'
 
 let db: Db
 const config = fileConfigSchema.parse({})
-const ctx = () => ({ db, config, scanId: 1, now: 'T' })
+const ALL_SOURCES = new Set<SourceName>(['jellyfin', 'filesystem', 'qbittorrent', 'arr', 'hashes'])
+const ctx = (cfg: typeof config = config) => ({ db, config: cfg, scanId: 1, now: 'T', availableSources: ALL_SOURCES })
 const rule = (id: string) => METADATA_RULES.find((r) => r.id === id)!
 
 function item(over: Record<string, unknown> = {}) {
@@ -100,5 +102,26 @@ describe('meta.bad-naming', () => {
   it('accepts a conventional episode filename', () => {
     item({ id: 'e', type: 'Episode', series_id: 's', season_no: 1, episode_no: 1, jf_path: '/media/TV/Show/Season 01/Show - S01E01.mkv' })
     expect(rule('meta.bad-naming').run(ctx())).toHaveLength(0)
+  })
+  it('can be turned off in config', () => {
+    item({ jf_path: '/media/Movies/Heat/Heat.mkv' })
+    const cfg = fileConfigSchema.parse({ rules: { 'meta.bad-naming': { enabled: false } } })
+    expect(rule('meta.bad-naming').run(ctx(cfg))).toHaveLength(0)
+  })
+  it('accepts a house style the built-in movie pattern rejects, once configured', () => {
+    item({ jf_path: '/media/Movies/Heat [1995]/Heat.mkv' })
+    expect(rule('meta.bad-naming').run(ctx())).toHaveLength(1)
+    const cfg = fileConfigSchema.parse({
+      rules: { 'meta.bad-naming': { moviePattern: '\\[(?:19|20)\\d{2}\\]/[^/]+$' } },
+    })
+    expect(rule('meta.bad-naming').run(ctx(cfg))).toHaveLength(0)
+  })
+  it('applies a configured episode pattern case-insensitively, like the built-in one', () => {
+    item({ id: 'e', type: 'Episode', series_id: 's', season_no: 1, episode_no: 1, jf_path: '/media/TV/Show/Show 1x01.mkv' })
+    expect(rule('meta.bad-naming').run(ctx())).toHaveLength(1)
+    const cfg = fileConfigSchema.parse({
+      rules: { 'meta.bad-naming': { episodePattern: '\\d{1,2}X\\d{1,3}' } },
+    })
+    expect(rule('meta.bad-naming').run(ctx(cfg))).toHaveLength(0)
   })
 })

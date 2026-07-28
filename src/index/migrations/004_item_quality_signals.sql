@@ -1,0 +1,21 @@
+-- Real keeper-scoring signals, captured instead of guessed.
+--
+-- The keeper score decides which copy of a duplicate the operator is shown as the one to KEEP —
+-- i.e. which of the others Plan 4 offers to delete — so every signal feeding it has to be something
+-- Jellyfin actually reported. Two were not:
+--
+--   * HDR was inferred as `video_codec LIKE '%hevc%' AND height >= 2160`. That is not HDR, it is
+--     "4K HEVC": an ordinary SDR 4K HEVC rip collected the full HDR bonus it had not earned, while
+--     a genuinely HDR file in H.264, or at 1080p, collected none. `video_range` is what Jellyfin
+--     itself reports for the video stream (SDR / HDR10 / HLG / Dolby Vision / ...).
+--   * Subtitles were hardcoded false for every member, so a weight sat in the scoring table looking
+--     live while being incapable of separating any two copies. `has_subtitles` records whether the
+--     item carries any subtitle stream.
+--
+-- video_range is nullable with no default on purpose. NULL means "this row predates the column, or
+-- this Jellyfin does not report it" — an ABSENT signal, which must contribute nothing rather than
+-- be re-derived from the codec. has_subtitles defaults to 0 because a row written before this
+-- column existed genuinely has no subtitle evidence, and 0 costs a copy only the smallest weight in
+-- the table until the next scan refreshes it.
+ALTER TABLE jellyfin_items ADD COLUMN video_range TEXT;
+ALTER TABLE jellyfin_items ADD COLUMN has_subtitles INTEGER NOT NULL DEFAULT 0;

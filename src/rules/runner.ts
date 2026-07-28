@@ -1,6 +1,7 @@
 import type { Db } from '../index/db.js'
 import type { FileConfig } from '../config/schema.js'
-import type { Rule, SourceName, SubRun } from './types.js'
+import type { Rule, SourceName, SourceReasons, SubRun } from './types.js'
+import { unavailableSourcesReason } from './types.js'
 import { ALL_RULES } from './registry.js'
 
 export interface RuleRunSummary {
@@ -21,12 +22,22 @@ export function runRules(opts: {
   config: FileConfig
   scanId: number
   availableSources: Set<SourceName>
+  /** Why each unavailable source is unavailable, so a not-evaluated row can say more than a name. */
+  sourceReasons?: SourceReasons
   rules?: Rule[]
   now?: string
 }): RuleRunSummary {
   const { db } = opts
   const now = opts.now ?? new Date().toISOString()
   const rules = opts.rules ?? ALL_RULES
+  const ruleCtx = {
+    db,
+    config: opts.config,
+    scanId: opts.scanId,
+    now,
+    availableSources: opts.availableSources,
+    sourceReasons: opts.sourceReasons,
+  }
   const summary: RuleRunSummary = { evaluated: [], notEvaluated: [], created: 0, resolved: 0, reopened: 0 }
 
   const upsert = db.prepare(`INSERT INTO findings
@@ -71,11 +82,13 @@ export function runRules(opts: {
   // persisting is not.
   const pass = db.transaction(() => {
     for (const rule of rules) {
-      const missing = rule.requires.filter((r) => !opts.availableSources.has(r))
-      if (missing.length) {
-        const reason = `required sources unavailable: ${missing.join(', ')}`
-        recordRun.run(opts.scanId, rule.id, 'not-evaluated', reason, 0, 0)
-        summary.notEvaluated.push({ ruleId: rule.id, reason })
+      // Not "does the table have rows" — whether this scan actually OBSERVED each source. The
+      // caller decides that (see the rules phase); the reason it supplies is what makes the
+      // not-evaluated row say which phase failed and what it said.
+      const unavailable = unavailableSourcesReason(rule.requires, opts.availableSources, opts.sourceReasons)
+      if (unavailable) {
+        recordRun.run(opts.scanId, rule.id, 'not-evaluated', unavailable, 0, 0)
+        summary.notEvaluated.push({ ruleId: rule.id, reason: unavailable })
         continue
       }
 
@@ -103,10 +116,10 @@ export function runRules(opts: {
       // (findings committed but persist failed, or vice versa).
       db.pragma('query_only = ON')
       try {
-        findings = rule.run({ db, config: opts.config, scanId: opts.scanId, now })
-        subRuns = rule.subRuns?.({ db, config: opts.config, scanId: opts.scanId, now }) ?? []
+        findings = rule.run(ruleCtx)
+        subRuns = rule.subRuns?.(ruleCtx) ?? []
         db.pragma('query_only = OFF')
-        rule.persist?.({ db, config: opts.config, scanId: opts.scanId, now }, findings)
+        rule.persist?.(ruleCtx, findings)
       } catch (err) {
         db.pragma('query_only = OFF')
         const reason = `rule threw: ${(err as Error).message}`
