@@ -2,11 +2,6 @@ import type { Finding } from '../../core/types.js'
 import { findingId } from '../../core/types.js'
 import type { Rule, RuleContext } from '../types.js'
 
-const JUNK_NAME = /(^|[.\-_ ])sample([.\-_ ]|$)/i
-const JUNK_EXT = new Set(['.part', '.tmp', '.!qb', '.crdownload'])
-const JUNK_DIR = new Set(['proof', 'screens', 'sample'])
-const SIDECAR_EXT = new Set(['.srt', '.sub', '.idx', '.ass', '.nfo', '.jpg', '.png'])
-
 function finding(
   ctx: RuleContext, ruleId: string, key: string, path: string,
   severity: Finding['severity'], evidence: Record<string, unknown>, reclaimable: number | null,
@@ -113,18 +108,26 @@ const emptyFolderRule: Rule = {
 }
 
 /**
- * A media file under a library root with no matching `jellyfin_items.container_path`. Deliberately
+ * A media file under a library root that Jellyfin does not know about under ANY path. Deliberately
  * scoped to `root_role = 'library'`: files under a download root are pre-import staging, not a
  * Jellyfin gap, per the global rule that only library roots are ever compared against Jellyfin's
  * inventory.
  *
- * Known gap (see task report): `jellyfin_items` stores exactly one `container_path` per Jellyfin
- * item — the API's top-level `Path`, which for a merged multi-version item is only the PRIMARY
- * version. An alternate version's physical file, though still known to and playable from Jellyfin,
- * has no row of its own here and so is indistinguishable from a genuine orphan by this join. That
- * is an ingestion-side limitation of `jellyfin_items` (Plans 1-2), not a defect in this join —
- * fixing it requires capturing every `MediaSources[].Path`, not just the first, which is out of
- * this task's scope. Flagged here, not silently patched around.
+ * "Known to Jellyfin" checks two sources, not one: `jellyfin_items.container_path` (the primary
+ * path of a standalone or merged item) AND `jellyfin_item_paths.container_path` (every physical
+ * file behind an item, including alternate versions — see 003_jellyfin_item_paths.sql). The second
+ * check exists because `jellyfin_items` stores exactly one path per item, and for a merged
+ * multi-version item that is only the primary version: `/Items?Recursive=true` stops returning an
+ * alternate version as its own item row the moment it's merged, so without `jellyfin_item_paths`
+ * its file would be indistinguishable from a genuine orphan here — a live path to the operator
+ * deleting the file they just told Jellyfin (via this app's own `merge-versions` action) to keep.
+ *
+ * Both checks are `NOT EXISTS` against an indexed equality (`jellyfin_items.container_path` and
+ * `jellyfin_item_paths.container_path` are both indexed), not a second `LEFT JOIN`: a `LEFT JOIN`
+ * against `jellyfin_item_paths` could fan out into more than one matching row per file if two
+ * different (item, path) pairs ever resolved to the same container path, which would silently
+ * double-count that file's finding. `NOT EXISTS` is a boolean per outer row regardless of how many
+ * matches exist on the other side, so this can't happen.
  */
 const orphanMediaRule: Rule = {
   id: 'fs.orphan-media',
@@ -133,14 +136,23 @@ const orphanMediaRule: Rule = {
   run(ctx) {
     const rows = ctx.db.prepare(`SELECT f.container_path AS path, f.size_bytes AS size
       FROM fs_entries f
-      LEFT JOIN jellyfin_items i ON i.container_path = f.container_path
-      WHERE f.is_media = 1 AND f.root_role = 'library' AND i.id IS NULL`)
+      WHERE f.is_media = 1 AND f.root_role = 'library'
+        AND NOT EXISTS (SELECT 1 FROM jellyfin_items i WHERE i.container_path = f.container_path)
+        AND NOT EXISTS (SELECT 1 FROM jellyfin_item_paths p WHERE p.container_path = f.container_path)`)
       .all() as Array<{ path: string; size: number }>
     return rows.map((r) =>
       finding(ctx, 'fs.orphan-media', r.path, r.path, 'warning', { sizeBytes: r.size }, r.size))
   },
 }
 
+/**
+ * A Jellyfin item none of whose known paths resolve to a file on disk — critical because the
+ * primary path (`jellyfin_items.container_path`) being gone does not by itself mean the item is
+ * unplayable: if an alternate version merged into the same item (`jellyfin_item_paths`) still
+ * exists, Jellyfin can still serve it, and reporting "missing" here would mislead the operator.
+ * Only reported when NEITHER the primary path NOR any alternate resolves — same `NOT EXISTS`
+ * reasoning, and same fan-out hazard, as `fs.orphan-media` above.
+ */
 const missingFileRule: Rule = {
   id: 'fs.missing-file',
   class: 'filesystem',
@@ -148,8 +160,13 @@ const missingFileRule: Rule = {
   run(ctx) {
     const rows = ctx.db.prepare(`SELECT i.id AS id, i.name AS name, i.container_path AS path
       FROM jellyfin_items i
-      LEFT JOIN fs_entries f ON f.container_path = i.container_path
-      WHERE i.container_path IS NOT NULL AND f.container_path IS NULL`)
+      WHERE i.container_path IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM fs_entries f WHERE f.container_path = i.container_path)
+        AND NOT EXISTS (
+          SELECT 1 FROM jellyfin_item_paths p
+          JOIN fs_entries fa ON fa.container_path = p.container_path
+          WHERE p.item_id = i.id
+        )`)
       .all() as Array<{ id: string; name: string; path: string }>
     return rows.map((r) => ({
       id: findingId('fs.missing-file', r.id),
@@ -167,11 +184,22 @@ const missingFileRule: Rule = {
   },
 }
 
+/**
+ * Every threshold and ignorable-file list here comes from config (`ctx.config.rules['fs.junk']`),
+ * not a hardcoded constant: a bare `/sample/i` name pattern would flag a real title like "Sample
+ * City" for every operator with no way to turn it off. Defaults match what used to be hardcoded
+ * exactly, so an unconfigured install behaves identically to before.
+ */
 const junkRule: Rule = {
   id: 'fs.junk',
   class: 'filesystem',
   requires: ['filesystem'],
   run(ctx) {
+    const cfg = ctx.config.rules['fs.junk']
+    const namePatterns = cfg.namePatterns.map((p) => new RegExp(p, 'i'))
+    const junkExt = new Set(cfg.extensions.map((e) => e.toLowerCase()))
+    const junkDir = new Set(cfg.directoryNames.map((d) => d.toLowerCase()))
+
     const rows = ctx.db.prepare(
       'SELECT container_path, name, ext, is_dir, is_media, size_bytes FROM fs_entries',
     ).all() as Array<{ container_path: string; name: string; ext: string | null; is_dir: number; is_media: number; size_bytes: number }>
@@ -180,10 +208,10 @@ const junkRule: Rule = {
     for (const r of rows) {
       const ext = (r.ext ?? '').toLowerCase()
       let reason: string | null = null
-      if (r.is_dir === 1 && JUNK_DIR.has(r.name.toLowerCase())) reason = 'junk directory'
-      else if (r.is_dir === 0 && JUNK_EXT.has(ext)) reason = `incomplete download (${ext})`
-      else if (r.is_dir === 0 && JUNK_NAME.test(r.name)) reason = 'sample file'
-      else if (r.is_dir === 0 && r.is_media === 1 && r.size_bytes === 0) reason = 'zero-byte media file'
+      if (r.is_dir === 1 && junkDir.has(r.name.toLowerCase())) reason = 'junk directory'
+      else if (r.is_dir === 0 && junkExt.has(ext)) reason = `incomplete download (${ext})`
+      else if (r.is_dir === 0 && namePatterns.some((re) => re.test(r.name))) reason = 'sample file'
+      else if (r.is_dir === 0 && cfg.zeroByteIsJunk && r.is_media === 1 && r.size_bytes === 0) reason = 'zero-byte media file'
       if (!reason) continue
       out.push(finding(ctx, 'fs.junk', r.container_path, r.container_path, 'warning',
         { reason, sizeBytes: r.size_bytes }, r.size_bytes))
@@ -197,6 +225,7 @@ const straySidecarRule: Rule = {
   class: 'filesystem',
   requires: ['filesystem'],
   run(ctx) {
+    const sidecarExt = new Set(ctx.config.rules['fs.stray-sidecar'].extensions.map((e) => e.toLowerCase()))
     const rows = ctx.db.prepare(
       'SELECT container_path, parent_path, ext FROM fs_entries WHERE is_dir = 0',
     ).all() as Array<{ container_path: string; parent_path: string; ext: string | null }>
@@ -206,7 +235,7 @@ const straySidecarRule: Rule = {
     ).all() as Array<{ parent_path: string; c: number }>) mediaByParent.set(r.parent_path, r.c)
 
     return rows
-      .filter((r) => SIDECAR_EXT.has((r.ext ?? '').toLowerCase()) && !(mediaByParent.get(r.parent_path) ?? 0))
+      .filter((r) => sidecarExt.has((r.ext ?? '').toLowerCase()) && !(mediaByParent.get(r.parent_path) ?? 0))
       .map((r) => finding(ctx, 'fs.stray-sidecar', r.container_path, r.container_path, 'info',
         { ext: r.ext }, 0))
   },

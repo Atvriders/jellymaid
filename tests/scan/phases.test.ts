@@ -167,6 +167,75 @@ describe('jellyfinPhase', () => {
     expect(db.prepare("SELECT COUNT(*) c FROM jellyfin_items WHERE id = 'old'").get()).toEqual({ c: 0 })
   })
 
+  it('writes one jellyfin_item_paths row per media source, translated through the path map like the primary path', async () => {
+    // Merged versions: /Items returns one item whose MediaSources[] lists both the primary and
+    // the alternate physical file. fs.orphan-media needs BOTH container paths recorded here, or
+    // the alternate reads as an orphan even though Jellyfin still knows and can play it.
+    const jf = {
+      virtualFolders: async () => [{ id: 'lib1', name: 'Movies', collectionType: 'movies', locations: ['/media/Movies'] }],
+      items: async () => ({
+        totalRecordCount: 1,
+        items: [{
+          id: 'merged1', type: 'Movie', name: 'Heat', sortName: null, year: 1995,
+          seriesId: null, seriesName: null, seasonNo: null, episodeNo: null, providerIds: {},
+          jfPath: '/media/Movies/Heat.mkv',
+          mediaSourcePaths: ['/media/Movies/Heat.mkv', '/media/Movies/Heat.2160p.mkv', '/unmapped/Heat.alt.mkv'],
+          sizeBytes: 10, runtimeTicks: 1, container: 'mkv', videoCodec: 'h264', audioCodec: 'aac',
+          audioChannels: 2, width: 1920, height: 1080, bitrate: 100, hasPrimaryImage: true,
+          dateCreated: null, mediaSourceId: 'ms1',
+        }],
+      }),
+    }
+    const res = await jellyfinPhase.run(ctx({
+      jellyfin: jf as never,
+      pathMap: createPathMap([{ role: 'library', jellyfin: '/media/Movies', container: '/mnt/m', qbit: null }]),
+    }))
+    expect(res.status).toBe('completed')
+    const rows = db.prepare('SELECT jf_path, container_path FROM jellyfin_item_paths WHERE item_id = ? ORDER BY jf_path')
+      .all('merged1') as Array<{ jf_path: string; container_path: string | null }>
+    expect(rows).toEqual([
+      { jf_path: '/media/Movies/Heat.2160p.mkv', container_path: '/mnt/m/Heat.2160p.mkv' },
+      { jf_path: '/media/Movies/Heat.mkv', container_path: '/mnt/m/Heat.mkv' },
+      { jf_path: '/unmapped/Heat.alt.mkv', container_path: null },
+    ])
+    // The unmapped alternate path is counted in the SAME tally as an unmapped primary path —
+    // no separate counter was invented for this table.
+    expect(res.counts.unmapped).toBe(1)
+  })
+
+  it('sweeps jellyfin_item_paths under the exact same completeness gate as jellyfin_items — never a separate licence', async () => {
+    seedPriorItem()
+    db.prepare(`INSERT INTO jellyfin_item_paths (item_id, scan_id, jf_path, container_path)
+                VALUES ('old', 0, '/media/Movies/Old.mkv', '/mnt/m/Old.mkv')`).run()
+
+    // A short fetch: the same gate that leaves jellyfin_items untouched must leave
+    // jellyfin_item_paths untouched too.
+    let call = 0
+    const shortFetch = {
+      virtualFolders: async () => [],
+      items: async () => {
+        call += 1
+        return call === 1
+          ? { totalRecordCount: 10, items: [{
+              id: 'a', type: 'Movie', name: 'A', sortName: null, year: null, seriesId: null,
+              seriesName: null, seasonNo: null, episodeNo: null, providerIds: {}, jfPath: null,
+              mediaSourcePaths: [], sizeBytes: null, runtimeTicks: null, container: null,
+              videoCodec: null, audioCodec: null, audioChannels: null, width: null, height: null,
+              bitrate: null, hasPrimaryImage: false, dateCreated: null, mediaSourceId: null,
+            }] }
+          : { totalRecordCount: 10, items: [] }
+      },
+    }
+    const shortRes = await jellyfinPhase.run(ctx({ jellyfin: shortFetch as never }))
+    expect(shortRes.status).toBe('skipped')
+    expect(db.prepare("SELECT COUNT(*) c FROM jellyfin_item_paths WHERE item_id = 'old'").get()).toEqual({ c: 1 })
+
+    // A complete fetch: now both tables sweep together.
+    const res = await jellyfinPhase.run(ctx({ jellyfin: pages(3) as never }))
+    expect(res.status).toBe('completed')
+    expect(db.prepare("SELECT COUNT(*) c FROM jellyfin_item_paths WHERE item_id = 'old'").get()).toEqual({ c: 0 })
+  })
+
   it('does not sweep when a resumed fetch reports a total lower than the cursor recorded — the library shrank during the gap', async () => {
     // Cursor left behind by a cancelled attempt: it had reached offset 1000 out of a
     // then-reported 5000. Between that cancel and this resume, items below offset 1000 were

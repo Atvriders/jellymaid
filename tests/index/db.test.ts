@@ -25,8 +25,9 @@ describe('openDb', () => {
     const names = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()
       .map((r) => (r as { name: string }).name)
     for (const t of [
-      'scans', 'jellyfin_items', 'fs_entries', 'torrents', 'torrent_files', 'arr_records',
-      'findings', 'dupe_groups', 'plans', 'plan_actions', 'audit', 'trash', 'kv', 'rule_runs',
+      'scans', 'jellyfin_items', 'jellyfin_item_paths', 'fs_entries', 'torrents', 'torrent_files',
+      'arr_records', 'findings', 'dupe_groups', 'plans', 'plan_actions', 'audit', 'trash', 'kv',
+      'rule_runs',
     ]) {
       expect(names).toContain(t)
     }
@@ -161,6 +162,11 @@ describe('migrations', () => {
       { hash: string; state: string; files_error: string | null }
     expect(row.state).toBe('downloading')
     expect(row.files_error).toBeNull()
+    // 003 must also have applied on top of a database that started at 001 — proves the chain
+    // isn't just "the immediately-next migration", but every one still missing, in order.
+    const tables = upgraded.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()
+      .map((t) => (t as { name: string }).name)
+    expect(tables).toContain('jellyfin_item_paths')
     upgraded.close()
 
     // And reopening applies nothing further — no version bump, no second ALTER TABLE (which

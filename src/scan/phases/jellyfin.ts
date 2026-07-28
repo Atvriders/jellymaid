@@ -15,6 +15,12 @@ export const jellyfinPhase: Phase = {
       video_codec, audio_codec, audio_channels, width, height, bitrate, has_primary_image,
       library_id, library_name, date_created, media_source_id
     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    // One row per physical file behind an item (see 003_jellyfin_item_paths.sql) — every
+    // MediaSources[] path, not just the primary `jf_path` already carried on jellyfin_items.
+    // Keyed on (item_id, jf_path): an item legitimately has more than one path once versions are
+    // merged.
+    const insertPath = ctx.db.prepare(`INSERT OR REPLACE INTO jellyfin_item_paths
+      (item_id, scan_id, jf_path, container_path) VALUES (?,?,?,?)`)
 
     let libraryByLocation: Array<{ id: string; name: string; location: string }> = []
     try {
@@ -36,7 +42,10 @@ export const jellyfinPhase: Phase = {
     let unmapped = 0
     let total: number | null = null
 
-    const writeBatch = ctx.db.transaction((rows: unknown[][]) => { for (const r of rows) insert.run(...r) })
+    const writeBatch = ctx.db.transaction((rows: unknown[][], pathRows: unknown[][]) => {
+      for (const r of rows) insert.run(...r)
+      for (const r of pathRows) insertPath.run(...r)
+    })
 
     while (true) {
       if (ctx.signal.aborted) return { status: 'cancelled', counts: { items: written, unmapped } }
@@ -49,7 +58,9 @@ export const jellyfinPhase: Phase = {
       total = page.totalRecordCount
       if (!page.items.length) break
 
-      const rows = page.items.map((i) => {
+      const rows: unknown[][] = []
+      const pathRows: unknown[][] = []
+      for (const i of page.items) {
         const lib = i.jfPath ? libraryByLocation.find((l) => i.jfPath!.startsWith(l.location)) : undefined
         // An item Jellyfin gave a path for that no mapping covers lands here with a NULL
         // container_path — indistinguishable, downstream, from an item that never had a path at
@@ -60,15 +71,22 @@ export const jellyfinPhase: Phase = {
           containerPath = ctx.deps.pathMap.toContainer(i.jfPath)
           if (containerPath === null) unmapped += 1
         }
-        return [
+        rows.push([
           i.id, ctx.scanId, i.type, i.name, i.sortName, i.year, i.seriesId, i.seriesName, i.seasonNo, i.episodeNo,
           JSON.stringify(i.providerIds), i.jfPath, containerPath,
           i.sizeBytes, i.runtimeTicks, i.container, i.videoCodec, i.audioCodec, i.audioChannels,
           i.width, i.height, i.bitrate, i.hasPrimaryImage ? 1 : 0,
           lib?.id ?? null, lib?.name ?? null, i.dateCreated, i.mediaSourceId,
-        ]
-      })
-      writeBatch(rows)
+        ])
+        // Test doubles built directly (not through the real connector) may omit this field
+        // entirely; treat absent exactly like empty rather than throwing on `undefined`.
+        for (const jfPath of i.mediaSourcePaths ?? []) {
+          const itemContainerPath = ctx.deps.pathMap.toContainer(jfPath)
+          if (itemContainerPath === null) unmapped += 1
+          pathRows.push([i.id, ctx.scanId, jfPath, itemContainerPath])
+        }
+      }
+      writeBatch(rows, pathRows)
       written += rows.length
       startIndex += page.items.length
       ctx.saveCursor({ startIndex, total })
@@ -112,6 +130,12 @@ export const jellyfinPhase: Phase = {
     // Items Jellyfin no longer returns were removed from the library; drop their rows so
     // the duplicate and metadata rules do not reason about entries that no longer exist.
     const stale = ctx.db.prepare('DELETE FROM jellyfin_items WHERE scan_id != ?').run(ctx.scanId).changes
+    // Same licence as the sweep above — reached only once every completeness/shrink check this
+    // function performs has already passed for THIS pass. Not a second, independently-reasoned
+    // gate: jellyfin_item_paths is exactly as trustworthy as jellyfin_items for a given pass,
+    // since both are written from the same fetched pages, so there is nothing to license
+    // separately here.
+    ctx.db.prepare('DELETE FROM jellyfin_item_paths WHERE scan_id != ?').run(ctx.scanId)
     return { status: 'completed', counts: { items: written, stale, unmapped } }
   },
 }

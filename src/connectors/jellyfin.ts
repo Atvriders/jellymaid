@@ -14,6 +14,15 @@ export interface JellyfinItem {
   episodeNo: number | null
   providerIds: Record<string, string>
   jfPath: string | null
+  /**
+   * Every non-empty `MediaSources[].Path`, deduplicated, including the primary source. Once two
+   * items are merged via `mergeVersions`, `/Items?Recursive=true` stops returning the alternate
+   * version as its own item row — it only survives inside the surviving item's `MediaSources[]`.
+   * `jfPath` (the item's own top-level `Path`) is only ONE of these; without capturing the rest,
+   * an alternate version's physical file becomes indistinguishable from a genuine orphan to
+   * `fs.orphan-media`, even though Jellyfin still knows it and can still play it.
+   */
+  mediaSourcePaths: string[]
   sizeBytes: number | null
   runtimeTicks: number | null
   container: string | null
@@ -44,7 +53,7 @@ const CLIENT_HEADER =
   'MediaBrowser Client="Jellymaid", Device="Jellymaid", DeviceId="jellymaid-server", Version="1.0.0"'
 
 interface RawStream { Type?: string; Codec?: string; Width?: number; Height?: number; Channels?: number }
-interface RawSource { Id?: string; Size?: number; Container?: string; Bitrate?: number; MediaStreams?: RawStream[] }
+interface RawSource { Id?: string; Path?: string; Size?: number; Container?: string; Bitrate?: number; MediaStreams?: RawStream[] }
 interface RawItem {
   Id: string; Type?: string; Name?: string; SortName?: string; ProductionYear?: number
   SeriesId?: string; SeriesName?: string; ParentIndexNumber?: number; IndexNumber?: number
@@ -59,6 +68,12 @@ function normalize(raw: RawItem): JellyfinItem {
   const audio = streams.find((s) => s.Type === 'Audio')
   const providerIds: Record<string, string> = {}
   for (const [k, v] of Object.entries(raw.ProviderIds ?? {})) providerIds[k.toLowerCase()] = v
+  // Every physical file behind this item, not just the primary. Order doesn't matter downstream
+  // (the phase writes one row per path keyed on (item id, jf path)); dedup does, so a source list
+  // that happens to repeat a path doesn't produce two identical rows for no reason.
+  const mediaSourcePaths = [...new Set(
+    (raw.MediaSources ?? []).map((s) => s.Path).filter((p): p is string => Boolean(p)),
+  )]
   return {
     id: raw.Id,
     type: raw.Type ?? 'Unknown',
@@ -74,6 +89,7 @@ function normalize(raw: RawItem): JellyfinItem {
     episodeNo: raw.Type === 'Season' ? null : raw.IndexNumber ?? null,
     providerIds,
     jfPath: raw.Path ?? null,
+    mediaSourcePaths,
     sizeBytes: source?.Size ?? null,
     runtimeTicks: raw.RunTimeTicks ?? null,
     container: source?.Container ?? null,

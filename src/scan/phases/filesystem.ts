@@ -168,6 +168,15 @@ export const filesystemPhase: Phase = {
     // of leaving fs.permission reporting on paths that read fine now. Capped: an operator with a
     // badly broken mount does not need tens of thousands of identical rows, and this key is read
     // back whole, not paginated.
+    //
+    // Deliberately only reached from this one, fully-completed return — never from any of the
+    // `cancelled` returns or the "every root failed to open" `skipped` return, all above this
+    // point. Those passes could not fully re-derive the truth (a cancelled walk saw only part of
+    // the tree; a totally unreachable root saw none of it), so refreshing this key from their
+    // partial `errors` would silently DROP whatever a previous, more complete pass already
+    // recorded — including entries for paths this pass never got far enough to re-check. A
+    // stale-but-real prior error list beats one wiped by a pass that could not see enough to
+    // replace it.
     ctx.db.prepare("INSERT OR REPLACE INTO kv (key, value_json) VALUES ('scan.fsErrors', ?)")
       .run(JSON.stringify(errors.slice(0, 500)))
 

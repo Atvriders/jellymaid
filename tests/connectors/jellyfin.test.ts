@@ -139,6 +139,46 @@ describe('items', () => {
     const { items } = await createJellyfinClient(opts(f)).items({ startIndex: 0, limit: 1 })
     expect(items[0]!.sizeBytes).toBeNull()
     expect(items[0]!.hasPrimaryImage).toBe(false)
+    expect(items[0]!.mediaSourcePaths).toEqual([])
+  })
+
+  it('collects every MediaSources path, not just the primary — this is how a merged item\'s alternate version stays visible', async () => {
+    // Once two items are merged via mergeVersions, /Items stops returning the alternate version
+    // as its own row; the only place its physical path still shows up is here.
+    const f = stub({
+      '/Items': {
+        TotalRecordCount: 1,
+        Items: [{
+          Id: 'i1', Type: 'Movie', Name: 'Heat', Path: '/media/Movies/Heat (1995)/Heat.mkv',
+          MediaSources: [
+            { Id: 'ms1', Path: '/media/Movies/Heat (1995)/Heat.mkv', Size: 100 },
+            { Id: 'ms2', Path: '/media/Movies/Heat (1995)/Heat.2160p.mkv', Size: 200 },
+          ],
+        }],
+      },
+    })
+    const { items } = await createJellyfinClient(opts(f)).items({ startIndex: 0, limit: 1 })
+    expect(items[0]!.mediaSourcePaths).toEqual([
+      '/media/Movies/Heat (1995)/Heat.mkv',
+      '/media/Movies/Heat (1995)/Heat.2160p.mkv',
+    ])
+  })
+
+  it('deduplicates identical MediaSources paths', async () => {
+    const f = stub({
+      '/Items': {
+        TotalRecordCount: 1,
+        Items: [{
+          Id: 'i1', Type: 'Movie', Name: 'Heat', Path: '/media/Movies/Heat.mkv',
+          MediaSources: [
+            { Id: 'ms1', Path: '/media/Movies/Heat.mkv', Size: 100 },
+            { Id: 'ms2', Path: '/media/Movies/Heat.mkv', Size: 100 },
+          ],
+        }],
+      },
+    })
+    const { items } = await createJellyfinClient(opts(f)).items({ startIndex: 0, limit: 1 })
+    expect(items[0]!.mediaSourcePaths).toEqual(['/media/Movies/Heat.mkv'])
   })
 
   it('maps a Season row\'s IndexNumber to seasonNo, not episodeNo', async () => {

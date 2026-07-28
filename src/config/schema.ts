@@ -79,6 +79,20 @@ export const fileConfigSchema = z.object({
       allowedContainers: z.array(z.string()).default(['mkv', 'mp4']),
     }).default({}),
     'quality.biggest': z.object({ enabled: z.boolean().default(true), topN: z.number().int().min(1).default(50) }).default({}),
+    // Case-insensitive regex SOURCES (compiled by the rule, not stored compiled): a hardcoded
+    // `/sample/i` flags a real title like "Sample City" for every operator, with no way to turn
+    // it off. `zeroByteIsJunk` is its own flag because a 0-byte file mid-write from a slow network
+    // copy is a real, if rare, false positive some operators may want to disable independently of
+    // every other junk signal.
+    'fs.junk': z.object({
+      namePatterns: z.array(z.string()).default(['(^|[.\\-_ ])sample([.\\-_ ]|$)']),
+      extensions: z.array(z.string()).default(['.part', '.tmp', '.!qb', '.crdownload']),
+      directoryNames: z.array(z.string()).default(['proof', 'screens', 'sample']),
+      zeroByteIsJunk: z.boolean().default(true),
+    }).default({}),
+    'fs.stray-sidecar': z.object({
+      extensions: z.array(z.string()).default(['.srt', '.sub', '.idx', '.ass', '.nfo', '.jpg', '.png']),
+    }).default({}),
   }).default({}),
 })
 
