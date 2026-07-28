@@ -1,0 +1,60 @@
+services:
+  jellymaid:
+    image: ghcr.io/atvriders/jellymaid:latest
+    container_name: jellymaid
+    restart: unless-stopped
+    # Match these to the uid:gid that owns your media library on the HOST (`id -u` / `id -g`),
+    # not the other way around. Jellymaid deletes and moves files under /mnt/media and
+    # /mnt/downloads below; a container running as root would create root-owned trash/replacement
+    # files in a library your own account owns, which is a real, ongoing problem, not a one-time
+    # inconvenience. Defaults to 1000:1000, the `node` user this image is already built to run as
+    # (see Dockerfile), so most single-user Linux hosts need no override at all. Whatever you set,
+    # `./data` below must exist and be owned by that same uid:gid BEFORE first start — the daemon
+    # creates a missing bind-mount directory as root, and a non-root container cannot then write
+    # to it (`mkdir -p ./data && chown ${PUID:-1000}:${PGID:-1000} ./data`).
+    user: "${PUID:-1000}:${PGID:-1000}"
+    ports:
+      - "8099:8099"
+    environment:
+      # EXAMPLE addresses (RFC 5737 TEST-NET-1) — replace with your own hosts.
+      JELLYFIN_URL: "http://192.0.2.10:8096"
+      JELLYFIN_API_KEY: "${JELLYFIN_API_KEY}"
+      QBIT_URL: "http://192.0.2.10:8080"
+      QBIT_USER: "${QBIT_USER}"
+      QBIT_PASS: "${QBIT_PASS}"
+      # Optional. Jellymaid only ever unmonitors in these — it never deletes or blocklists. Each
+      # is a pair: RADARR_URL and RADARR_API_KEY must both be present, or both absent — delete
+      # both of a connector's two lines below (URL is a literal here, not env-substituted) if you
+      # don't run it, or the container refuses to start rather than guess at a half-configured one.
+      RADARR_URL: "http://192.0.2.11:7878"
+      RADARR_API_KEY: "${RADARR_API_KEY}"
+      SONARR_URL: "http://192.0.2.11:8989"
+      SONARR_API_KEY: "${SONARR_API_KEY}"
+      # Any Olson zone (e.g. America/New_York); only affects log timestamps and SCAN_CRON.
+      TZ: "UTC"
+      # Must equal the number of proxies actually in front of this service — behind a single
+      # Cloudflare tunnel or reverse proxy that is 1, with nothing in front of it that is 0
+      # (the default, applied when this line is removed). Setting it HIGHER than the real count
+      # lets a caller forge X-Forwarded-For and reinstate the login-lockout bypass this setting
+      # exists to close; setting it LOWER collapses every real client onto the proxy's own
+      # address and locks all of them out together after a few failed logins from any one of them.
+      TRUST_PROXY: "1"
+      # Optional. Unset by default: Jellymaid mints a random secret on first boot and persists it
+      # at /data/.session-secret, so sessions already survive container restarts and image
+      # upgrades without this being set. Set it only if you need every session invalidated on a
+      # fixed schedule of your own choosing, or are restoring /data from a backup that predates
+      # that file and want a specific value instead of whatever gets generated.
+      # SESSION_SECRET: "${SESSION_SECRET}"
+    volumes:
+      # REQUIRED: index, config, audit log and trash manifest live here. Must pre-exist and be
+      # owned by the uid:gid set above — see the `user:` comment.
+      - ./data:/data
+      # EXAMPLE paths — replace with your actual media/download directories. Read-write, not
+      # read-only: Jellymaid removes empty folders and leftover hardlinks directly on disk, which
+      # no API call can do, and the trash it moves deleted files into
+      # (<mount>/.jellymaid-trash/<planId>/…) lives INSIDE each of these mounts on purpose, so a
+      # "delete" is a same-filesystem rename, never a copy — a read-only mount, a mount split
+      # across two different filesystems, or a mount that isn't the true root of one filesystem
+      # would each break that guarantee (src/plan/trash.ts).
+      - /path/to/media:/mnt/media
+      - /path/to/downloads:/mnt/downloads

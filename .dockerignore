@@ -1,0 +1,12 @@
+node_modules
+client/node_modules
+dist
+client/dist
+data
+.git
+docs
+.superpowers
+tests
+.env
+*.log
+*.tsbuildinfo
