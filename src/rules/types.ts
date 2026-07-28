@@ -18,6 +18,22 @@ export interface RuleContext {
   now: string
 }
 
+/**
+ * A pure reporting entry for a sub-unit of work inside a rule that itself only registers once in
+ * `ALL_RULES` — e.g. `dupe.group` internally runs six duplicate matchers but emits one finding
+ * shape per group, not one finding-rule per matcher. Without this, an operator staring at
+ * `rule_runs` cannot tell "no identical files" (matcher ran, found nothing) apart from "hashing is
+ * off, this matcher never ran" — exactly the ambiguity `rule_runs` exists to rule out for
+ * top-level rules. `found` is a link/item count, not a finding count: these are not findings, just
+ * visibility into whether the underlying check ran at all.
+ */
+export interface SubRun {
+  ruleId: string
+  status: 'evaluated' | 'not-evaluated'
+  reason?: string
+  found?: number
+}
+
 export interface Rule {
   id: RuleId
   class: FindingClass
@@ -37,6 +53,14 @@ export interface Rule {
    * rows.
    */
   persist?(ctx: RuleContext, findings: Finding[]): void
+  /**
+   * Optional per-sub-unit visibility (see `SubRun`). Pure and read-only, exactly like `run()`:
+   * the runner calls it under the same `query_only = ON` window, immediately after `run()`
+   * succeeds, and each returned entry lands as its own `rule_runs` row alongside the rule's own —
+   * but only once the whole rule (including `persist`) has succeeded, so a failure anywhere in
+   * the rule's pass never leaves a partial set of sub-run rows behind.
+   */
+  subRuns?(ctx: RuleContext): SubRun[]
 }
 
 /** Duplicate rules emit links; grouping is a separate concern. */

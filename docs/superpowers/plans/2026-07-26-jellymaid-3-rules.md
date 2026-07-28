@@ -377,7 +377,29 @@ export interface Rule {
   id: RuleId
   class: FindingClass
   requires: SourceName[]
+  /** Pure and read-only — the runner enforces it with `PRAGMA query_only = ON`. */
   run(ctx: RuleContext): Finding[]
+  /**
+   * Optional. Writes a rule's own derived mirror table. Called by the runner AFTER
+   * `run()` succeeds and `query_only` is back OFF, inside the same pass transaction,
+   * and isolated on throw exactly like a throwing `run()`. It must derive purely from
+   * the findings `run()` already produced — re-querying the index here would see
+   * different data than the findings were built from.
+   */
+  persist?(ctx: RuleContext, findings: Finding[]): void
+  /**
+   * Optional, pure. Reports per-matcher evaluation status for a rule that internally
+   * runs several matchers. Without it, `dupe.group` would be the only row in
+   * `rule_runs`, and an operator could not tell that `dupe.identical-file` never ran
+   * because hashing is off — "found none" and "never checked" would look identical,
+   * which is the exact failure `rule_runs` exists to prevent.
+   */
+  subRuns?(ctx: RuleContext): Array<{
+    ruleId: string
+    status: 'evaluated' | 'not-evaluated'
+    reason?: string
+    found?: number
+  }>
 }
 
 /** Duplicate rules emit links; grouping is a separate concern. */

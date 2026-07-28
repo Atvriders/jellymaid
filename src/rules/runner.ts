@@ -1,6 +1,6 @@
 import type { Db } from '../index/db.js'
 import type { FileConfig } from '../config/schema.js'
-import type { Rule, SourceName } from './types.js'
+import type { Rule, SourceName, SubRun } from './types.js'
 import { ALL_RULES } from './registry.js'
 
 export interface RuleRunSummary {
@@ -81,12 +81,19 @@ export function runRules(opts: {
 
       const started = Date.now()
       let findings
+      let subRuns: SubRun[] = []
       // Rules are pure and read-only by contract; enforce it at the connection level instead of
       // trusting it. A rule that attempts a write throws SQLITE_READONLY, which the catch below
       // isolates exactly like any other throwing rule. query_only is turned back off as the very
       // first statement of both the success path and the catch — not in a `finally` — because a
       // `finally` runs only after the catch block's own statements (including recordRun.run below)
       // have already executed, which would make that write itself fail read-only too.
+      //
+      // A rule's optional `subRuns` step runs immediately after `run()`, still inside this same
+      // try and still under query_only — it is pure and read-only exactly like `run()`, just a
+      // second read that reports on sub-units of work `run()` doesn't surface one-for-one as
+      // findings (see `SubRun`'s doc comment). Its write to `rule_runs` is deferred to after the
+      // whole rule succeeds, alongside the rule's own row, below.
       //
       // A rule's optional `persist` step runs inside this same try, immediately after query_only
       // goes back off: it is the one place a rule is allowed to write, and only after `run()` —
@@ -97,6 +104,7 @@ export function runRules(opts: {
       db.pragma('query_only = ON')
       try {
         findings = rule.run({ db, config: opts.config, scanId: opts.scanId, now })
+        subRuns = rule.subRuns?.({ db, config: opts.config, scanId: opts.scanId, now }) ?? []
         db.pragma('query_only = OFF')
         rule.persist?.({ db, config: opts.config, scanId: opts.scanId, now }, findings)
       } catch (err) {
@@ -121,6 +129,13 @@ export function runRules(opts: {
       summary.created += findings.length
       summary.evaluated.push(rule.id)
       recordRun.run(opts.scanId, rule.id, 'evaluated', null, findings.length, Date.now() - started)
+      // Sub-run rows land only once the parent rule's own row has (i.e. only on this success
+      // path, never from inside the catch above), so a rule that ultimately fails — even if its
+      // `subRuns` computed cleanly before a later `persist` failure — leaves no orphaned sub-run
+      // visibility for work whose parent was rolled back to not-evaluated.
+      for (const s of subRuns) {
+        recordRun.run(opts.scanId, s.ruleId, s.status, s.reason ?? null, s.found ?? 0, null)
+      }
     }
 
     // Only rules that actually ran may resolve their own stale findings. A rule that could not be

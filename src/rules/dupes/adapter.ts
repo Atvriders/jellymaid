@@ -1,6 +1,6 @@
 import type { Finding, Subject } from '../../core/types.js'
 import { findingId } from '../../core/types.js'
-import type { Rule, RuleContext } from '../types.js'
+import type { DupeLink, DupeRule, Rule, RuleContext, SubRun } from '../types.js'
 import { DUPE_RULES } from './index.js'
 import { buildDupeGroups } from '../grouping.js'
 import { DEFAULT_KEEPER_WEIGHTS, pickKeeper, type MemberFacts } from '../keeper.js'
@@ -11,9 +11,50 @@ interface MemberRow {
   audio_channels: number | null; library_name: string | null
 }
 
+/**
+ * The exact shape `run()` writes into a `dupe.group` finding's `evidence`, and the shape
+ * `persist()` reads back out of it. `Finding.evidence` itself is necessarily typed as
+ * `Record<string, unknown>` (every rule's evidence is a different shape), so nothing stops the two
+ * ends from drifting apart silently — this interface is the seam that turns that drift into a
+ * compile error instead of a runtime bind mistake. `scores` is tied directly to `pickKeeper`'s own
+ * return type rather than hand-copied, so a future change to the scoring result shape in
+ * `keeper.ts` flows through here automatically instead of needing to be kept in sync by hand.
+ */
+interface DupeGroupEvidence extends Record<string, unknown> {
+  groupId: string
+  keeperId: string
+  scores: ReturnType<typeof pickKeeper>['scores']
+  matchedBy: string[]
+  links: DupeLink[]
+  crossLibrary: boolean
+}
+
 function hasHashes(ctx: RuleContext): boolean {
   const row = ctx.db.prepare('SELECT COUNT(*) c FROM fs_entries WHERE quick_hash IS NOT NULL').get() as { c: number }
   return row.c > 0
+}
+
+/** The two matchers with a config `enabled` flag; every other matcher id has none. */
+function configEnabled(ctx: RuleContext, ruleId: string): boolean | null {
+  switch (ruleId) {
+    case 'dupe.runtime': return ctx.config.rules['dupe.runtime'].enabled
+    case 'dupe.fuzzy-title': return ctx.config.rules['dupe.fuzzy-title'].enabled
+    default: return null
+  }
+}
+
+/**
+ * Why a matcher would contribute nothing this pass, or `null` if there's no known reason it
+ * shouldn't run. Shared by `run()` (which silently skips an unavailable matcher's links) and
+ * `subRuns()` (which reports the same judgement as a `rule_runs` row) so the two can never
+ * disagree about which matchers actually ran.
+ */
+function unavailableReason(ctx: RuleContext, matcher: DupeRule): string | null {
+  if (matcher.requires.includes('hashes') && !hasHashes(ctx)) {
+    return 'no fs_entries row has a quick_hash yet — hashing is disabled or has not completed'
+  }
+  if (configEnabled(ctx, matcher.id) === false) return 'disabled in config'
+  return null
 }
 
 /**
@@ -26,20 +67,20 @@ function hasHashes(ctx: RuleContext): boolean {
  * into `PRAGMA query_only` for the exact duration of `run()`, so that write would throw
  * SQLITE_READONLY every pass. Rather than weaken that enforcement, the group data a write would
  * need (memberIds, tier, keeperId, scores) is carried entirely inside each finding's `evidence`
- * and `confidence`/`subjects`, and `persist()` below — which the runner calls separately, only
- * after `run()` has already succeeded and query_only is back off — reads it back out of those
- * findings and writes `dupe_groups` from them. No second pass over the database, no recomputation:
- * `persist()` is a pure reshape of what `run()` already produced.
+ * (see `DupeGroupEvidence`) and `confidence`/`subjects`, and `persist()` below — which the runner
+ * calls separately, only after `run()` has already succeeded and query_only is back off — reads it
+ * back out of those findings and writes `dupe_groups` from them. No second pass over the database,
+ * no recomputation: `persist()` is a pure reshape of what `run()` already produced.
  */
 export const dupeGroupRule: Rule = {
   id: 'dupe.group',
   class: 'duplicate',
   requires: ['jellyfin'],
   run(ctx: RuleContext): Finding[] {
-    const links = DUPE_RULES.flatMap((rule) => {
+    const links = DUPE_RULES.flatMap((matcher) => {
       // A matcher whose extra sources are absent contributes nothing rather than failing the group rule.
-      if (rule.requires.includes('hashes') && !hasHashes(ctx)) return []
-      try { return rule.link(ctx) } catch { return [] }
+      if (unavailableReason(ctx, matcher)) return []
+      try { return matcher.link(ctx) } catch { return [] }
     })
     const groups = buildDupeGroups(links)
     if (!groups.length) return []
@@ -71,6 +112,15 @@ export const dupeGroupRule: Rule = {
         .filter((r) => r.id !== keeperId)
         .reduce((sum, r) => sum + (r.size_bytes ?? 0), 0)
 
+      const evidence: DupeGroupEvidence = {
+        groupId: group.id,
+        keeperId,
+        scores,
+        matchedBy: [...new Set(group.links.map((l) => l.ruleId))],
+        links: group.links,
+        crossLibrary: new Set(rows.map((r) => r.library_name)).size > 1,
+      }
+
       findings.push({
         id: findingId('dupe.group', group.memberIds),
         ruleId: 'dupe.group',
@@ -78,14 +128,7 @@ export const dupeGroupRule: Rule = {
         severity: group.tier === 'exact' ? 'warning' : 'info',
         confidence: group.tier,
         subjects,
-        evidence: {
-          groupId: group.id,
-          keeperId,
-          scores,
-          matchedBy: [...new Set(group.links.map((l) => l.ruleId))],
-          links: group.links,
-          crossLibrary: new Set(rows.map((r) => r.library_name)).size > 1,
-        },
+        evidence,
         reclaimableBytes: reclaimable,
         status: 'open',
         firstSeen: ctx.now,
@@ -105,17 +148,37 @@ export const dupeGroupRule: Rule = {
     )
     for (const f of findings) {
       if (f.ruleId !== 'dupe.group') continue
+      const evidence = f.evidence as DupeGroupEvidence
       const memberIds = f.subjects
         .filter((s): s is Extract<Subject, { kind: 'item' }> => s.kind === 'item')
         .map((s) => s.id)
       insertGroup.run(
-        f.evidence.groupId,
+        evidence.groupId,
         f.confidence,
         JSON.stringify(memberIds),
-        f.evidence.keeperId,
-        JSON.stringify(f.evidence.scores),
+        evidence.keeperId,
+        JSON.stringify(evidence.scores),
         'open',
       )
     }
+  },
+
+  /**
+   * `dupe.group` is the only registered `Rule` for all six duplicate matchers, so without this,
+   * `rule_runs` can never distinguish "dupe.identical-file ran and found nothing" from "hashing is
+   * off, dupe.identical-file never ran" — the exact ambiguity `rule_runs` exists to prevent. One
+   * entry per matcher, using the same `unavailableReason` judgement `run()` itself acts on, so the
+   * two can't disagree; an available matcher reports the number of links it actually produced.
+   */
+  subRuns(ctx: RuleContext): SubRun[] {
+    return DUPE_RULES.map((matcher): SubRun => {
+      const reason = unavailableReason(ctx, matcher)
+      if (reason) return { ruleId: matcher.id, status: 'not-evaluated', reason }
+      try {
+        return { ruleId: matcher.id, status: 'evaluated', found: matcher.link(ctx).length }
+      } catch (err) {
+        return { ruleId: matcher.id, status: 'not-evaluated', reason: `matcher threw: ${(err as Error).message}` }
+      }
+    })
   },
 }
