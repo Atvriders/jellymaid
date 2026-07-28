@@ -1,0 +1,579 @@
+/*
+ * Jellymaid — visual direction: "inspection instrument"
+ * ------------------------------------------------------
+ * Jellymaid reads a library and permanently deletes things from it. The brief for this app asks
+ * for something that reads as precise and calm — an instrument, not a dashboard toy — where
+ * destructive affordances are unmistakable without the whole UI shouting.
+ *
+ * Concretely, that means:
+ *
+ *   - A light, cool "bench" surface instead of the near-black dashboard look most admin tools
+ *     default to. Dark admin chrome is itself the generic answer here; a paper-and-ink instrument
+ *     panel reads calmer and more legible for something an operator studies before approving.
+ *   - Monospace as the DISPLAY voice, not just for numbers. Every screen in this app is
+ *     fundamentally about reading exact, fixed-width facts — file paths, byte counts, guard ids,
+ *     timestamps — character for character. Setting the wordmark, nav and buttons in the same
+ *     monospace face as the data makes that literal instead of decorative.
+ *   - One recurring signature: the "inspection tag" — a small, sharp-cornered, uppercase label
+ *     used everywhere something has a verdict (severity, tier, guard outcome, connector health).
+ *     It borrows its shape from a museum conservation tag or a QC reject sticker: something
+ *     physically stapled to an item to record a judgement about it. The tag's weight escalates
+ *     with consequence — pass/info are a quiet tint, warn is a stronger tint, and outcomes that
+ *     actually block or delete get a solid, high-contrast fill. Nothing else in the UI competes
+ *     for that visual weight, so when something IS destructive, it is the loudest thing on the
+ *     screen without any screen being loud by default.
+ *   - "Not evaluated" gets its own identity (a hazard-striped amber notice), deliberately
+ *     different from both a quiet empty state and a red block tag — because treating "we didn't
+ *     check" the same as "we checked and found nothing" is the one framing this app must never
+ *     use by accident.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  /* Surfaces */
+  --surface: #e9ece9;
+  --panel: #ffffff;
+  --panel-alt: #f3f5f3;
+  --overlay: rgba(20, 24, 22, 0.5);
+
+  /* Ink */
+  --ink: #171b1a;
+  --ink-muted: #5a6564;
+  --ink-faint: #8a9392;
+
+  /* Structure */
+  --line: #ccd3d1;
+  --line-strong: #98a3a1;
+  --radius: 3px;
+
+  /* Accent (primary actions, focus, links, active nav) */
+  --accent: #1f6f6b;
+  --accent-strong: #16514e;
+  --accent-ink: #f4faf9;
+  --accent-tint: #e2f0ee;
+
+  /* Status: pass / ok */
+  --ok: #2e6a48;
+  --ok-tint: #e2f1e7;
+  --ok-line: #a9c9b6;
+
+  /* Status: warn / not-evaluated */
+  --warn: #7a5410;
+  --warn-tint: #f8edd6;
+  --warn-line: #d9b96c;
+  --warn-strong: #8a5a0c;
+
+  /* Status: block / destructive */
+  --danger: #8a2e22;
+  --danger-tint: #f5e2df;
+  --danger-line: #cf9a90;
+  --danger-strong: #7a2318;
+  --danger-ink: #fdf3f1;
+
+  --font-mono: ui-monospace, "SF Mono", "Menlo", "Consolas", "Liberation Mono", "Cascadia Mono", monospace;
+  --font-sans: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+
+  --shadow-panel: 0 1px 2px rgba(20, 24, 22, 0.08);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: #14181a;
+    --panel: #1b2123;
+    --panel-alt: #212a2b;
+    --overlay: rgba(0, 0, 0, 0.6);
+
+    --ink: #e8ece9;
+    --ink-muted: #a2adaa;
+    --ink-faint: #6f7a78;
+
+    --line: #333e3f;
+    --line-strong: #4a5758;
+
+    --accent: #4fb3ab;
+    --accent-strong: #6fc9c1;
+    --accent-ink: #06201e;
+    --accent-tint: #16302e;
+
+    --ok: #78c79a;
+    --ok-tint: #163024;
+    --ok-line: #2f5a44;
+
+    --warn: #e3b95a;
+    --warn-tint: #33270f;
+    --warn-line: #6b551f;
+    --warn-strong: #f0c877;
+
+    --danger: #e08e7f;
+    --danger-tint: #3a1f1a;
+    --danger-line: #6b3830;
+    --danger-strong: #c25d4a;
+    --danger-ink: #22110d;
+
+    --shadow-panel: 0 1px 2px rgba(0, 0, 0, 0.4);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--surface);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 0 0 0.5em;
+}
+
+code,
+kbd {
+  font-family: var(--font-mono);
+}
+
+button {
+  font-family: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* ---------- Buttons & fields ---------- */
+
+.btn {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0.6em 1em;
+  border-radius: var(--radius);
+  border: 1px solid var(--line-strong);
+  background: var(--panel);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent-strong);
+  color: var(--accent-ink);
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-strong);
+  color: var(--accent-ink);
+}
+
+.btn-quiet {
+  background: transparent;
+  border-color: transparent;
+  color: var(--ink-muted);
+}
+
+.btn-quiet:hover:not(:disabled) {
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+
+/* A destructive action gets the one solid, high-contrast treatment in the whole system. */
+.btn-danger {
+  background: var(--danger-strong);
+  border-color: var(--danger-strong);
+  color: var(--danger-ink);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: var(--danger-ink);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4em;
+  margin-bottom: 1.1em;
+}
+
+.field label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-muted);
+}
+
+.field input,
+.field select {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  padding: 0.55em 0.65em;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--panel);
+  color: var(--ink);
+}
+
+.field input:focus-visible,
+.field select:focus-visible {
+  outline-offset: 0;
+}
+
+/* ---------- Inspection tags — the app's one recurring signature ---------- */
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0.15em 0.5em;
+  border-radius: 2px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+  line-height: 1.6;
+}
+
+.tag-quiet {
+  background: var(--panel-alt);
+  border-color: var(--line);
+  color: var(--ink-muted);
+}
+
+.tag-ok {
+  background: var(--ok-tint);
+  border-color: var(--ok-line);
+  color: var(--ok);
+}
+
+.tag-warn {
+  background: var(--warn-tint);
+  border-color: var(--warn-line);
+  color: var(--warn-strong);
+}
+
+/* The one solid fill in the tag system: reserved for outcomes that actually block or destroy. */
+.tag-block {
+  background: var(--danger-strong);
+  border-color: var(--danger-strong);
+  color: var(--danger-ink);
+}
+
+/* ---------- App shell ---------- */
+
+.app-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  font-family: var(--font-mono);
+  color: var(--ink-muted);
+  letter-spacing: 0.04em;
+}
+
+.app-shell {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 0 1.25rem;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  box-shadow: var(--shadow-panel);
+  flex-wrap: wrap;
+}
+
+.wordmark {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding: 1rem 0;
+  color: var(--ink);
+}
+
+.nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.1rem;
+  margin-right: auto;
+}
+
+.nav-tab {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--ink-muted);
+  padding: 1rem 0.75rem;
+  cursor: pointer;
+}
+
+.nav-tab:hover {
+  color: var(--ink);
+}
+
+.nav-tab-active {
+  color: var(--accent-strong);
+  border-bottom-color: var(--accent);
+}
+
+.session {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 1rem 0;
+}
+
+.session-user {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+
+.main {
+  flex: 1;
+  padding: 1.5rem;
+  max-width: 72rem;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.screen-placeholder {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 2rem;
+}
+
+/* ---------- Login ---------- */
+
+.login-page {
+  min-height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
+}
+
+.login {
+  width: 100%;
+  max-width: 22rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-panel);
+  padding: 2rem;
+}
+
+.login h1 {
+  font-size: 18px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 1rem;
+  margin-bottom: 1.25rem;
+}
+
+.login .btn-primary {
+  width: 100%;
+  padding: 0.75em 1em;
+}
+
+.login .hint {
+  font-size: 13px;
+  color: var(--ink-muted);
+  border-top: 1px solid var(--line);
+  margin: 1.25rem 0 0;
+  padding-top: 1rem;
+}
+
+/* An alert reads as a printed "reject" slip: a hard left rule instead of a soft rounded banner,
+   with a mono status word so the operator's eye lands on the category before the sentence. */
+.alert {
+  display: flex;
+  gap: 0.6em;
+  align-items: baseline;
+  background: var(--danger-tint);
+  border: 1px solid var(--danger-line);
+  border-left: 3px solid var(--danger-strong);
+  border-radius: var(--radius);
+  color: var(--danger);
+  padding: 0.75em 0.9em;
+  margin: 0 0 1.1em;
+  font-size: 13.5px;
+}
+
+.alert-kind {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--danger-strong);
+  flex-shrink: 0;
+}
+
+/* ---------- Guard verdicts ---------- */
+
+.guards {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.guard {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.55rem 0.75rem;
+}
+
+.guard-name {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+
+.guard-reason {
+  font-size: 13.5px;
+  color: var(--ink);
+}
+
+.guard-override {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--danger);
+}
+
+/* ---------- Not-evaluated notice ----------
+   Deliberately its own thing: a hazard-striped left edge (borrowed from an "out of service" tag)
+   so a screen with zero findings because nothing ran cannot be mistaken, even at a glance, for a
+   screen with zero findings because everything ran clean. */
+
+.not-evaluated {
+  background: var(--warn-tint);
+  border: 1px solid var(--warn-line);
+  border-radius: var(--radius);
+  padding: 0.9rem 1rem 0.9rem 1.1rem;
+  margin: 0 0 1.25rem;
+  color: var(--warn-strong);
+  border-left-width: 10px;
+  border-left-style: solid;
+  border-left-color: var(--warn-line);
+  background-image: repeating-linear-gradient(
+    135deg,
+    var(--warn-line) 0,
+    var(--warn-line) 4px,
+    transparent 4px,
+    transparent 10px
+  );
+  background-size: 10px 100%;
+  background-repeat: no-repeat;
+  background-position: 0 0;
+}
+
+.not-evaluated > * {
+  margin-left: 0.4rem;
+}
+
+.not-evaluated strong {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  margin-bottom: 0.35em;
+}
+
+.not-evaluated ul {
+  margin: 0 0 0.5em;
+  padding-left: 1.1em;
+  font-size: 13.5px;
+}
+
+.not-evaluated p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--warn-strong);
+}
+
+.not-evaluated code {
+  font-size: 12px;
+  background: var(--panel);
+  border: 1px solid var(--warn-line);
+  border-radius: 2px;
+  padding: 0 0.3em;
+}
+
+/* ---------- Misc ---------- */
+
+.empty {
+  color: var(--ink-muted);
+  font-size: 13.5px;
+}
