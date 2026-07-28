@@ -30,6 +30,27 @@ export interface ArrMatch {
   path: string
 }
 
+export interface JellyfinOwnership {
+  /** The owning item's id, found in either `jellyfin_items.container_path` (the primary path) or
+   * `jellyfin_item_paths.container_path` (an alternate version). `null` when this path belongs to
+   * no Jellyfin item at all. */
+  itemId: string | null
+  /**
+   * True when this path is a merged item's ALTERNATE version — present in `jellyfin_item_paths`
+   * but not the item's own primary `container_path` — never true for the primary path itself.
+   * After a Jellyfin "Merge Versions", the alternate no longer has its own `jellyfin_items` row;
+   * it survives only inside the surviving item's MediaSources[]. Deleting it is therefore NOT a
+   * normal single-item delete: the executor must refresh (re-scan) the surviving item so Jellyfin
+   * drops the now-dead MediaSource reference, rather than deleting `itemId` outright — the
+   * surviving item is the version the operator chose to KEEP, and the primary is very often one
+   * of `siblingPaths`, so treating this like an ordinary delete would remove the wrong copy's
+   * metadata (or none at all, leaving Jellyfin holding a stale reference to deleted bytes).
+   */
+  isAlternateVersion: boolean
+  /** The item's other known container paths (primary and/or alternates), excluding this one. */
+  siblingPaths: string[]
+}
+
 export interface Resolution {
   path: string
   exists: boolean
@@ -40,6 +61,7 @@ export interface Resolution {
   hardlinks: string[]
   torrents: TorrentMatch[]
   arr: ArrMatch[]
+  jellyfin: JellyfinOwnership
   root: PathMapping | null
   /**
    * Every source this resolution could NOT verify, by label ('qbittorrent', 'radarr', 'sonarr').
@@ -123,7 +145,13 @@ export async function resolveTarget(deps: ResolveDeps, containerPath: string): P
       // the source is marked unavailable even though some records DID come back.
       if (!complete) sourcesUnavailable.push(label)
       for (const record of records) {
-        const mapped = record.arrPath ? deps.pathMap.toContainer(record.arrPath) ?? record.arrPath : null
+        // NULL, never the raw *arr path as a stand-in — same invariant `scan/phases/arr.ts`
+        // documents for this same data. A raw, untranslated path can coincidentally collide with
+        // a real container path under a DIFFERENT mapping (e.g. the target's own path, if the
+        // *arr path happens to equal it as a bare string); treating that collision as a match
+        // would flip `monitored: false` on an unrelated title and report a false "arr-managed"
+        // hit in the dry run. An unmapped record produces no match at all, not a guess.
+        const mapped = record.arrPath ? deps.pathMap.toContainer(record.arrPath) : null
         if (mapped && (mapped === containerPath || inodeSet.has(mapped))) {
           arr.push({ kind: record.kind, instance: record.instance, remoteId: record.remoteId, title: record.title, path: mapped })
         }
@@ -143,9 +171,50 @@ export async function resolveTarget(deps: ResolveDeps, containerPath: string): P
     hardlinks: hardlinks.sort(),
     torrents,
     arr,
+    jellyfin: resolveJellyfinOwnership(deps.db, containerPath),
     root: deps.pathMap.rootFor(containerPath),
     sourcesUnavailable,
   }
+}
+
+/**
+ * Looks the path up in `jellyfin_items.container_path` (the primary path) first, then in
+ * `jellyfin_item_paths.container_path` (an alternate version) — the same two-table shape
+ * `003_jellyfin_item_paths.sql` introduced so a merged item's alternate is distinguishable from a
+ * genuine orphan. Runs regardless of whether the path currently exists on disk: this is Jellyfin's
+ * OWN view of ownership, not a filesystem fact.
+ */
+function resolveJellyfinOwnership(db: Db, containerPath: string): JellyfinOwnership {
+  const primary = db.prepare('SELECT id FROM jellyfin_items WHERE container_path = ?').get(containerPath) as
+    | { id: string }
+    | undefined
+  if (primary) {
+    const siblings = (db.prepare(
+      'SELECT DISTINCT container_path FROM jellyfin_item_paths WHERE item_id = ? AND container_path IS NOT NULL AND container_path != ?',
+    ).all(primary.id, containerPath) as Array<{ container_path: string }>).map((r) => r.container_path)
+    return { itemId: primary.id, isAlternateVersion: false, siblingPaths: siblings.sort() }
+  }
+
+  const alt = db.prepare('SELECT item_id FROM jellyfin_item_paths WHERE container_path = ? LIMIT 1').get(containerPath) as
+    | { item_id: string }
+    | undefined
+  if (!alt) return { itemId: null, isAlternateVersion: false, siblingPaths: [] }
+
+  // Gathered from BOTH tables, not just jellyfin_item_paths: the primary path is expected to also
+  // appear there (the jellyfin phase writes every MediaSources[] path, including the primary), but
+  // reading it from jellyfin_items directly as well means a sibling is never missed if that ever
+  // isn't the case (an older row predating this table, or a source that omitted it).
+  const primaryRow = db.prepare('SELECT container_path FROM jellyfin_items WHERE id = ?').get(alt.item_id) as
+    | { container_path: string | null }
+    | undefined
+  const otherRows = (db.prepare(
+    'SELECT DISTINCT container_path FROM jellyfin_item_paths WHERE item_id = ? AND container_path IS NOT NULL AND container_path != ?',
+  ).all(alt.item_id, containerPath) as Array<{ container_path: string }>).map((r) => r.container_path)
+
+  const siblings = new Set(otherRows)
+  if (primaryRow?.container_path && primaryRow.container_path !== containerPath) siblings.add(primaryRow.container_path)
+
+  return { itemId: alt.item_id, isAlternateVersion: true, siblingPaths: [...siblings].sort() }
 }
 
 function matchTorrent(

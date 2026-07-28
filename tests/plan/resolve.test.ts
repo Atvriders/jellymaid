@@ -98,11 +98,28 @@ describe('resolveTarget', () => {
   it('matches *arr records by path', async () => {
     const r = await resolveTarget(deps({
       radarr: { inventory: async () => ({
-        records: [{ kind: 'radarr', instance: 'radarr', remoteId: 5, title: 'Heat', arrPath: media, monitored: true, seriesId: null, episodeId: null, episodeFileId: null }],
+        // A real *arr path lives in the Jellyfin-style namespace the path map translates, not
+        // already in container space — see the "does not match an untranslated path" test below
+        // for why a raw container-space string must NOT be treated as an equivalent stand-in.
+        records: [{ kind: 'radarr', instance: 'radarr', remoteId: 5, title: 'Heat', arrPath: '/media/Movies/Heat.mkv', monitored: true, seriesId: null, episodeId: null, episodeFileId: null }],
         complete: true,
       }) },
     }), media)
     expect(r.arr).toEqual([{ kind: 'radarr', instance: 'radarr', remoteId: 5, title: 'Heat', path: media }])
+  })
+
+  it('produces no ArrMatch for an *arr path that fails to translate, even when the raw string equals a real container path elsewhere', async () => {
+    const r = await resolveTarget(deps({
+      // arrPath here is a bare container-space string (in fact the target's own path) rather than
+      // anything the configured map translates. Falling back to using it as-is would produce a
+      // FALSE match — flipping `monitored: false` on an unrelated title and reporting a false
+      // "arr-managed" hit — so an untranslated path must match nothing at all.
+      radarr: { inventory: async () => ({
+        records: [{ kind: 'radarr', instance: 'radarr', remoteId: 7, title: 'Unrelated', arrPath: media, monitored: true, seriesId: null, episodeId: null, episodeFileId: null }],
+        complete: true,
+      }) },
+    }), media)
+    expect(r.arr).toEqual([])
   })
 
   it('records an unreachable service in sourcesUnavailable instead of pretending there are no torrents', async () => {
@@ -156,7 +173,7 @@ describe('resolveTarget', () => {
   it('still reports a match found inside a partial inventory, alongside flagging it unverifiable', async () => {
     const r = await resolveTarget(deps({
       sonarr: { inventory: async () => ({
-        records: [{ kind: 'sonarr', instance: 'sonarr', remoteId: 9, title: 'Heat S1E1', arrPath: media, monitored: true, seriesId: 1, episodeId: 2, episodeFileId: 9 }],
+        records: [{ kind: 'sonarr', instance: 'sonarr', remoteId: 9, title: 'Heat S1E1', arrPath: '/media/Movies/Heat.mkv', monitored: true, seriesId: 1, episodeId: 2, episodeFileId: 9 }],
         complete: false,
       }) },
     }), media)
@@ -167,6 +184,43 @@ describe('resolveTarget', () => {
   it('does not flag radarr/sonarr unavailable when both are simply unconfigured (null is a legitimate "not used")', async () => {
     const r = await resolveTarget(deps(), media)
     expect(r.sourcesUnavailable).toEqual([])
+  })
+
+  // --- Jellyfin ownership: a merged item's alternate version has no jellyfin_items row of its
+  // own, only a jellyfin_item_paths row, so the executor needs a way to tell "primary" from
+  // "alternate" apart rather than deleting the alternate as if it were an ordinary orphan. ---
+
+  describe('jellyfin ownership', () => {
+    const altPath = () => join(dir, 'lib', 'Heat-remux.mkv')
+
+    function seedMergedItem() {
+      writeFileSync(altPath(), 'y'.repeat(500))
+      db.prepare('INSERT INTO jellyfin_items (id, scan_id, type, name, container_path) VALUES (?,1,?,?,?)')
+        .run('item1', 'Movie', 'Heat', media)
+      // Mirrors what the jellyfin scan phase actually writes: one jellyfin_item_paths row per
+      // MediaSources[] entry, INCLUDING the primary path, not just the alternates.
+      db.prepare('INSERT INTO jellyfin_item_paths (item_id, scan_id, jf_path, container_path) VALUES (?,1,?,?)')
+        .run('item1', '/media/Movies/Heat.mkv', media)
+      db.prepare('INSERT INTO jellyfin_item_paths (item_id, scan_id, jf_path, container_path) VALUES (?,1,?,?)')
+        .run('item1', '/media/Movies/Heat-remux.mkv', altPath())
+    }
+
+    it('resolves the primary path as not-an-alternate and lists the alternate as a sibling', async () => {
+      seedMergedItem()
+      const r = await resolveTarget(deps(), media)
+      expect(r.jellyfin).toEqual({ itemId: 'item1', isAlternateVersion: false, siblingPaths: [altPath()] })
+    })
+
+    it('resolves an alternate path to the same item, flagged as an alternate, listing the primary as a sibling', async () => {
+      seedMergedItem()
+      const r = await resolveTarget(deps(), altPath())
+      expect(r.jellyfin).toEqual({ itemId: 'item1', isAlternateVersion: true, siblingPaths: [media] })
+    })
+
+    it('resolves a path in neither table to no item at all', async () => {
+      const r = await resolveTarget(deps(), media)
+      expect(r.jellyfin).toEqual({ itemId: null, isAlternateVersion: false, siblingPaths: [] })
+    })
   })
 })
 
