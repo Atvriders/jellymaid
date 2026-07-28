@@ -11,6 +11,7 @@ import type { ScanRunner } from './scan/runner.js'
 import type { PlannerDeps } from './plan/planner.js'
 import type { TrashDeps } from './plan/trash.js'
 import type { createExecutor } from './plan/executor.js'
+import type { PathMap } from './fs/pathmap.js'
 import { createLockout } from './auth/lockout.js'
 import { registerAuthRoutes } from './api/auth.js'
 import { registerHealthRoutes } from './api/health.js'
@@ -18,6 +19,7 @@ import { registerPathMapRoutes } from './api/pathmap.js'
 import { registerScanRoutes } from './api/scan.js'
 import { registerFindingsRoutes } from './api/findings.js'
 import { registerPlanRoutes } from './api/plans.js'
+import { registerExplorerRoutes } from './api/explorer.js'
 
 export interface ServerDeps {
   config: AppConfig
@@ -30,6 +32,10 @@ export interface ServerDeps {
   plannerDeps: () => PlannerDeps
   trashDeps: () => TrashDeps
   executor: ReturnType<typeof createExecutor>
+  /** Same long-lived instance the planner and executor use (src/index.ts) — the Explorer's
+   * containment check must be the identical `isWithinRoot` every destructive path already trusts,
+   * not a second instance built from a possibly-stale copy of the config. */
+  pathMap: PathMap
   /**
    * Where the built SPA (`client/dist`) lives. Optional so every existing route test keeps
    * building a server without ever having a client build on disk; defaults to the real build
@@ -80,6 +86,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     sessionSecret: deps.config.env.sessionSecret,
   })
   registerFindingsRoutes(app, { db: deps.db, sessionSecret: deps.config.env.sessionSecret })
+  registerExplorerRoutes(app, { db: deps.db, sessionSecret: deps.config.env.sessionSecret, pathMap: deps.pathMap })
   registerPlanRoutes(app, {
     db: deps.db,
     sessionSecret: deps.config.env.sessionSecret,

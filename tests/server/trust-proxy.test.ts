@@ -6,6 +6,7 @@ import { buildServer } from '../../src/server.js'
 import { openDb } from '../../src/index/db.js'
 import { createLogger } from '../../src/core/logger.js'
 import { loadConfig } from '../../src/config/load.js'
+import { createPathMap } from '../../src/fs/pathmap.js'
 
 /** Builds the real server off the real loader, so the TRUST_PROXY env value is exercised end to end. */
 function serverFor(trustProxyEnv?: string) {
@@ -29,6 +30,7 @@ function serverFor(trustProxyEnv?: string) {
     plannerDeps: (() => ({})) as never,
     trashDeps: (() => ({})) as never,
     executor: {} as never,
+    pathMap: createPathMap([]),
   })
   // The login lockout keys on req.ip; this echoes exactly the value it would key on.
   app.get('/__ip', async (req) => ({ ip: req.ip }))

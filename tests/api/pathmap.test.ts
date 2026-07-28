@@ -10,6 +10,7 @@ import { openDb } from '../../src/index/db.js'
 import { createLogger } from '../../src/core/logger.js'
 import { fileConfigSchema } from '../../src/config/schema.js'
 import { signSession } from '../../src/auth/session.js'
+import { createPathMap } from '../../src/fs/pathmap.js'
 import type { JellyfinItem } from '../../src/connectors/jellyfin.js'
 
 const SECRET = 'y'.repeat(32)
@@ -47,6 +48,7 @@ function app(items?: (opts: { startIndex: number; limit: number }) => Promise<{ 
     plannerDeps: (() => ({})) as never,
     trashDeps: (() => ({})) as never,
     executor: {} as never,
+    pathMap: createPathMap([]),
   })
 }
 

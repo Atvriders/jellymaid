@@ -6,6 +6,7 @@ import { buildServer } from '../../src/server.js'
 import { openDb } from '../../src/index/db.js'
 import { createLogger } from '../../src/core/logger.js'
 import { fileConfigSchema } from '../../src/config/schema.js'
+import { createPathMap } from '../../src/fs/pathmap.js'
 
 // Same stub-deps shape as tests/api/health.test.ts, plus `clientDir` pointing at a temp
 // directory containing a built SPA's index.html.
@@ -31,6 +32,7 @@ function testDeps(clientDir: string) {
     plannerDeps: (() => ({})) as never,
     trashDeps: (() => ({})) as never,
     executor: {} as never,
+    pathMap: createPathMap([]),
     clientDir,
   }
 }

@@ -89,7 +89,7 @@ const scheduler = createScheduler({
 })
 scheduler.start()
 
-const app = buildServer({ config, db, jellyfin, logger, scanRunner, plannerDeps, trashDeps, executor })
+const app = buildServer({ config, db, jellyfin, logger, scanRunner, plannerDeps, trashDeps, executor, pathMap })
 app.listen({ port: config.env.port, host: '0.0.0.0' })
   .then(() => logger.info('jellymaid listening', { port: config.env.port }))
   .catch((err) => { logger.error('failed to start', { err: (err as Error).message }); process.exit(1) })

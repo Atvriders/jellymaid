@@ -8,6 +8,7 @@ import { registerHealthRoutes } from '../../src/api/health.js'
 import { openDb } from '../../src/index/db.js'
 import { createLogger } from '../../src/core/logger.js'
 import { fileConfigSchema } from '../../src/config/schema.js'
+import { createPathMap } from '../../src/fs/pathmap.js'
 
 function testDeps(pingImpl: () => Promise<void>) {
   const dir = mkdtempSync(join(tmpdir(), 'jm-srv-'))
@@ -32,6 +33,7 @@ function testDeps(pingImpl: () => Promise<void>) {
     plannerDeps: (() => ({})) as never,
     trashDeps: (() => ({})) as never,
     executor: {} as never,
+    pathMap: createPathMap([]),
   }
 }
 
