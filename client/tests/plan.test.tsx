@@ -244,6 +244,37 @@ describe('PlanScreen', () => {
     expect(within(dryRun).queryByText(/undefined/i)).not.toBeInTheDocument()
   })
 
+  // --- MAJOR (regression): a terminal plan must not be a dead end once something new is queued ---
+  // Journey: execute plan p1 (terminal, `completed`) -> navigate to another screen and queue a
+  // DIFFERENT action -> navigate back to Plan. `planId` (lifted to App) still names p1, so this
+  // mount loads it via getPlan on mount exactly like the CRITICAL-1 test above, but `queued` is no
+  // longer empty. The old `{!plan ? <queue panel> : null}` rendering made the freshly queued action
+  // invisible and unbuildable the moment ANY plan — including a finished one with nothing left to
+  // do — was in view, with no control anywhere on the screen to get out of it short of a full page
+  // reload. A terminal plan must not block the queue panel from rendering.
+  it('shows the queue panel and a Build plan button for a newly queued action even though a completed plan is already in view', async () => {
+    const getPlan = vi.fn(async () => plan({ status: 'completed' }))
+    const createPlan = vi.fn(async () => plan({ id: 'p2', status: 'draft' }))
+    const freshlyQueued: RequestedAction[] = [{ type: 'delete-junk-file', targetPath: '/mnt/m/Other.nfo' }]
+    render(
+      <PlanScreen
+        api={api({ getPlan, createPlan })}
+        queued={freshlyQueued}
+        onClear={() => {}}
+        planId="p1"
+        onPlanIdChange={() => {}}
+      />,
+    )
+    // The completed plan from before is still shown, not silently dropped.
+    expect(await screen.findByText('p1')).toBeInTheDocument()
+    expect(screen.getByText('completed')).toBeInTheDocument()
+    // The newly queued action — for a DIFFERENT file — must actually be visible...
+    expect(await screen.findByText('/mnt/m/Other.nfo')).toBeInTheDocument()
+    // ...and buildable, not stranded with no controls anywhere on the screen.
+    await userEvent.click(await screen.findByRole('button', { name: /build plan/i }))
+    expect(createPlan).toHaveBeenCalledWith(freshlyQueued)
+  })
+
   it('renders the directories-swept figure when the plan actually computed one', async () => {
     const createPlan = vi.fn(async () => plan({
       dryRun: { deleteCount: 1, bytesFreed: 0, torrentsRemoved: 0, blockedCount: 0, directoriesSwept: 2 },

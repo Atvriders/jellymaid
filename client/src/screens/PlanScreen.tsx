@@ -245,6 +245,22 @@ export function PlanScreen({ api, queued, onClear, planId, onPlanIdChange }: {
   const hasOverridesSelected = Object.values(overridesByAction).some((list) => list.length > 0)
   const hasExecutableAction = plan?.actions.some((a) => a.status === 'pending') ?? false
 
+  /**
+   * MAJOR regression fix: a plan reaches `completed` or `failed` (src/plan/executor.ts's
+   * `ExecutionSummary.status` union, and the only two statuses `runPlan` ever writes once a plan
+   * leaves `running`) and then never changes again — there is no rebuild/approve/execute control
+   * left for it anywhere below, by design. Before this, the queue panel rendered only when there
+   * was NO plan in view at all (`!plan`), so an operator who executed p1, then queued a different
+   * action from Findings/Duplicates/Explorer and navigated back here, found the finished p1 filling
+   * the whole screen with zero controls: the newly queued action was invisible and unbuildable, with
+   * no way out but a full page reload. A plan that is still `draft`/`approved` deliberately does NOT
+   * get this treatment — that plan has its own live rebuild/approve/execute controls below, and
+   * showing the queue panel alongside it would let a stray "Build plan" click blow away the
+   * in-progress plan's on-screen state while it still has undecided work.
+   */
+  const planIsTerminal = plan !== null && (plan.status === 'completed' || plan.status === 'failed')
+  const showQueuePanel = queued.length > 0 && (!plan || planIsTerminal)
+
   if (loadingPlan) {
     return <EmptyState>Loading plan…</EmptyState>
   }
@@ -259,10 +275,13 @@ export function PlanScreen({ api, queued, onClear, planId, onPlanIdChange }: {
 
   return (
     <div className="plan-screen">
-      {!plan ? (
+      {showQueuePanel ? (
         <section className="panel plan-queue">
           <h2>Queued actions</h2>
-          <p>{queued.length} action{queued.length === 1 ? '' : 's'} queued, not yet planned.</p>
+          <p>
+            {queued.length} action{queued.length === 1 ? '' : 's'} queued, not yet planned.
+            {plan ? ' Building starts a new plan — it does not change the one below.' : ''}
+          </p>
           <ul className="plan-queue-list">
             {queued.map((a, i) => (
               // Index is stable for the lifetime of this unbuilt queue (it only ever changes by a
