@@ -78,6 +78,29 @@ describe('resolveTarget', () => {
     expect(r.torrents.map((t) => t.matchedBy)).toEqual(['path'])
   })
 
+  it('does not match a torrent that merely shares a save directory with the target', async () => {
+    // savePath is the directory the torrent was saved INTO, which every other torrent saved beside
+    // it shares. Matching on it alone made deleting one unrelated file in a download directory
+    // resolve to a torrent that has nothing to do with it — and the executor removes matched
+    // torrents WITH THEIR DATA.
+    const stranger = join(dir, 'dl', 'Unrelated.mkv')
+    writeFileSync(stranger, 'u')
+    const r = await resolveTarget(deps({
+      qbittorrent: { torrents: async () => [torrent({ contentPath: '/downloads/Heat.mkv', savePath: '/downloads' })] },
+    }), stranger)
+    expect(r.torrents).toEqual([])
+  })
+
+  it('matches a file inside a multi-file torrent through its content path', async () => {
+    mkdirSync(join(dir, 'dl', 'Heat'), { recursive: true })
+    const inside = join(dir, 'dl', 'Heat', 'CD1.mkv')
+    writeFileSync(inside, 'c')
+    const r = await resolveTarget(deps({
+      qbittorrent: { torrents: async () => [torrent({ contentPath: '/downloads/Heat', savePath: '/downloads' })] },
+    }), inside)
+    expect(r.torrents.map((t) => t.matchedBy)).toEqual(['path'])
+  })
+
   it('finds two torrents on one inode — the cross-seed case', async () => {
     linkSync(media, linked)
     const r = await resolveTarget(deps({
@@ -105,7 +128,11 @@ describe('resolveTarget', () => {
         complete: true,
       }) },
     }), media)
-    expect(r.arr).toEqual([{ kind: 'radarr', instance: 'radarr', remoteId: 5, title: 'Heat', path: media }])
+    // `arrPath` is carried verbatim beside the translated container path: it is the string the
+    // connector's own unmonitorByPath matches on, and the executor must hand back exactly it.
+    expect(r.arr).toEqual([
+      { kind: 'radarr', instance: 'radarr', remoteId: 5, title: 'Heat', path: media, arrPath: '/media/Movies/Heat.mkv' },
+    ])
   })
 
   it('produces no ArrMatch for an *arr path that fails to translate, even when the raw string equals a real container path elsewhere', async () => {
@@ -177,7 +204,9 @@ describe('resolveTarget', () => {
         complete: false,
       }) },
     }), media)
-    expect(r.arr).toEqual([{ kind: 'sonarr', instance: 'sonarr', remoteId: 9, title: 'Heat S1E1', path: media }])
+    expect(r.arr).toEqual([
+      { kind: 'sonarr', instance: 'sonarr', remoteId: 9, title: 'Heat S1E1', path: media, arrPath: '/media/Movies/Heat.mkv' },
+    ])
     expect(r.sourcesUnavailable).toContain('sonarr')
   })
 

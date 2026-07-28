@@ -1,5 +1,5 @@
 import { statSync } from 'node:fs'
-import { join } from 'node:path'
+import { sep } from 'node:path'
 import type { Db } from '../index/db.js'
 import type { PathMap } from '../fs/pathmap.js'
 import type { PathMapping } from '../core/types.js'
@@ -27,7 +27,19 @@ export interface ArrMatch {
   instance: string
   remoteId: number
   title: string
+  /** The container path this record resolves to — the path Jellymaid would delete. */
   path: string
+  /**
+   * The path EXACTLY as the *arr itself reported it, before the path map translated it. Both
+   * connectors' `unmonitorByPath` match on this string (`x.rec.arrPath === path`), and the two
+   * namespaces routinely differ — Radarr says `/movies/Heat.mkv`, the container sees
+   * `/mnt/media/movies/Heat.mkv`. Handing the container path to `unmonitorByPath` would find no
+   * record, return `not-managed`, and read as "nothing to unmonitor" for a file that is very much
+   * monitored: the file gets deleted and the *arr re-grabs it. Carried verbatim rather than
+   * reversed through the path map, because `fromContainer` can legitimately pick a different
+   * mapping than `toContainer` came in on when two mappings share a container root.
+   */
+  arrPath: string
 }
 
 export interface JellyfinOwnership {
@@ -152,8 +164,11 @@ export async function resolveTarget(deps: ResolveDeps, containerPath: string): P
         // would flip `monitored: false` on an unrelated title and report a false "arr-managed"
         // hit in the dry run. An unmapped record produces no match at all, not a guess.
         const mapped = record.arrPath ? deps.pathMap.toContainer(record.arrPath) : null
-        if (mapped && (mapped === containerPath || inodeSet.has(mapped))) {
-          arr.push({ kind: record.kind, instance: record.instance, remoteId: record.remoteId, title: record.title, path: mapped })
+        if (mapped && record.arrPath && (mapped === containerPath || inodeSet.has(mapped))) {
+          arr.push({
+            kind: record.kind, instance: record.instance, remoteId: record.remoteId,
+            title: record.title, path: mapped, arrPath: record.arrPath,
+          })
         }
       }
     } catch {
@@ -243,7 +258,20 @@ function matchTorrent(
     } catch { /* not present on disk right now */ }
   }
 
-  if (contentContainer === target) return [{ ...base, matchedBy: 'path' }]
-  if (saveContainer && target.startsWith(join(saveContainer, ''))) return [{ ...base, matchedBy: 'path' }]
+  // `contentPath` is the torrent's OWN data — the file itself for a single-file torrent, the
+  // torrent's folder for a multi-file one — so containment under it is proof the target belongs to
+  // this torrent.
+  if (contentContainer && (target === contentContainer || target.startsWith(`${contentContainer}${sep}`))) {
+    return [{ ...base, matchedBy: 'path' }]
+  }
+  // `savePath` is only the DIRECTORY the torrent was saved into, which every other torrent saved
+  // beside it shares. It is a last resort for a torrent whose contentPath is missing or unmappable,
+  // never a general rule: used generally, deleting one unrelated file in a download directory
+  // resolves to every torrent in it, and the executor removes those torrents WITH THEIR DATA. The
+  // separator is explicit for the same reason `isWithinRoot` insists on one — a bare `startsWith`
+  // makes `/downloads/heat-extras.mkv` look like it lives inside `/downloads/heat`.
+  if (!contentContainer && saveContainer && target.startsWith(`${saveContainer}${sep}`)) {
+    return [{ ...base, matchedBy: 'path' }]
+  }
   return []
 }

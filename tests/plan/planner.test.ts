@@ -177,7 +177,7 @@ describe('buildPlan', () => {
 
   it('marks a guard-blocked action blocked and counts it', async () => {
     const plan = await buildPlan(deps({
-      qbittorrent: { torrents: async () => [torrent({ state: 'downloading' })] },
+      qbittorrent: { torrents: async () => [torrent({ state: 'downloading', contentPath: '/downloads/A.mkv' })] },
     }), { createdBy: 'bob', actions: [{ type: 'delete-media', targetPath: a }] })
     expect(plan.actions[0]!.status).toBe('blocked')
     expect(plan.dryRun.blockedCount).toBe(1)
@@ -186,7 +186,7 @@ describe('buildPlan', () => {
   it('leaves an action pending when an overridable guard is overridden', async () => {
     const plan = await buildPlan(deps({
       config: fileConfigSchema.parse({ guards: { minRatio: 10 } }),
-      qbittorrent: { torrents: async () => [torrent({ isPrivate: true, ratio: 1 })] },
+      qbittorrent: { torrents: async () => [torrent({ isPrivate: true, ratio: 1, contentPath: '/downloads/A.mkv' })] },
     }), { createdBy: 'bob', actions: [{ type: 'delete-media', targetPath: a, overrides: ['guard.private-ratio'] }] })
     expect(plan.actions[0]!.status).toBe('pending')
   })
@@ -194,7 +194,7 @@ describe('buildPlan', () => {
   it('records the override in the persisted action', async () => {
     await buildPlan(deps({
       config: fileConfigSchema.parse({ guards: { minRatio: 10 } }),
-      qbittorrent: { torrents: async () => [torrent({ isPrivate: true, ratio: 1 })] },
+      qbittorrent: { torrents: async () => [torrent({ isPrivate: true, ratio: 1, contentPath: '/downloads/A.mkv' })] },
     }), { createdBy: 'bob', actions: [{ type: 'delete-media', targetPath: a, overrides: ['guard.private-ratio'] }] })
     const row = db.prepare('SELECT override_by, payload_json FROM plan_actions').get() as { override_by: string; payload_json: string }
     expect(row.override_by).toBe('bob')
@@ -280,7 +280,7 @@ describe('approvePlan', () => {
 
   it('refuses to approve a plan whose every action is blocked', async () => {
     const plan = await buildPlan(deps({
-      qbittorrent: { torrents: async () => [torrent({ state: 'downloading' })] },
+      qbittorrent: { torrents: async () => [torrent({ state: 'downloading', contentPath: '/downloads/A.mkv' })] },
     }), { createdBy: 'bob', actions: [{ type: 'delete-media', targetPath: a }] })
     expect(() => approvePlan(db, plan.id, 'bob')).toThrow(/no executable actions/i)
   })
