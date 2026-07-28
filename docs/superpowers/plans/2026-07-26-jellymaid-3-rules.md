@@ -933,7 +933,12 @@ const runtimeRule: DupeRule = {
     const cfg = ctx.config.rules['dupe.runtime']
     if (!cfg.enabled) return []
     const tolerance = cfg.toleranceSeconds * TICKS_PER_SECOND
-    const rows = loadItems(ctx).filter((r) => r.runtime_ticks !== null)
+    // Movies only, like every other title-keyed rule. Unrelated shows reuse generic
+    // episode titles that normalization passes through verbatim ("Pilot", "Part 1") and
+    // broadcast content is cut to standard slot lengths, so episodes would link across
+    // series on title+runtime alone. Episode duplicates are covered exactly by
+    // dupe.series-episode and dupe.identical-file.
+    const rows = loadItems(ctx).filter((r) => r.type === 'Movie' && r.runtime_ticks !== null)
     const out: DupeLink[] = []
     for (const [, group] of bucket(rows, (r) => normalizeTitle(r.name) || null)) {
       for (let i = 0; i < group.length; i += 1) {
