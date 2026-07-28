@@ -62,15 +62,33 @@ export const jellyfinPhase: Phase = {
       const pathRows: unknown[][] = []
       for (const i of page.items) {
         const lib = i.jfPath ? libraryByLocation.find((l) => i.jfPath!.startsWith(l.location)) : undefined
+
+        // Every DISTINCT jf_path behind this item, translated exactly once. `mediaSourcePaths`
+        // deliberately includes the primary source (see the connector), so for an ordinary
+        // single-version item `jfPath` and its one media source are usually the identical string.
+        // Translating that string twice — once here, once again inside a second loop over
+        // `mediaSourcePaths` — would count one real unmapped file as two. Building the distinct
+        // set up front and translating each member once, rather than skipping only the "is this
+        // literally the primary" case, also gets a merged item's genuinely-repeated alternate
+        // paths right without needing a second special case.
+        const distinctPaths = new Set<string>()
+        if (i.jfPath) distinctPaths.add(i.jfPath)
+        // Test doubles built directly (not through the real connector) may omit this field
+        // entirely; treat absent exactly like empty rather than throwing on `undefined`.
+        for (const p of i.mediaSourcePaths ?? []) distinctPaths.add(p)
+
         // An item Jellyfin gave a path for that no mapping covers lands here with a NULL
         // container_path — indistinguishable, downstream, from an item that never had a path at
         // all (a Series or Season row). Counted so Plans 3-4 can tell a degraded index from an
         // empty one. Items with no jfPath are not counted: there was nothing to translate.
-        let containerPath: string | null = null
-        if (i.jfPath) {
-          containerPath = ctx.deps.pathMap.toContainer(i.jfPath)
-          if (containerPath === null) unmapped += 1
+        const containerPathByJfPath = new Map<string, string | null>()
+        for (const p of distinctPaths) {
+          const resolved = ctx.deps.pathMap.toContainer(p)
+          containerPathByJfPath.set(p, resolved)
+          if (resolved === null) unmapped += 1
         }
+
+        const containerPath = i.jfPath ? containerPathByJfPath.get(i.jfPath)! : null
         rows.push([
           i.id, ctx.scanId, i.type, i.name, i.sortName, i.year, i.seriesId, i.seriesName, i.seasonNo, i.episodeNo,
           JSON.stringify(i.providerIds), i.jfPath, containerPath,
@@ -78,12 +96,8 @@ export const jellyfinPhase: Phase = {
           i.width, i.height, i.bitrate, i.hasPrimaryImage ? 1 : 0,
           lib?.id ?? null, lib?.name ?? null, i.dateCreated, i.mediaSourceId,
         ])
-        // Test doubles built directly (not through the real connector) may omit this field
-        // entirely; treat absent exactly like empty rather than throwing on `undefined`.
         for (const jfPath of i.mediaSourcePaths ?? []) {
-          const itemContainerPath = ctx.deps.pathMap.toContainer(jfPath)
-          if (itemContainerPath === null) unmapped += 1
-          pathRows.push([i.id, ctx.scanId, jfPath, itemContainerPath])
+          pathRows.push([i.id, ctx.scanId, jfPath, containerPathByJfPath.get(jfPath)!])
         }
       }
       writeBatch(rows, pathRows)
@@ -129,13 +143,20 @@ export const jellyfinPhase: Phase = {
 
     // Items Jellyfin no longer returns were removed from the library; drop their rows so
     // the duplicate and metadata rules do not reason about entries that no longer exist.
-    const stale = ctx.db.prepare('DELETE FROM jellyfin_items WHERE scan_id != ?').run(ctx.scanId).changes
-    // Same licence as the sweep above — reached only once every completeness/shrink check this
-    // function performs has already passed for THIS pass. Not a second, independently-reasoned
-    // gate: jellyfin_item_paths is exactly as trustworthy as jellyfin_items for a given pass,
-    // since both are written from the same fetched pages, so there is nothing to license
-    // separately here.
-    ctx.db.prepare('DELETE FROM jellyfin_item_paths WHERE scan_id != ?').run(ctx.scanId)
+    //
+    // Both deletes run inside ONE transaction, not as two independent autocommit statements: a
+    // crash between them would otherwise leave jellyfin_item_paths rows whose parent item is
+    // already gone — exactly the "path present, item absent" shape that would make an orphaned
+    // file's path still resolve via jellyfin_item_paths and suppress a genuine fs.orphan-media
+    // finding until the next fully-completed scan swept it too. The gate above already licenses
+    // sweeping both tables together (same completeness/shrink checks, no second licence); this
+    // just makes the two deletes land together as well, restoring the single-statement atomicity
+    // that existed before jellyfin_item_paths was introduced.
+    const stale = ctx.db.transaction(() => {
+      const changes = ctx.db.prepare('DELETE FROM jellyfin_items WHERE scan_id != ?').run(ctx.scanId).changes
+      ctx.db.prepare('DELETE FROM jellyfin_item_paths WHERE scan_id != ?').run(ctx.scanId)
+      return changes
+    })()
     return { status: 'completed', counts: { items: written, stale, unmapped } }
   },
 }

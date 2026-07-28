@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -203,6 +203,53 @@ describe('jellyfinPhase', () => {
     expect(res.counts.unmapped).toBe(1)
   })
 
+  it('does not double-count an ordinary single-version item\'s one unmapped path as two', async () => {
+    // mediaSourcePaths deliberately includes the primary source, so for a normal item with a
+    // single version, jfPath and its one media source are the identical string. Translating that
+    // string twice (once for the item row, once inside the media-source loop) must not increment
+    // `unmapped` twice for what is, on disk, one real unmapped file.
+    const jf = {
+      virtualFolders: async () => [],
+      items: async () => ({
+        totalRecordCount: 1,
+        items: [{
+          id: 'solo1', type: 'Movie', name: 'Heat', sortName: null, year: 1995,
+          seriesId: null, seriesName: null, seasonNo: null, episodeNo: null, providerIds: {},
+          jfPath: '/media/Movies/Heat.mkv', mediaSourcePaths: ['/media/Movies/Heat.mkv'],
+          sizeBytes: 10, runtimeTicks: 1, container: 'mkv', videoCodec: 'h264', audioCodec: 'aac',
+          audioChannels: 2, width: 1920, height: 1080, bitrate: 100, hasPrimaryImage: true,
+          dateCreated: null, mediaSourceId: 'ms1',
+        }],
+      }),
+    }
+    // No path mapping configured at all — the primary (and its one, identical media source) is
+    // genuinely unmapped.
+    const res = await jellyfinPhase.run(ctx({ jellyfin: jf as never }))
+    expect(res.status).toBe('completed')
+    expect(res.counts.unmapped).toBe(1)
+  })
+
+  it('counts a merged item\'s two distinct unmapped alternate paths as two, not more', async () => {
+    const jf = {
+      virtualFolders: async () => [],
+      items: async () => ({
+        totalRecordCount: 1,
+        items: [{
+          id: 'merged2', type: 'Movie', name: 'Heat', sortName: null, year: 1995,
+          seriesId: null, seriesName: null, seasonNo: null, episodeNo: null, providerIds: {},
+          jfPath: '/media/Movies/Heat.mkv',
+          mediaSourcePaths: ['/media/Movies/Heat.mkv', '/media/Movies/Heat.2160p.mkv'],
+          sizeBytes: 10, runtimeTicks: 1, container: 'mkv', videoCodec: 'h264', audioCodec: 'aac',
+          audioChannels: 2, width: 1920, height: 1080, bitrate: 100, hasPrimaryImage: true,
+          dateCreated: null, mediaSourceId: 'ms1',
+        }],
+      }),
+    }
+    const res = await jellyfinPhase.run(ctx({ jellyfin: jf as never }))
+    expect(res.status).toBe('completed')
+    expect(res.counts.unmapped).toBe(2)
+  })
+
   it('sweeps jellyfin_item_paths under the exact same completeness gate as jellyfin_items — never a separate licence', async () => {
     seedPriorItem()
     db.prepare(`INSERT INTO jellyfin_item_paths (item_id, scan_id, jf_path, container_path)
@@ -234,6 +281,30 @@ describe('jellyfinPhase', () => {
     const res = await jellyfinPhase.run(ctx({ jellyfin: pages(3) as never }))
     expect(res.status).toBe('completed')
     expect(db.prepare("SELECT COUNT(*) c FROM jellyfin_item_paths WHERE item_id = 'old'").get()).toEqual({ c: 0 })
+  })
+
+  it('sweeps jellyfin_items and jellyfin_item_paths atomically — a failure sweeping paths rolls the items sweep back too', async () => {
+    // Without a shared transaction, a crash between the two DELETEs would leave a
+    // jellyfin_item_paths row whose parent item is already gone — "path present, item absent" —
+    // which would keep resolving an orphaned file's path via jellyfin_item_paths and suppress a
+    // genuine fs.orphan-media finding until some later, fully-completed scan swept it too.
+    seedPriorItem()
+    db.prepare(`INSERT INTO jellyfin_item_paths (item_id, scan_id, jf_path, container_path)
+                VALUES ('old', 0, '/media/Movies/Old.mkv', '/mnt/m/Old.mkv')`).run()
+
+    const realPrepare = db.prepare.bind(db)
+    const spy = vi.spyOn(db, 'prepare').mockImplementation(((sql: string) => {
+      if (sql.includes('DELETE FROM jellyfin_item_paths')) throw new Error('boom')
+      return realPrepare(sql)
+    }) as typeof db.prepare)
+
+    await expect(jellyfinPhase.run(ctx({ jellyfin: pages(3) as never }))).rejects.toThrow('boom')
+    spy.mockRestore()
+
+    // Neither delete took effect, even though the items delete ran first and succeeded before the
+    // paths delete threw: the whole sweep rolled back as one unit.
+    expect(db.prepare("SELECT COUNT(*) c FROM jellyfin_items WHERE id = 'old'").get()).toEqual({ c: 1 })
+    expect(db.prepare("SELECT COUNT(*) c FROM jellyfin_item_paths WHERE item_id = 'old'").get()).toEqual({ c: 1 })
   })
 
   it('does not sweep when a resumed fetch reports a total lower than the cursor recorded — the library shrank during the gap', async () => {
