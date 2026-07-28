@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { Api, Confidence, Finding, FindingClass, FindingStatus, RequestedAction, Severity } from '../api.js'
 import { CONFIDENCES, FINDING_CLASSES, SEVERITIES } from '../api.js'
 import { useAsync } from '../hooks.js'
@@ -29,13 +29,36 @@ function orUndefined<T extends string>(v: T | ''): T | undefined {
  * quality rule ids) is informational and MUST queue nothing. Returning `null` is that contract,
  * not a missing case.
  */
-export function actionForFinding(f: { ruleId: string; subjects: Array<{ path?: string }> }): RequestedAction | null {
+export function actionForFinding(
+  f: { ruleId: string; subjects: Array<{ path?: string }>; evidence?: Record<string, unknown> },
+): RequestedAction | null {
   const path = f.subjects[0]?.path
   if (!path) return null
   if (f.ruleId === 'fs.empty-folder') return { type: 'remove-empty-folder', targetPath: path }
-  if (f.ruleId === 'fs.junk' || f.ruleId === 'fs.stray-sidecar') return { type: 'delete-junk-file', targetPath: path }
+  if (f.ruleId === 'fs.junk') {
+    // `fs.junk` also flags directories (src/rules/filesystem/index.ts's junkRule, matched against
+    // the configured `directoryNames`, default `['proof','screens','sample']`) — distinguishable
+    // only by `evidence.reason === 'junk directory'`, the one reason string it emits for a
+    // directory match; every other reason ('sample file', 'incomplete download (...)', 'zero-byte
+    // media file') is a file. `delete-junk-file` fails closed on anything that is not a regular
+    // file (src/plan/executor.ts's `deleteTarget`), so nothing would actually be destroyed by
+    // queuing one of these — but offering the checkbox anyway would still be a false affordance.
+    // There is no `remove-junk-folder` action type yet, so a junk directory stays informational.
+    if (f.evidence?.reason === 'junk directory') return null
+    return { type: 'delete-junk-file', targetPath: path }
+  }
+  if (f.ruleId === 'fs.stray-sidecar') return { type: 'delete-junk-file', targetPath: path }
   if (f.ruleId === 'fs.orphan-media') return { type: 'delete-media', targetPath: path }
   return null // metadata and quality findings are informational; they queue nothing
+}
+
+/** `evidence.reason` is the one field every filesystem rule sets to explain WHY a finding exists
+ * ('sample file', 'junk directory', 'incomplete download (.part)', 'zero-byte media file', ...) —
+ * the decision-relevant fact for an operator about to authorise a permanent delete. It is
+ * untrusted filesystem-derived text like everything else on this row, so this only ever hands
+ * back a plain string for a text node, never anything rendered as markup. */
+function evidenceReason(evidence: Record<string, unknown>): string | null {
+  return typeof evidence.reason === 'string' ? evidence.reason : null
 }
 
 /**
@@ -59,6 +82,15 @@ export function Findings({ api, onQueue }: { api: FindingsApi; onQueue: (actions
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [dismissingId, setDismissingId] = useState<string | null>(null)
   const [reasonText, setReasonText] = useState('')
+
+  // A selection is only ever meaningful against the list it was made from. Without this, checking
+  // a row, then changing a filter, leaves `selected` holding an id that is not even present in the
+  // new `list.data.findings` — "Add to plan" still looks armed, but `handleAddToPlan` below can
+  // only iterate the NEW list, finds none of the selected ids in it, and fires `onQueue([])`: a
+  // positive-looking click that queues nothing.
+  useEffect(() => {
+    setSelected(new Set())
+  }, [filters.class, filters.severity, filters.confidence, filters.status])
 
   function toggleSelected(id: string) {
     setSelected((prev) => {
@@ -167,7 +199,12 @@ export function Findings({ api, onQueue }: { api: FindingsApi; onQueue: (actions
       ) : (
         <>
           <p className="findings-count">
-            {list.data.total} matching finding{list.data.total === 1 ? '' : 's'}
+            {/* `api.findings()` is called with no `limit`, so the server applies its own
+                `default(100)` — the count line must say so rather than implying every matching
+                finding is on screen. */}
+            {list.data.findings.length < list.data.total
+              ? `Showing ${list.data.findings.length} of ${list.data.total}`
+              : `${list.data.total} matching finding${list.data.total === 1 ? '' : 's'}`}
           </p>
           <table className="table findings-table">
             <thead>
@@ -178,6 +215,7 @@ export function Findings({ api, onQueue }: { api: FindingsApi; onQueue: (actions
                 <th scope="col">Severity</th>
                 <th scope="col">Confidence</th>
                 <th scope="col">Subject</th>
+                <th scope="col">Reason</th>
                 <th scope="col">Reclaimable</th>
                 <th scope="col">Status</th>
                 <th scope="col">Dismiss</th>
@@ -210,6 +248,11 @@ export function Findings({ api, onQueue }: { api: FindingsApi; onQueue: (actions
                       {f.subjects.map((s, i) => (
                         <div key={`${f.id}-subject-${i}`} className="subject-path">{s.label}</div>
                       ))}
+                    </td>
+                    <td>
+                      {/* evidence.reason is untrusted filesystem-derived text — a text node only,
+                          same discipline as the subject path above. */}
+                      {evidenceReason(f.evidence) ?? '—'}
                     </td>
                     <td><Bytes value={f.reclaimableBytes} /></td>
                     <td>{f.status}</td>

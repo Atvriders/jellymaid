@@ -1,5 +1,15 @@
 export class ApiError extends Error {
-  constructor(public readonly status: number, message: string) { super(message); this.name = 'ApiError' }
+  /**
+   * The parsed response body, additive alongside `status`/`message` so existing callers (which
+   * only ever read those two) are unaffected. Some refusals are domain statements, not bare
+   * errors — e.g. `/api/scan/start`'s 412 sends `{ error, forcible: true }` — and a caller that
+   * needs the rest of the statement should read it from here rather than re-deriving it from the
+   * status code alone, which only tells you THAT the server refused, not what it said.
+   */
+  constructor(public readonly status: number, message: string, public readonly body: unknown = undefined) {
+    super(message)
+    this.name = 'ApiError'
+  }
 }
 
 // Mirrors src/core/types.ts. Duplicated here (not imported) because the client is its own
@@ -194,7 +204,7 @@ export function createApi(opts: { baseUrl: string; fetchImpl?: typeof fetch }) {
     })
     const text = await res.text()
     const body = text ? JSON.parse(text) : {}
-    if (!res.ok) throw new ApiError(res.status, (body as { error?: string }).error ?? `HTTP ${res.status}`)
+    if (!res.ok) throw new ApiError(res.status, (body as { error?: string }).error ?? `HTTP ${res.status}`, body)
     return body as T
   }
 

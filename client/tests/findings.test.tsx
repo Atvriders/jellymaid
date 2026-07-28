@@ -16,11 +16,26 @@ const api = (over = {}) => ({
   ...over,
 } as never)
 
+// Mirrors src/rules/registry.ts's ALL_RULES ids as of this task. Not imported — the client is its
+// own package that does not reach into ../../src (see api.ts's comment on the same constraint).
+// `dupe.identical-file`, `dupe.title-year` etc. are NOT in this list: they are `dupe.group`'s
+// internal matcher ids (see src/rules/dupes/adapter.ts), never registered as their own top-level
+// rule, so they can never appear as a finding's `ruleId` either.
+const ALL_RULE_IDS = [
+  'dupe.group',
+  'fs.empty-folder', 'fs.orphan-media', 'fs.missing-file', 'fs.junk', 'fs.stray-sidecar', 'fs.permission',
+  'meta.unidentified', 'meta.missing-artwork', 'meta.missing-year', 'meta.episode-no-season', 'meta.mixed-content', 'meta.bad-naming',
+  'quality.low-bitrate', 'quality.tiny-file', 'quality.transcode-risk', 'quality.missing-subs', 'quality.biggest',
+] as const
+
+const ACTIONABLE_RULE_IDS = new Set(['fs.empty-folder', 'fs.junk', 'fs.stray-sidecar', 'fs.orphan-media'])
+
 describe('Findings', () => {
-  it('lists findings with their rule and subject path', async () => {
+  it('lists findings with their rule, subject path, and the evidence reason the operator needs to authorise a delete', async () => {
     render(<Findings api={api()} onQueue={() => {}} />)
     expect(await screen.findByText('fs.junk')).toBeInTheDocument()
     expect(await screen.findByText('/mnt/m/sample.mkv')).toBeInTheDocument()
+    expect(await screen.findByText('sample file')).toBeInTheDocument()
   })
 
   it('refetches with the class filter applied', async () => {
@@ -28,6 +43,24 @@ describe('Findings', () => {
     render(<Findings api={api({ findings })} onQueue={() => {}} />)
     await userEvent.selectOptions(await screen.findByLabelText(/class/i), 'duplicate')
     await waitFor(() => expect(findings).toHaveBeenLastCalledWith(expect.objectContaining({ class: 'duplicate' })))
+  })
+
+  it('clears the selection when a filter changes, so a stale selection can never be queued against the new list', async () => {
+    const onQueue = vi.fn()
+    const findings = vi.fn()
+      .mockResolvedValueOnce({ findings: [finding()], total: 1 })
+      .mockResolvedValueOnce({ findings: [], total: 0 })
+    render(<Findings api={api({ findings })} onQueue={onQueue} />)
+
+    await userEvent.click(await screen.findByRole('checkbox', { name: /select/i }))
+    expect(screen.getByRole('button', { name: /add to plan/i })).toBeEnabled()
+
+    await userEvent.selectOptions(await screen.findByLabelText(/class/i), 'duplicate')
+    await waitFor(() => expect(findings).toHaveBeenLastCalledWith(expect.objectContaining({ class: 'duplicate' })))
+
+    // The old selection referred to a row from the PREVIOUS filter's list, which no longer exists
+    // on screen — "Add to plan" must not still look armed.
+    expect(screen.getByRole('button', { name: /add to plan/i })).toBeDisabled()
   })
 
   it('requires a reason before dismissing', async () => {
@@ -70,20 +103,84 @@ describe('Findings', () => {
   it('does not offer a queueing checkbox for an informational metadata finding', async () => {
     const onQueue = vi.fn()
     render(<Findings api={api({
-      findings: async () => ({ findings: [finding({ ruleId: 'meta.missing-poster', class: 'metadata' })], total: 1 }),
+      findings: async () => ({ findings: [finding({ ruleId: 'meta.missing-artwork', class: 'metadata' })], total: 1 }),
     })} onQueue={onQueue} />)
-    await screen.findByText('meta.missing-poster')
+    await screen.findByText('meta.missing-artwork')
     expect(screen.queryByRole('checkbox', { name: /select/i })).not.toBeInTheDocument()
   })
 
-  it('actionForFinding returns null for metadata and quality rule ids, queueing nothing', () => {
-    expect(actionForFinding({ ruleId: 'meta.missing-poster', subjects: [{ path: '/mnt/m/x.mkv' }] })).toBeNull()
-    expect(actionForFinding({ ruleId: 'quality.low-bitrate', subjects: [{ path: '/mnt/m/x.mkv' }] })).toBeNull()
+  it('does not offer a queueing checkbox for a junk finding that is actually a directory, because delete-junk-file cannot execute on one', async () => {
+    const onQueue = vi.fn()
+    render(<Findings api={api({
+      findings: async () => ({
+        findings: [finding({
+          subjects: [{ kind: 'path', path: '/mnt/m/Show/proof', label: '/mnt/m/Show/proof' }],
+          evidence: { reason: 'junk directory' },
+        })],
+        total: 1,
+      }),
+    })} onQueue={onQueue} />)
+    await screen.findByText('/mnt/m/Show/proof')
+    expect(screen.queryByRole('checkbox', { name: /select/i })).not.toBeInTheDocument()
+  })
+
+  it('shows how many findings are on screen when the server truncated the list below the total', async () => {
+    const findings = vi.fn(async () => ({
+      findings: [finding({ id: 'f1' }), finding({ id: 'f2' })],
+      total: 5,
+    }))
+    render(<Findings api={api({ findings })} onQueue={() => {}} />)
+    expect(await screen.findByText('Showing 2 of 5')).toBeInTheDocument()
+    expect(screen.queryByText(/5 matching finding/i)).not.toBeInTheDocument()
+  })
+
+  it('shows the plain matching-findings count when the server returned everything', async () => {
+    render(<Findings api={api()} onQueue={() => {}} />)
+    expect(await screen.findByText('1 matching finding')).toBeInTheDocument()
+  })
+
+  it('actionForFinding returns an action only for the four actionable filesystem rules, and null for every other real rule id', () => {
+    for (const ruleId of ALL_RULE_IDS) {
+      const result = actionForFinding({ ruleId, subjects: [{ path: '/mnt/m/x.mkv' }] })
+      if (ACTIONABLE_RULE_IDS.has(ruleId)) {
+        expect(result, `expected an action for ${ruleId}`).not.toBeNull()
+      } else {
+        expect(result, `expected null for ${ruleId}`).toBeNull()
+      }
+    }
+  })
+
+  it('actionForFinding returns null for fs.missing-file even though its subject carries a populated path — a missing file is not one this screen can queue a delete for', () => {
+    expect(actionForFinding({ ruleId: 'fs.missing-file', subjects: [{ path: '/mnt/m/Show/episode.mkv' }] })).toBeNull()
+  })
+
+  it('actionForFinding returns null for fs.permission', () => {
+    expect(actionForFinding({ ruleId: 'fs.permission', subjects: [{ path: '/mnt/m/locked' }] })).toBeNull()
+  })
+
+  it('actionForFinding returns null for an fs.junk finding whose evidence says it is a directory, not a file', () => {
+    expect(actionForFinding({
+      ruleId: 'fs.junk', subjects: [{ path: '/mnt/m/Show/sample' }], evidence: { reason: 'junk directory' },
+    })).toBeNull()
+  })
+
+  it('actionForFinding still queues delete-junk-file for an fs.junk FILE finding', () => {
+    expect(actionForFinding({
+      ruleId: 'fs.junk', subjects: [{ path: '/mnt/m/Show/sample.mkv' }], evidence: { reason: 'sample file' },
+    })).toEqual({ type: 'delete-junk-file', targetPath: '/mnt/m/Show/sample.mkv' })
   })
 
   it('renders a malicious file name as text', async () => {
     render(<Findings api={api({
       findings: async () => ({ findings: [finding({ subjects: [{ kind: 'path', path: '<img src=x onerror=alert(1)>', label: '<img src=x onerror=alert(1)>' }] })], total: 1 }),
+    })} onQueue={() => {}} />)
+    expect(await screen.findByText('<img src=x onerror=alert(1)>')).toBeInTheDocument()
+    expect(document.querySelector('img')).toBeNull()
+  })
+
+  it('renders a malicious evidence reason as text, never as markup', async () => {
+    render(<Findings api={api({
+      findings: async () => ({ findings: [finding({ evidence: { reason: '<img src=x onerror=alert(1)>' } })], total: 1 }),
     })} onQueue={() => {}} />)
     expect(await screen.findByText('<img src=x onerror=alert(1)>')).toBeInTheDocument()
     expect(document.querySelector('img')).toBeNull()

@@ -674,6 +674,18 @@ button {
   color: var(--ink-muted);
 }
 
+/* A tile whose class has at least one not-evaluated rule behind it — same warn identity as
+   `.not-evaluated` (see above), so a degraded count reads as visually distinct from a clean one,
+   not just textually. */
+.tile-degraded {
+  background: var(--warn-tint);
+  border-color: var(--warn-line);
+}
+
+.tile-count-degraded {
+  color: var(--warn-strong);
+}
+
 .reclaimable {
   font-size: 14px;
   display: flex;

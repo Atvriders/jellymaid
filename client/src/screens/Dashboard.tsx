@@ -25,6 +25,38 @@ interface ScanRefusal {
   forcible: boolean
 }
 
+/** Which finding class each rule-id prefix belongs to. Verified against `ALL_RULES` in
+ * src/rules/registry.ts: every registered rule id (including `dupe.group`'s own internal matcher
+ * ids reported via its `subRuns`, e.g. `dupe.identical-file`, `dupe.title-year` — see
+ * src/rules/dupes/adapter.ts) is namespaced by exactly one of these four prefixes. */
+const RULE_PREFIX_CLASS: Record<string, FindingClass> = {
+  dupe: 'duplicate',
+  fs: 'filesystem',
+  meta: 'metadata',
+  quality: 'quality',
+}
+
+/**
+ * Which classes have at least one rule that did not run this pass — so a tile for that class can
+ * be marked degraded instead of showing a count that might be missing whatever the unevaluated
+ * rule would have found. `notEvaluated[].ruleId` mixes top-level rule ids with `dupe.group`'s
+ * internal matcher ids (both land in the same `rule_runs` table, see src/api/findings.ts), which
+ * is exactly why this goes by prefix rather than an exhaustive id list.
+ */
+function degradedClasses(notEvaluated: Array<{ ruleId: string }>): Set<FindingClass> {
+  const out = new Set<FindingClass>()
+  for (const item of notEvaluated) {
+    const prefix = item.ruleId.split('.')[0] ?? ''
+    const cls = RULE_PREFIX_CLASS[prefix]
+    if (cls) out.add(cls)
+  }
+  return out
+}
+
+function forcibleFrom(body: unknown): boolean {
+  return typeof body === 'object' && body !== null && Boolean((body as { forcible?: unknown }).forcible)
+}
+
 /**
  * The instrument-panel front page: is the picture on the other screens trustworthy right now?
  * That is three separate questions — are the connectors this app depends on reachable, is a scan
@@ -58,13 +90,19 @@ export function Dashboard({ api }: { api: DashboardApi }) {
     setScanRefusal(null)
     try {
       await api.scanStart(force ? { force: true } : {})
+      // Set the instant the request succeeds, not only once a poll tick observes `running: true`:
+      // a scan that finishes before the next 2s tick would otherwise never trip the "just
+      // stopped" edge below, and the summary panel would go stale silently.
+      wasRunning.current = true
       setRunning(true)
     } catch (err) {
       // A 412 here is the runner refusing to trust an unverified path map — never retried
-      // automatically. The operator is told exactly why and offered the force path explicitly;
-      // anything else is a plain failure message.
+      // automatically. The operator is told exactly why and offered the force path explicitly,
+      // read from the server's own statement (`forcible` in the response body) rather than
+      // inferred from the status code, so the affordance can never drift from what the server
+      // actually said just because some other refusal also happens to use 412.
       if (err instanceof ApiError && err.status === 412) {
-        setScanRefusal({ message: err.message, forcible: true })
+        setScanRefusal({ message: err.message, forcible: forcibleFrom(err.body) })
       } else {
         setScanRefusal({ message: err instanceof Error ? err.message : 'failed to start scan', forcible: false })
       }
@@ -149,6 +187,16 @@ export function Dashboard({ api }: { api: DashboardApi }) {
             // same thing as a clean scan with nothing to report, and must never look like one.
             return <EmptyState>No scan has completed the rules phase yet — nothing has been evaluated.</EmptyState>
           }
+          // Computed once per render, same reasoning as capturing `data` above: both are read
+          // several times below (once per tile, plus the reclaimable line) and must all agree on
+          // the same `notEvaluated` snapshot.
+          const degraded = degradedClasses(data.notEvaluated)
+          // Only `filesystem` and `duplicate` rules ever produce a non-null `reclaimableBytes`
+          // (metadata and quality findings always report `null` — see src/rules/metadata/index.ts
+          // and src/rules/quality/index.ts), so only degradation in one of those two classes can
+          // make the aggregate total an undercount.
+          const reclaimableDegraded = degraded.has('filesystem') || degraded.has('duplicate')
+
           return (
             <>
               {data.latestAttempt ? (
@@ -158,20 +206,34 @@ export function Dashboard({ api }: { api: DashboardApi }) {
                 </p>
               ) : null}
 
+              {/* Above the tiles, not below: the notice's own text ("their absence from the
+                  results below") only makes sense read in that order, and an operator scanning
+                  top-down must meet the caveat before a number it qualifies, never after. */}
+              <NotEvaluatedNotice items={data.notEvaluated} />
+
               <div className="class-tiles">
-                {FINDING_CLASSES.map((cls) => (
-                  <div key={cls} className="tile">
-                    <span className="tile-count">{data.byClass[cls] ?? 0}</span>
-                    <span className="tile-label">{CLASS_LABEL[cls]}</span>
-                  </div>
-                ))}
+                {FINDING_CLASSES.map((cls) => {
+                  const isDegraded = degraded.has(cls)
+                  return (
+                    <div key={cls} className={isDegraded ? 'tile tile-degraded' : 'tile'}>
+                      {isDegraded ? (
+                        // "Degraded means not evaluated, never zero" (see NotEvaluatedNotice's own
+                        // doc comment) — a bare number here would read as a confirmed count when at
+                        // least one rule that feeds this class did not run. Same reasoning as
+                        // `Bytes` rendering an em dash for a `null` value, applied to a class tile.
+                        <span className="tile-count tile-count-degraded" title="Not evaluated in the last scan — this count may be incomplete">—</span>
+                      ) : (
+                        <span className="tile-count">{data.byClass[cls] ?? 0}</span>
+                      )}
+                      <span className="tile-label">{CLASS_LABEL[cls]}</span>
+                    </div>
+                  )
+                })}
               </div>
 
               <p className="reclaimable">
-                Reclaimable space <Bytes value={data.reclaimableBytes} />
+                Reclaimable space <Bytes value={reclaimableDegraded ? null : data.reclaimableBytes} />
               </p>
-
-              <NotEvaluatedNotice items={data.notEvaluated} />
             </>
           )
         })()}
