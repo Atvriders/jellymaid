@@ -299,17 +299,17 @@ services:
     ports:
       - "8099:8099"
     environment:
-      JELLYFIN_URL: "http://192.168.1.100:8096"
+      JELLYFIN_URL: "http://192.0.2.10:8096"
       JELLYFIN_API_KEY: "${JELLYFIN_API_KEY}"
-      QBIT_URL: "http://192.168.1.100:8080"
+      QBIT_URL: "http://192.0.2.10:8080"
       QBIT_USER: "${QBIT_USER}"
       QBIT_PASS: "${QBIT_PASS}"
       # Optional. Jellymaid only ever unmonitors in these — it never deletes or blocklists.
-      RADARR_URL: "http://192.168.1.100:7878"
+      RADARR_URL: "http://192.0.2.11:7878"
       RADARR_API_KEY: "${RADARR_API_KEY}"
-      SONARR_URL: "http://192.168.1.100:8989"
+      SONARR_URL: "http://192.0.2.11:8989"
       SONARR_API_KEY: "${SONARR_API_KEY}"
-      TZ: "America/Winnipeg"
+      TZ: "UTC"
       # Must equal the number of proxies actually in front of this service — behind a single
       # Cloudflare tunnel that is 1. Setting it HIGHER than the real count lets a caller forge
       # X-Forwarded-For and reinstate the login-lockout bypass this setting exists to close.
@@ -319,8 +319,8 @@ services:
       - ./data:/data
       # Media and downloads, read-write: empty folders and leftover hardlinks cannot be
       # removed through any API, only on disk.
-      - /mnt/user/media:/mnt/media
-      - /mnt/user/downloads:/mnt/downloads
+      - /path/to/media:/mnt/media
+      - /path/to/downloads:/mnt/downloads
 ```
 
 ```

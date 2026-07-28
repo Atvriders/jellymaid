@@ -85,9 +85,12 @@ never real hosts.
   against your Jellyfin server; Jellymaid then confirms `Policy.IsAdministrator` and immediately
   revokes that Jellyfin token, replacing it with its own signed session cookie. A non-admin
   Jellyfin account is refused outright — this app deletes things, so there are no lesser roles.
-  Three failed logins in five minutes locks that username for an hour; the same applies per public
-  IP address (private/loopback addresses are exempt from the IP dimension, since a proxy in front
-  of Jellymaid can otherwise collapse every real client onto one address — see
+  Three failed logins in five minutes locks that username for an hour. A separate, shorter lockout
+  applies per public IP address too — three failures in five minutes locks that address for
+  **15 minutes**, not the same hour the username dimension uses — because an IP can be shared
+  infrastructure rather than one attacker, so a false-positive lock recovers faster (private and
+  loopback addresses are exempt from this dimension entirely, since a proxy in front of Jellymaid
+  can otherwise collapse every real client onto one address — see
   [`TRUST_PROXY`](#troubleshooting) below).
 
 ## Path mapping
@@ -123,6 +126,15 @@ thing, so it gets two dedicated Settings tools:
   to make the schedule bypass it. The manual "Scan now" button can be force-started past a failing
   verification if you explicitly choose to; the schedule cannot.
 
+**A saved path map does not reach every part of the running process.** `pathMappings` is the
+*only* config field Jellymaid can write itself (`PUT /api/pathmap`); saving it updates
+`config.json` immediately, and the next scan picks it up because the scan worker reloads the whole
+config fresh for each run. The executor does not: it was built once at boot from whatever the
+config file said then, so the sweep boundary an in-flight or later delete uses is the *old* map
+until the container restarts. In practice this means a scan can run against your corrected mapping
+while a delete in the same session still confines its directory sweep to the previous one — restart
+the container after changing path mappings if you want both to agree.
+
 ## How a delete actually runs
 
 Every `delete-media` and `delete-junk-file` action runs through these steps, in this fixed order,
@@ -140,15 +152,23 @@ so a guard evaluated only against yesterday's index would be a guard evaluated a
 2. **qBittorrent delete-with-data.** Every torrent whose content resolves to this file is removed
    with `deleteFiles=true`, and Jellymaid polls until qBittorrent confirms the hash is actually
    gone before moving on.
-3. **Sweep leftover empty directories.** Whatever qBittorrent didn't own — this path's own link,
-   plus any now-empty parent directories — is removed, walking upward but never above the mapped
-   library or torrent root.
-4. **Remaining hardlinks** the operator explicitly selected in the plan are unlinked here. This is
-   the step that actually reclaims space in a hardlinked \*arr/qBittorrent layout — removing only
-   the first link frees nothing.
+3. **Whatever qBittorrent left: this path's own link.** A junk file with no torrent behind it is
+   moved to trash (see [Trash](#trash) below) if it qualifies; a media file, or any file a torrent
+   backs, is unlinked directly here and cannot be recovered — one "Delete" vocabulary covering two
+   different outcomes. Space for a hardlinked file is only reclaimed once its **last** remaining
+   link is removed (`nlink <= 1` at the moment of unlink) — removing just this one path frees 0
+   bytes if another link to the same inode survives.
+4. **Sweep leftover empty directories.** The now-empty parent directories this leaves behind are
+   removed, walking upward one level at a time but never above the mapped library or torrent root.
 5. **Jellyfin**, last: the item is deleted once its bytes are actually gone (or the library is
    refreshed instead, if the item still has a surviving sibling version or was merged). **One**
    batched `Library/Refresh` runs after the whole plan finishes — never per file.
+
+**There is no step that unlinks "remaining hardlinks the operator selected."** That capability
+does not exist — there is no hardlink-unlink action type and no selection UI for it. The *only*
+way another hardlink to the same bytes is ever removed is if that other path is itself queued,
+approved and executed as its own delete action; `guard.hardlink` only ever warns that other links
+survive, it never offers or performs a way to remove them from here.
 
 A file with no matching torrent skips straight to steps 3–5.
 
@@ -160,8 +180,17 @@ queue → approve → delete pipeline as everything else.
 
 ## The five guards
 
-Every path-based action is judged against five guards before it can run. Guards are pure checks
-against live data — no guard is ever evaluated from a stale scan snapshot.
+Every path-based action is judged against five guards before it can run. Guards are re-resolved
+against live services immediately before each action runs — but "live" has one caveat worth
+naming: the target's own identity (`nlink`, size, `dev`/`inode`) always comes from a fresh
+`stat()` right then, and qBittorrent's own live torrent list and file counts are always
+re-fetched. What is *not* re-walked from disk each time is the **set of other paths** that share
+this file's inode: `guard.hardlink`'s list of other hardlinks, and one of the two sources
+`guard.torrent-scope` can use for a torrent's file count, both come from the last scan's
+`fs_entries`/`torrent_files` index rows. In practice `guard.torrent-scope` prefers a live
+qBittorrent file listing when the index can't answer completely, but a complete indexed answer is
+used as-is without a live re-check. A hardlink created, or a torrent file added, since the last
+scan will not be reflected until the next one.
 
 | Guard | Protects against | Overridable? |
 |---|---|---|
@@ -171,7 +200,7 @@ against live data — no guard is ever evaluated from a stale scan snapshot.
 | `guard.protected` | Acting on a torrent that's busy (downloading/checking/moving), tagged/categorized as protected, or whose true state can't be verified because qBittorrent or a configured \*arr instance is unreachable | **No.** This is the one guard with no override, by design |
 | `guard.torrent-scope` | A file's torrent covering *more* files than the plan named (e.g. a `sample.mkv` inside a whole season pack) — deleting it with data would take files nobody reviewed | Yes — the operator is explicitly accepting that the rest of the torrent goes too |
 
-Defaults, all editable in Settings (`config.json`'s `guards` block):
+Defaults (`config.json`'s `guards` block):
 
 - `minRatio`: `1.0`
 - `minSeedTimeDays`: `14`
@@ -179,6 +208,16 @@ Defaults, all editable in Settings (`config.json`'s `guards` block):
 - `privateTrackerHosts`: empty (operator-populated; qBittorrent's own `private` flag is preferred
   when the connected version reports it, and a torrent whose privacy can't be determined is
   treated as private — fail-safe, not fail-open)
+
+**None of this block is editable from the UI.** Settings' Thresholds panel is explicitly
+read-only — it says so on screen — because there is no `PUT` route for it; the client has no way
+to send these numbers back. The only way to change `minRatio`, `minSeedTimeDays`,
+`protectedCategories`, `protectedTags`, or `privateTrackerHosts` is to hand-edit `/data/config.json`
+directly and **restart the container**: `loadConfig` runs once at process start, and the resulting
+object is captured by the executor, both schedulers, and qBittorrent's client (which is what reads
+`privateTrackerHosts`) for the life of that process. Concretely: adding a private-tracker host to
+`config.json` without restarting does nothing — qBittorrent's own `private` flag is still consulted
+live, but a host you just added is silently not, until the next restart picks it up.
 
 An unreachable qBittorrent, or an unreachable/incomplete Radarr or Sonarr inventory, makes
 `guard.protected` block with **no override** — an empty answer from a source that can't be
@@ -215,19 +254,33 @@ Torrent-backed files are never trashed — qBittorrent deletes its own data dire
 the delete pipeline above, and pre-copying a large file to a trash folder before removing it would
 defeat the point of reclaiming the space.
 
-A small trash *is* used for non-torrent junk: a file below `trash.maxBytes` (default **1 GB**)
-that isn't backed by any torrent is **moved** (same-filesystem rename, not copied) into
-`<library-or-download-root>/.jellymaid-trash/<plan-id>/` and purged after `trash.retentionDays`
-(default **30 days**), on a nightly schedule. Both values live in `config.json` and are editable
-in Settings. Restore is available from History while the entry survives.
+**Trash only ever applies to a `delete-junk-file` action with no torrent behind it.** That is a
+narrower condition than "small and torrentless" — it is a specific action *type*. A
+`delete-media` action — the kind that removes an actual movie or episode file — is **always
+unlinked directly, with no trash and no recovery, regardless of size or whether a torrent backs
+it.** Only a junk file identified by the filesystem rules (leftover `.nfo`/sample/partial-download
+debris, not a Jellyfin-known media file) ever gets a trash pass. Read "Delete" on a `delete-media`
+row as unconditionally permanent.
+
+For the files that do qualify: one below `trash.maxBytes` (default **1 GiB**) is **moved**
+(same-filesystem rename, not copied) into `<library-or-download-root>/.jellymaid-trash/<plan-id>/`
+and purged after `trash.retentionDays` (default **30 days**), on a nightly schedule. Restore is
+available from History while the entry survives. Both `trash.maxBytes` and `trash.retentionDays`
+are shown, read-only, on the Settings Thresholds panel — like the guard defaults above, changing
+them means hand-editing `/data/config.json` and restarting the container.
 
 **Trash must live on the same filesystem as the media** — this is why it's placed inside each
-configured root rather than at some fixed global path. If a root spans a read-only mount, or isn't
+configured root rather than at some fixed global path. If a root spans a read-only mount, isn't
 the true root of one filesystem (e.g. two different filesystems bind-mounted under what looks like
-one path), the trash move fails and the file is deleted outright instead, with the trash row
-marked to say so. `.jellymaid-trash` itself is excluded from every scan phase and every rule — it
-never shows up as orphan media, junk, or an empty folder, and never counts toward folder sizes in
-Explorer.
+one path), or the file is over `trash.maxBytes`, the trash move is skipped entirely and the file is
+unlinked outright instead — the exact same unrecoverable path a `delete-media` action always takes.
+**The trash *database row* for that attempt is deleted, not marked** — trash entries only ever
+describe files that still exist. The only surviving trace that a trash attempt was refused is
+`trashRefused` in that action's audit-log detail, alongside the eventual `disposition: 'unlinked'`.
+Nothing on screen distinguishes "too big for trash" from "read-only mount" from any other reason
+the move failed — all three land on the same unlinked outcome and the same audit note.
+`.jellymaid-trash` itself is excluded from every scan phase and every rule — it never shows up as
+orphan media, junk, or an empty folder, and never counts toward folder sizes in Explorer.
 
 A trash entry that fails to purge (permission error, read-only mount, etc.) keeps its database row
 on purpose — that row is the only record the file still exists. It shows up as a purge failure in
@@ -235,19 +288,30 @@ the logs rather than being silently forgotten.
 
 ## Scanning
 
-- **`SCAN_CRON`** (default `0 3 * * *`, evaluated in the container's `TZ`) schedules a full scan. A
-  scheduled scan never starts while one is already running, and never bypasses the path-map
-  verification gate.
+- **There is no `SCAN_CRON` environment variable.** The schedule is `scanCron` in `/data/config.json`
+  (default `0 3 * * *`), and like every other `config.json` field it is read once at container
+  start — change it and restart to pick up the new schedule. **It is evaluated in UTC, always**,
+  regardless of the container's `TZ` — the scheduler pins `tz: 'UTC'` explicitly so the schedule
+  cannot silently drift with wherever it happens to be deployed. If you want "3am local", convert
+  your timezone's offset to UTC yourself when writing the cron string. A scheduled scan never
+  starts while one is already running, and never bypasses the path-map verification gate.
 - A scan walks Jellyfin, then the filesystem, then qBittorrent, then \*arr, then runs every rule
   over the results, in that order, with a resumable cursor per phase — a killed or crashed scan
   picks back up where it left off rather than starting over.
-- **Hashing is opt-in per library root** (`hashedLibraryRoots` in `config.json`). Only
-  `dupe.identical-file` needs it. A root left out of that list still gets every other rule; that
-  rule alone reports **not evaluated** for it.
+- **Hashing is opt-in per library root** (`hashedLibraryRoots` in `config.json`), but whether
+  `dupe.identical-file` counts as "evaluated" for this scan is decided **globally, not per root**:
+  the check is simply "does any row anywhere have a `quick_hash`". If even one root is hashed, the
+  whole scan is marked evaluated for that rule — files in a *different*, unhashed root then just
+  never match anything by hash, which surfaces as an ordinary lack of findings for that root's
+  files, **not** as the distinct "not evaluated" state described below. Only a library where *no*
+  root anywhere has hashing on gets the honest "not evaluated" treatment. Turn hashing on for every
+  root you want covered by `dupe.identical-file`, or don't rely on this rule for the ones you leave off.
 - **"Not evaluated" is a real, distinct state — it is never rendered as "no findings."** If
-  qBittorrent or an \*arr instance is unreachable during a scan, or hashing is off for a root, the
-  rules that depend on that source say so explicitly rather than silently reporting zero results.
-  "No duplicates found" and "couldn't check for duplicates" are never allowed to look the same.
+  qBittorrent or an \*arr instance is unreachable during a scan, or hashing is off for every root,
+  the rules that depend on that source say so explicitly rather than silently reporting zero
+  results. "No duplicates found" and "couldn't check for duplicates" are never allowed to look the
+  same — except for the per-root hashing gap just above, which is the one place that guarantee
+  currently has a hole.
 
 ## Troubleshooting
 
@@ -281,9 +345,12 @@ the logs rather than being silently forgotten.
 
 ## What has NOT been verified against a live stack
 
-Jellymaid has ~770 server tests and ~179 client tests, all passing against fixtures, in-memory
-SQLite, real temporary directories (including real hardlinks), and recorded/stubbed HTTP
-responses. **None of that is the same as running against a real deployment.** As of this writing:
+As of this writing Jellymaid has 786 server tests and 180 client tests, all passing against
+fixtures, in-memory SQLite, real temporary directories (including real hardlinks), and
+recorded/stubbed HTTP responses. **That count goes stale on the next commit** — run `npm test` and
+`npm --prefix client test` yourself for the number that is actually true right now; do not trust a
+number sitting in prose over one you can reproduce. And regardless of how big it is, **none of that
+is the same as running against a real deployment.** As of this writing:
 
 - No real Jellyfin server has ever been contacted.
 - No real qBittorrent instance has ever been contacted.
@@ -297,6 +364,31 @@ responses. **None of that is the same as running against a real deployment.** As
 
 Do not treat any claim in this document as validated by anything stronger than test coverage
 against simulated services until you've personally run the checklist below.
+
+### Known limitations
+
+These are known-open items, not bugs waiting to be noticed — accepted gaps an operator should know
+about going in:
+
+- **An unmapped Radarr/Sonarr folder can wedge every delete, and nothing on the health page says
+  so.** A record whose *arr path resolves to no configured mapping (`arrUnmappable`) blocks that
+  path's delete, non-overridably, but the only way to discover it today is to try to build a plan
+  and read the block reason. One decommissioned root folder in Radarr/Sonarr can silently stop
+  every delete in the whole install until an operator happens to hit it.
+- **Sessions cannot be revoked.** Logging out only clears the cookie in your own browser — there is
+  no server-side session list or kill switch. A captured session cookie remains a valid credential
+  for the rest of its 7-day life even after you log out, and there is no way to force it to expire
+  early short of changing `SESSION_SECRET` (which invalidates every session at once, not just one).
+- **There is no `SIGTERM` handler.** `docker stop`, a host reboot, or an orchestrator-issued
+  restart can land in the middle of an executing plan with no graceful shutdown. The recovery path
+  is: go to **History**, find the plan (it will show status `running`), and click **Resume** — the
+  executor re-verifies every guard live before continuing, so this is safe, but it is a manual step
+  an operator has to know to take.
+- **A plan stuck `running` after a crash shows no controls on the Plan screen itself.** The Plan
+  screen only offers rebuild/approve/execute controls for a `draft` or `approved` plan; a plan a
+  crash left `running` looks the same there as one that is genuinely still executing, with nothing
+  to click. The only place to act on it is History, per the point above — the Plan screen gives no
+  hint that History is where to go.
 
 ### First-run checklist
 
@@ -322,3 +414,7 @@ miss if it were gone:
 
 Only after step 7 behaves exactly as documented here should you point Jellymaid at anything that
 matters.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
