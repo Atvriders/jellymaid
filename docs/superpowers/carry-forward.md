@@ -103,3 +103,34 @@ why the obvious simplification is wrong:
 - Only `kind === 'auth'` consumes a lockout attempt. Anything else — including an unclassifiable error — returns 503, or an outage locks the operator out of their own tool.
 - POST is **not retried** by default. A timeout is not evidence the request did not land, and the executor later issues `torrents/delete?deleteFiles=true` down this path.
 - A `Season` row's number lives in `IndexNumber`, not `ParentIndexNumber`.
+
+## Open after Plan 6 — nothing here blocks ship, all are documented in the README
+
+- **`arrUnmappable` is a count on `/healthz`, not an explanation.** `evaluated`/`count` is exposed
+  deliberately without paths, because `/healthz` is unauthenticated. The operator still learns
+  *which* root folder is unmappable only by building a plan and reading the failure. Surfacing the
+  offending root behind the authenticated API is the follow-up.
+- **Config is boot-time only.** `loadConfig` runs once at `src/index.ts`, and `config.file` is
+  captured by `pathMap`, the executor, `plannerDeps`, `trashDeps`, both schedulers, and
+  qBittorrent's `privateTrackerHosts`. Hand-editing `/data/config.json` needs a container restart —
+  and until that restart, an added private-tracker host **fails open**. A saved `pathMappings`
+  change reaches the scan worker (which reloads) but not the executor's live sweep boundary.
+- **`%2e%2e/`-style traversal returns 500, not 404.** `@fastify/static` throws `Forbidden` and the
+  generic error handler widens it. Pre-existing on both the 8.x and 10.x versions; no content leaks,
+  it is the status code that is wrong.
+- **No SIGTERM handler.** Shipping a container makes SIGTERM the normal stop path for a process that
+  deletes files mid-plan. The recovery path exists (History → Resume) but the Plan screen does not
+  mention it, and a plan stuck in `running` shows no controls there.
+- **No session revocation**, and the `/resume` staleness check is still the 5-minute age heuristic
+  documented at `src/api/plans.ts` rather than a real heartbeat.
+- **The hash-evaluated flag is global, not per-root.** With one library root hashed and another not,
+  the unhashed root contributes a silent zero to duplicate counts. Documented in the README.
+
+## Never verified against a live stack
+
+No real Jellyfin, qBittorrent, Radarr or Sonarr instance has ever been contacted; no real scan has
+run; no real delete has been executed. Docker was unavailable in the build sandbox, so the image has
+never been built and `docker compose up` has never run. Every connector behaviour is verified against
+fakes and fixtures only. The README's first-run checklist exists for exactly this reason and starts
+with a deliberate throwaway file — that checklist is the real acceptance test and the owner has to
+run it.
