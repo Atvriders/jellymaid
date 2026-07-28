@@ -161,3 +161,110 @@ describe('GET /healthz — all connectors', () => {
     expect(body.indexCounts).toMatchObject({ jellyfinItems: 0, fsEntries: 0, findings: 0 })
   })
 })
+
+// Fixwave-2 finding MAJOR 2: commit b47ec6b's Promise.all over four statusOf calls gates the whole
+// response on the SLOWEST connector, unbounded — production connectors inherit a 30s HttpClient
+// timeout with up to 3 retries, so one hung connector could stall /healthz for ~2 minutes. The
+// route's own comment claims concurrency alone protects it ("a single hanging connector must not
+// delay every other connector's report"), but concurrency only bounds the SUM across connectors
+// finishing in parallel, not the MAX any one of them is allowed to take.
+describe('GET /healthz — finding MAJOR 2 (a hanging connector must not delay the response)', () => {
+  it('does not block on a connector whose ping never resolves', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jm-hc-deadline-'))
+    const app = Fastify()
+    registerHealthRoutes(app, {
+      db: openDb(join(dir, 'db.sqlite')),
+      jellyfin: { ping: () => new Promise<void>(() => { /* never settles */ }) },
+      qbittorrent: null,
+      radarr: null,
+      sonarr: null,
+      probeDeadlineMs: 50,
+    })
+    const started = performance.now()
+    const res = await app.inject({ method: 'GET', url: '/healthz' })
+    const elapsedMs = performance.now() - started
+    // Generous relative to the 50ms deadline configured above — the point is this is nowhere near
+    // the tens of seconds a real hung connector would otherwise cost, not a tight timing assertion.
+    expect(elapsedMs).toBeLessThan(1000)
+    expect(res.statusCode).toBe(200)
+    const body = res.json()
+    expect(body.connectors.jellyfin).toBe('timeout')
+    // A probe that timed out is neither "ok" nor "not-configured" — it must still fail closed.
+    expect(body.status).toBe('degraded')
+  }, 2000)
+
+  it('still reports a fast connector normally when a different connector hangs', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jm-hc-deadline-mixed-'))
+    const app = Fastify()
+    registerHealthRoutes(app, {
+      db: openDb(join(dir, 'db.sqlite')),
+      jellyfin: { ping: () => new Promise<void>(() => { /* never settles */ }) },
+      qbittorrent: { ping: async () => {} },
+      radarr: null,
+      sonarr: null,
+      probeDeadlineMs: 50,
+    })
+    const res = await app.inject({ method: 'GET', url: '/healthz' })
+    const body = res.json()
+    expect(body.connectors.jellyfin).toBe('timeout')
+    expect(body.connectors.qbittorrent).toBe('ok')
+  }, 2000)
+})
+
+// Fixwave-2 finding MINOR 3: `(err as { kind?: string }).kind ?? 'unreachable'` trusted an
+// arbitrary property on whatever was thrown, verbatim, into a body /healthz serves with no
+// authentication. Only a bounded ConnectorError reaches this catch today, but one catch-and-rethrow
+// elsewhere would put attacker- or bug-supplied text straight into the response.
+describe('GET /healthz — finding MINOR 3 (err.kind must not be echoed unvalidated)', () => {
+  it('falls back to "unreachable" for a kind outside the known connector-error vocabulary', async () => {
+    const app = buildServer(testDeps(async () => {
+      throw Object.assign(new Error('boom'), { kind: '…?apikey=RADARRKEY-abcdef-SECRET' })
+    }))
+    const body = (await app.inject({ method: 'GET', url: '/healthz' })).json()
+    expect(body.connectors.jellyfin).toBe('unreachable')
+  })
+
+  it('still passes through a genuine known ConnectorError kind', async () => {
+    const app = buildServer(testDeps(async () => {
+      throw Object.assign(new Error('rate limited'), { kind: 'rate-limited' })
+    }))
+    const body = (await app.inject({ method: 'GET', url: '/healthz' })).json()
+    expect(body.connectors.jellyfin).toBe('rate-limited')
+  })
+})
+
+// Fixwave-2 finding MINOR 4: the four connector pings are TTL-cached specifically so an anonymous
+// caller cannot spend a rate-limited budget, but indexCounts was added later with no such
+// protection — every anonymous /healthz request ran four fresh COUNT(*) scans, scaling with library
+// size (measured: 3.2ms of synchronous, event-loop-blocking work per request on a 250k-row index).
+describe('GET /healthz — finding MINOR 4 (indexCounts must be TTL-cached like the connector pings)', () => {
+  it('reuses cached indexCounts within the TTL instead of re-querying on every request', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jm-hc-idx-'))
+    const db = openDb(join(dir, 'db.sqlite'))
+    let countQueries = 0
+    const originalPrepare = db.prepare.bind(db)
+    db.prepare = ((sql: string) => {
+      if (sql.includes('COUNT(*)')) countQueries += 1
+      return originalPrepare(sql)
+    }) as typeof db.prepare
+    let t = 0
+    const app = Fastify()
+    registerHealthRoutes(app, {
+      db,
+      jellyfin: { ping: async () => {} },
+      qbittorrent: null,
+      radarr: null,
+      sonarr: null,
+      now: () => t,
+    })
+    await app.inject({ method: 'GET', url: '/healthz' })
+    const afterFirst = countQueries
+    expect(afterFirst).toBeGreaterThan(0)
+    await app.inject({ method: 'GET', url: '/healthz' })
+    expect(countQueries).toBe(afterFirst) // still within the TTL — no new COUNT(*) queries
+
+    t = 10_000 // past the TTL
+    await app.inject({ method: 'GET', url: '/healthz' })
+    expect(countQueries).toBe(afterFirst * 2)
+  })
+})

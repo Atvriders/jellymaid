@@ -214,6 +214,83 @@ describe('/api/explorer', () => {
     })
   })
 
+  // Fixwave-2 finding MAJOR 1: commit f6ff6b1 rewrote flagMap to bind one `?` per listed path.
+  // SQLite's bind-variable ceiling is 32,766 in this project's better-sqlite3 build — 32,767 trips
+  // `SQLITE_ERROR: too many SQL variables` — so a flat directory at or above that many children (a
+  // downloads dir, a large music library) 500'd on every listing. The child query also had no
+  // LIMIT at all, so even a directory just under that ceiling shipped every row as one JSON body.
+  describe('finding MAJOR 1 — large directories (bind-variable ceiling + pagination)', () => {
+    const seedFlatChildren = (count: number) => {
+      const insert = db.prepare(`INSERT OR REPLACE INTO fs_entries (container_path, scan_id, parent_path, name, ext,
+        is_dir, size_bytes, mtime, dev, inode, nlink, is_media, library_root, root_role)
+        VALUES (@container_path,1,'/mnt/m',@name,'.mkv',0,100,0,1,@inode,1,1,'/mnt/m','library')`)
+      const tx = db.transaction(() => {
+        for (let i = 0; i < count; i += 1) {
+          const name = `file${i}.mkv`
+          insert.run({ container_path: `/mnt/m/${name}`, name, inode: i + 1 })
+        }
+      })
+      tx()
+    }
+
+    // 33,000 clears SQLite's 32,766 bind-variable ceiling with room to spare, so a batched/chunked
+    // flagMap query is what makes this pass rather than a lucky count that happens to sit under it.
+    it('does not 500 with SQLITE_ERROR when a directory has more children than the SQL bind-variable ceiling', async () => {
+      seedFlatChildren(33_000)
+      const res = await build().inject({ method: 'GET', url: '/api/explorer?path=/mnt/m&limit=33000', headers: auth() })
+      expect(res.statusCode).toBe(200)
+      const body = res.json()
+      expect(body.entries).toHaveLength(33_000)
+      expect(body.total).toBe(33_000)
+    })
+
+    it('paginates by default so a large directory does not ship every row as one response', async () => {
+      seedFlatChildren(33_000)
+      const res = await build().inject({ method: 'GET', url: '/api/explorer?path=/mnt/m', headers: auth() })
+      expect(res.statusCode).toBe(200)
+      const body = res.json()
+      expect(body.entries.length).toBeLessThan(33_000)
+      expect(body.entries.length).toBeGreaterThan(0)
+      expect(body.total).toBe(33_000)
+    })
+
+    it('returns a later page via limit/offset', async () => {
+      entry('/mnt/m/a.mkv')
+      entry('/mnt/m/b.mkv')
+      entry('/mnt/m/c.mkv')
+      const res = await build().inject({ method: 'GET', url: '/api/explorer?path=/mnt/m&limit=1&offset=1', headers: auth() })
+      const body = res.json()
+      expect(body.entries).toHaveLength(1)
+      expect(body.entries[0].name).toBe('b.mkv')
+      expect(body.total).toBe(3)
+    })
+
+    it('rejects an invalid limit/offset rather than guessing what the caller meant', async () => {
+      expect((await build().inject({ method: 'GET', url: '/api/explorer?path=/mnt/m&limit=0', headers: auth() })).statusCode).toBe(400)
+      expect((await build().inject({ method: 'GET', url: '/api/explorer?path=/mnt/m&limit=-1', headers: auth() })).statusCode).toBe(400)
+      expect((await build().inject({ method: 'GET', url: '/api/explorer?path=/mnt/m&offset=-1', headers: auth() })).statusCode).toBe(400)
+      expect((await build().inject({ method: 'GET', url: '/api/explorer?path=/mnt/m&limit=abc', headers: auth() })).statusCode).toBe(400)
+    })
+  })
+
+  // Fixwave-2 finding MINOR 6: descendantBounds('/') used to yield ['//', '/0'], which matches only
+  // paths beginning with a literal double slash — never a real child of the root ('/a.mkv' sorts
+  // above '/0' and so falls outside that range). A container mapped to '/' therefore rolled up to a
+  // silent zero regardless of what it actually contained, on the one screen this project treats as
+  // ground truth ("degraded means not evaluated, never zero").
+  describe('finding MINOR 6 — rollup at a mapping container of "/"', () => {
+    it('rolls up real descendant bytes and count instead of silently reporting zero', async () => {
+      const rootMappings: PathMapping[] = [{ role: 'library', jellyfin: '/media', container: '/', qbit: null }]
+      entry('/a.mkv', { is_media: 1, size_bytes: 123 })
+      entry('/sub', { is_dir: 1 })
+      entry('/sub/b.mkv', { is_media: 1, size_bytes: 456 })
+      const body = (await build(rootMappings).inject({ method: 'GET', url: '/api/explorer', headers: auth() })).json()
+      const root = body.entries.find((e: { path: string }) => e.path === '/')
+      expect(root.sizeBytes).toBe(579)
+      expect(root.fileCount).toBe(2)
+    })
+  })
+
   // Finding 1: rollupSize/rollupCount ran an unindexable full table scan (a `LIKE ? || '/%' ESCAPE
   // '\'`, which SQLite's LIKE-to-range optimization refuses to fire on) for EVERY directory row in
   // a listing. At this exact shape — 200 sibling directories, 20,200 total fs_entries rows — the

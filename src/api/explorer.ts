@@ -18,12 +18,31 @@ const FLAG_BY_RULE: Record<string, string> = {
   'fs.missing-file': 'missing',
 }
 
+/**
+ * How many children a directory listing returns per page. Finding MAJOR 1: the child query used
+ * to have no LIMIT at all, so a directory at or beyond SQLite's own bind-variable ceiling (see
+ * `FLAG_QUERY_BATCH_SIZE` below) shipped every row as one JSON response — 30+ MB for a flat
+ * downloads directory or a large music library. `MAX_PAGE_SIZE` is a ceiling on what an
+ * authenticated caller may explicitly request, not the common case; `DEFAULT_PAGE_SIZE` is what an
+ * unparameterized request gets, comfortably above what any reasonably-organized library directory
+ * holds.
+ */
+const DEFAULT_PAGE_SIZE = 500
+const MAX_PAGE_SIZE = 50_000
+
+/** A plain non-negative integer in decimal — rejects arrays, floats, and non-numeric junk alike,
+ * the same "SHAPE matters" discipline `path` documents below, rather than coercing and hoping. */
+const numericParam = (min: number, max: number) =>
+  z.string().regex(/^\d+$/, 'must be a non-negative integer').transform(Number).pipe(z.number().int().min(min).max(max))
+
 const explorerQuery = z.object({
   // No `.min(1)`: an explicit `?path=` and an absent `path` are treated identically below (both
   // mean "show the configured roots") rather than one of them 400ing as "invalid". What zod
   // guards here is SHAPE — Fastify turns a repeated `?path=a&path=b` into an array, and this must
   // refuse that rather than silently picking one of the two the caller might have meant.
   path: z.string().optional(),
+  limit: numericParam(1, MAX_PAGE_SIZE).optional(),
+  offset: numericParam(0, Number.MAX_SAFE_INTEGER).optional(),
 })
 
 export function registerExplorerRoutes(
@@ -73,15 +92,27 @@ export function registerExplorerRoutes(
       return reply.code(400).send({ error: 'path is outside every configured root' })
     }
 
+    const limit = parsed.data.limit ?? DEFAULT_PAGE_SIZE
+    const offset = parsed.data.offset ?? 0
+
+    // The total sibling count independent of the page below — a caller must be able to tell "500
+    // of 33,000" from "all 500 there are" without ever pulling all 33,000 rows into one response.
+    const total = (deps.db.prepare(
+      'SELECT COUNT(*) c FROM fs_entries WHERE parent_path = ?',
+    ).get(requested) as { c: number }).c
+
     const rows = deps.db.prepare(
-      'SELECT container_path, name, is_dir, size_bytes, is_media FROM fs_entries WHERE parent_path = ? ORDER BY is_dir DESC, name',
-    ).all(requested) as Array<{ container_path: string; name: string; is_dir: number; size_bytes: number; is_media: number }>
+      'SELECT container_path, name, is_dir, size_bytes, is_media FROM fs_entries WHERE parent_path = ? ORDER BY is_dir DESC, name LIMIT ? OFFSET ?',
+    ).all(requested, limit, offset) as Array<{ container_path: string; name: string; is_dir: number; size_bytes: number; is_media: number }>
 
     const flags = flagMap(deps.db, rows.map((r) => r.container_path))
 
     return reply.send({
       path: requested,
       parent: requested === root.container ? null : (requested.slice(0, requested.lastIndexOf('/')) || '/'),
+      total,
+      limit,
+      offset,
       entries: rows.map((r) => ({
         name: r.name,
         path: r.container_path,
@@ -115,21 +146,33 @@ export function registerExplorerRoutes(
  * (`sqlite_autoindex_fs_entries_1`), turning what was a full scan per directory into an index
  * range seek. Measured on 100,500 rows / 500 sibling directories: the old query took ~13.5s for a
  * single listing; this one takes ~22ms (see fixwave-server-report.md for the full before/after).
+ *
+ * Finding MINOR 6: a root of exactly `/` breaks the `+ '/'` / `+ '0'` trick above — a child of `/`
+ * is spelled `/name`, not `//name`, so `prefix + '/'` ('//') sits ABOVE every real child rather
+ * than below it, and nothing sorts below `prefix + '0'` ('/0') either once you account for that;
+ * the range ends up matching only literal double-slash paths, which this table never holds. `/`
+ * is also the one prefix with no meaningful "next byte" upper bound to reach for: it has no
+ * siblings to exclude, because every absolute path in this table already starts with it. `null`
+ * here means "no upper bound", not "zero rows" — the caller drops the upper-bound clause entirely
+ * rather than trying to invent a sentinel string that could collide with a real path.
  */
-const descendantBounds = (prefix: string): [string, string] => [`${prefix}/`, `${prefix}0`]
+const descendantBounds = (prefix: string): [string, string | null] =>
+  prefix === '/' ? ['/', null] : [`${prefix}/`, `${prefix}0`]
 
 const rollupSize = (db: Db, prefix: string): number => {
   const [lo, hi] = descendantBounds(prefix)
-  return (db.prepare(
-    'SELECT COALESCE(SUM(size_bytes),0) s FROM fs_entries WHERE is_dir = 0 AND container_path > ? AND container_path < ?',
-  ).get(lo, hi) as { s: number }).s
+  const row = hi === null
+    ? db.prepare('SELECT COALESCE(SUM(size_bytes),0) s FROM fs_entries WHERE is_dir = 0 AND container_path > ?').get(lo)
+    : db.prepare('SELECT COALESCE(SUM(size_bytes),0) s FROM fs_entries WHERE is_dir = 0 AND container_path > ? AND container_path < ?').get(lo, hi)
+  return (row as { s: number }).s
 }
 
 const rollupCount = (db: Db, prefix: string): number => {
   const [lo, hi] = descendantBounds(prefix)
-  return (db.prepare(
-    'SELECT COUNT(*) c FROM fs_entries WHERE is_dir = 0 AND container_path > ? AND container_path < ?',
-  ).get(lo, hi) as { c: number }).c
+  const row = hi === null
+    ? db.prepare('SELECT COUNT(*) c FROM fs_entries WHERE is_dir = 0 AND container_path > ?').get(lo)
+    : db.prepare('SELECT COUNT(*) c FROM fs_entries WHERE is_dir = 0 AND container_path > ? AND container_path < ?').get(lo, hi)
+  return (row as { c: number }).c
 }
 
 /**
@@ -145,23 +188,41 @@ const rollupCount = (db: Db, prefix: string): number => {
  * these paths" filter and the path extraction into SQL, so only rows that actually match come back
  * to be walked in JS at all — the shape already used for member-id lookups elsewhere in this file's
  * neighboring routes (see e.g. the placeholder-list pattern in findings.ts's /api/duplicates).
+ *
+ * Finding MAJOR 1: `paths` used to be bound as one `?` placeholder per entry in a single `IN (...)`
+ * list, with no ceiling. SQLite refuses a statement carrying more than `SQLITE_MAX_VARIABLE_NUMBER`
+ * bound parameters — measured at exactly 32,766 on this project's better-sqlite3 build (32,767
+ * throws `SQLITE_ERROR: too many SQL variables`) — so a single flat directory with that many
+ * children (a downloads folder, a large music library) 500'd on every listing. Batching `paths`
+ * into chunks well under that ceiling and merging the per-batch results keeps this correct at any
+ * directory size, independent of whatever page size the route above happens to be configured with.
  */
+const FLAG_QUERY_BATCH_SIZE = 500
+
+function chunk<T>(items: readonly T[], size: number): T[][] {
+  const out: T[][] = []
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size))
+  return out
+}
+
 function flagMap(db: Db, paths: string[]): Map<string, string[]> {
   const out = new Map<string, string[]>()
   if (!paths.length) return out
-  const placeholders = paths.map(() => '?').join(',')
-  const rows = db.prepare(
-    `SELECT DISTINCT f.rule_id AS rule_id, json_extract(je.value, '$.path') AS path
-     FROM findings f, json_each(f.subjects_json) je
-     WHERE f.status = 'open' AND f.class = 'filesystem'
-       AND json_extract(je.value, '$.path') IN (${placeholders})`,
-  ).all(...paths) as Array<{ rule_id: string; path: string | null }>
-  for (const row of rows) {
-    const flag = FLAG_BY_RULE[row.rule_id]
-    if (!flag || !row.path) continue
-    const list = out.get(row.path) ?? []
-    if (!list.includes(flag)) list.push(flag)
-    out.set(row.path, list)
+  for (const batch of chunk(paths, FLAG_QUERY_BATCH_SIZE)) {
+    const placeholders = batch.map(() => '?').join(',')
+    const rows = db.prepare(
+      `SELECT DISTINCT f.rule_id AS rule_id, json_extract(je.value, '$.path') AS path
+       FROM findings f, json_each(f.subjects_json) je
+       WHERE f.status = 'open' AND f.class = 'filesystem'
+         AND json_extract(je.value, '$.path') IN (${placeholders})`,
+    ).all(...batch) as Array<{ rule_id: string; path: string | null }>
+    for (const row of rows) {
+      const flag = FLAG_BY_RULE[row.rule_id]
+      if (!flag || !row.path) continue
+      const list = out.get(row.path) ?? []
+      if (!list.includes(flag)) list.push(flag)
+      out.set(row.path, list)
+    }
   }
   return out
 }
