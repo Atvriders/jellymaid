@@ -30,6 +30,16 @@ close it. Nothing here is a known-broken behaviour today; they are traps set for
 | A synchronous throw from `new Worker(...)` leaves the just-inserted `scans` row at `running` with no worker; healed only by the boot reconcile. | `src/scan/runner.ts` | Plan 6 |
 | `/healthz` still reports only Jellyfin though four connectors now exist. | `src/api/health.ts` | Plan 6 (already in its Task 1) |
 
+## Added by Plan 3 — must be closed by a specific slice
+
+| Item | Where | Close in |
+|---|---|---|
+| **Merge Versions changes what a delete means.** After a merge, Jellyfin returns ONE item and the alternate file's path lives only in `jellyfin_item_paths`. Deleting a non-keeper of a MERGED item removes a file the surviving item still references, so the executor must trigger a Jellyfin refresh for that item rather than a `DELETE /Items/{id}` — deleting the item would remove the version the operator kept. | `src/plan/executor.ts` | **Plan 4** |
+| **`unmonitorByPath` returns three states now** (`unmonitored` / `not-managed` / `lookup-failed`) and the plan document still shows the old two-field shape. `lookup-failed` must be treated as fail-closed: skip the delete. A fourth path exists — the unmonitor `PUT` itself throwing — which is only fail-closed if the executor wraps the call. | `docs/…-4-actions.md`, `src/plan/executor.ts` | **Plan 4, first task** |
+| The dupe-matcher memoization is keyed by `scanId` alone, so a reused id in one process would let `subRuns()` read a stale outcome map. Not reachable in production (ids autoincrement, one worker at a time) but the test suite already depends on incidental ordering to avoid it. Key it on something call-scoped before the pattern is reused. | `src/rules/dupes/adapter.ts` | Plan 4 or 5 |
+| If the two retained scans both fail before reaching the rules phase, the last successful scan's row is pruned and the summary's `evaluated` flips false while `findings` still holds real open rows. Narrow, currently unreachable. | `src/scan/orchestrator.ts`, `src/api/findings.ts` | Plan 6 |
+| `fuzzy-title`'s first-letter bucketing has no size bound and rebuilds trigram sets per comparison; a movie-heavy library with a skewed letter bucket could take minutes. Needs a size guard or timeout before running against a large library. | `src/rules/dupes/index.ts` | Plan 6 |
+
 ## Known limits, accepted
 
 - **Hop-count over-counting reinstates the vulnerability it closes.** `TRUST_PROXY` set higher than the real number of proxies makes Fastify trust a caller-supplied `X-Forwarded-For` token again. Documented in `parseHopCount` and the compose file; unguardable in code, since only the operator knows the topology.
