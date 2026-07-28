@@ -7,6 +7,7 @@ import { ACTION_TYPES, GUARD_IDS } from '../core/types.js'
 import { buildPlan, getPlan, approvePlan, type PlannerDeps } from '../plan/planner.js'
 import { restoreFromTrash, type TrashDeps } from '../plan/trash.js'
 import type { createExecutor } from '../plan/executor.js'
+import { writeAudit } from '../plan/audit.js'
 
 const actionSchema = z.object({
   type: z.enum(ACTION_TYPES),
@@ -122,18 +123,53 @@ export function registerPlanRoutes(app: FastifyInstance, deps: PlanRoutesDeps): 
     }
     deps.db.prepare("UPDATE plans SET status='approved' WHERE id=?").run(id)
     deps.db.prepare("UPDATE plan_actions SET status='pending' WHERE plan_id=? AND status='running'").run(id)
-    return reply.send(await deps.executor.execute(id, sessionOf(req).username))
+    try {
+      return reply.send(await deps.executor.execute(id, sessionOf(req).username))
+    } catch (err) {
+      // Symmetric with /execute above: a throw here can only come from the same `execute`
+      // function (the cross-process DB claim, since the in-process mutex was just checked), so it
+      // gets the same caller-facing mapping rather than falling through to a generic 500.
+      const message = (err as Error).message
+      return reply.code(message.includes('does not exist') ? 404 : 409).send({ error: message })
+    }
   })
 
+  /**
+   * A direct shortcut around the plan/approve/execute flow: Merge Versions is a reversible
+   * Jellyfin metadata change, not a filesystem delete, so it does not need a dry run an operator
+   * signs off on first. It still needs the same two things every OTHER state-changing route in
+   * this file gets for free from the plan/execute path: a permanent record of who did it, and
+   * safety against being replayed.
+   */
   app.post('/api/duplicates/:groupId/merge', guard, async (req, reply) => {
     const { groupId } = req.params as { groupId: string }
-    const row = deps.db.prepare('SELECT members_json FROM dupe_groups WHERE id = ?').get(groupId) as
-      { members_json: string } | undefined
+    const row = deps.db.prepare('SELECT members_json, status FROM dupe_groups WHERE id = ?').get(groupId) as
+      { members_json: string; status: string } | undefined
     if (!row) return reply.code(404).send({ error: 'no such duplicate group' })
+    // A double-click or a client retry after a timeout must not re-issue the merge: the ids in
+    // members_json may no longer name independent items once the first attempt succeeded, and
+    // mergeVersions has no defined behaviour for that. status='merged' is set only once, in the
+    // same transaction as the audit row below, so this check and that write can never disagree.
+    if (row.status === 'merged') {
+      return reply.code(409).send({ error: `duplicate group ${groupId} was already merged` })
+    }
     const ids = JSON.parse(row.members_json) as string[]
     if (ids.length < 2) return reply.code(409).send({ error: 'group has fewer than two members' })
     await deps.jellyfin.mergeVersions(ids)
-    deps.db.prepare("UPDATE dupe_groups SET status='merged' WHERE id=?").run(groupId)
+    const actor = sessionOf(req).username
+    // The status flip and the audit row land together or not at all — the same pairing the
+    // executor's own `settle`+`writeAudit` uses — so this merge can never succeed with zero trace
+    // in the audit log, and the log can never claim a merge that did not actually take.
+    deps.db.transaction(() => {
+      deps.db.prepare("UPDATE dupe_groups SET status='merged' WHERE id=?").run(groupId)
+      writeAudit(deps.db, {
+        actor,
+        actionType: 'merge-versions',
+        subject: groupId,
+        after: { mergedItemIds: ids },
+        outcome: 'done',
+      })
+    })()
     return reply.send({ merged: ids })
   })
 
