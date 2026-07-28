@@ -144,8 +144,13 @@ const purgeScheduler = createScheduler({
   cron: '30 4 * * *',
   isRunning: () => false,
   run: async () => {
-    const purged = purgeExpiredTrash({ db, config: config.file, pathMap: createPathMap(config.file.pathMappings) })
+    const { purged, failed } = purgeExpiredTrash({
+      db, config: config.file, pathMap: createPathMap(config.file.pathMappings),
+    })
     if (purged) logger.info('purged expired trash', { purged })
+    // A file that could not be removed keeps its trash row deliberately — the row is the
+    // only record that it exists. Say so, or the operator never learns it is stuck.
+    if (failed.length) logger.warn('some trash entries could not be purged', { failed })
   },
 })
 purgeScheduler.start()

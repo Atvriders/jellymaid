@@ -1240,16 +1240,30 @@ export function restoreFromTrash(deps: TrashDeps, trashId: string): { restored: 
   return { restored: true }
 }
 
-export function purgeExpiredTrash(deps: TrashDeps, now = new Date()): number {
+export function purgeExpiredTrash(
+  deps: TrashDeps,
+  now = new Date(),
+): { purged: number; failed: Array<{ id: string; path: string; reason: string }> } {
   const rows = deps.db.prepare('SELECT id, trash_path FROM trash WHERE restored_at IS NULL AND purge_after <= ?')
     .all(now.toISOString()) as Array<{ id: string; trash_path: string }>
   let purged = 0
+  const failed: Array<{ id: string; path: string; reason: string }> = []
   for (const row of rows) {
-    try { rmSync(row.trash_path, { force: true }) } catch { /* already gone */ }
+    // Only drop the row when the file is genuinely gone. An unconditional catch cannot
+    // tell "already gone" from EACCES or a read-only mount, and deleting the row anyway
+    // destroys the only record of a file that is still sitting on disk.
+    try {
+      rmSync(row.trash_path)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        failed.push({ id: row.id, path: row.trash_path, reason: (err as Error).message })
+        continue
+      }
+    }
     deps.db.prepare('DELETE FROM trash WHERE id = ?').run(row.id)
     purged += 1
   }
-  return purged
+  return { purged, failed }
 }
 ```
 
