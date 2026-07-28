@@ -28,6 +28,10 @@ function testDeps(pingImpl: () => Promise<void>) {
       start: () => ({ scanId: 1 }), cancel: () => false, isRunning: () => false,
       status: () => ({ running: false, scanId: null, phase: null, done: 0, total: null, lastScan: null }),
     } as never,
+    // Unused by these health-check tests — plans.test.ts covers the plan/execute/trash routes.
+    plannerDeps: (() => ({})) as never,
+    trashDeps: (() => ({})) as never,
+    executor: {} as never,
   }
 }
 

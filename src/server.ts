@@ -5,12 +5,16 @@ import type { Db } from './index/db.js'
 import type { JellyfinClient } from './connectors/jellyfin.js'
 import type { Logger } from './core/logger.js'
 import type { ScanRunner } from './scan/runner.js'
+import type { PlannerDeps } from './plan/planner.js'
+import type { TrashDeps } from './plan/trash.js'
+import type { createExecutor } from './plan/executor.js'
 import { createLockout } from './auth/lockout.js'
 import { registerAuthRoutes } from './api/auth.js'
 import { registerHealthRoutes } from './api/health.js'
 import { registerPathMapRoutes } from './api/pathmap.js'
 import { registerScanRoutes } from './api/scan.js'
 import { registerFindingsRoutes } from './api/findings.js'
+import { registerPlanRoutes } from './api/plans.js'
 
 export interface ServerDeps {
   config: AppConfig
@@ -18,6 +22,11 @@ export interface ServerDeps {
   jellyfin: JellyfinClient
   logger: Logger
   scanRunner: ScanRunner
+  /** Thunk, not a value: the planner needs a fresh *arr/qBittorrent view for every build, and a
+   * value captured once at server-construction time would go stale for the life of the process. */
+  plannerDeps: () => PlannerDeps
+  trashDeps: () => TrashDeps
+  executor: ReturnType<typeof createExecutor>
 }
 
 export function buildServer(deps: ServerDeps): FastifyInstance {
@@ -59,6 +68,14 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     sessionSecret: deps.config.env.sessionSecret,
   })
   registerFindingsRoutes(app, { db: deps.db, sessionSecret: deps.config.env.sessionSecret })
+  registerPlanRoutes(app, {
+    db: deps.db,
+    sessionSecret: deps.config.env.sessionSecret,
+    plannerDeps: deps.plannerDeps,
+    trashDeps: deps.trashDeps,
+    executor: deps.executor,
+    jellyfin: deps.jellyfin,
+  })
 
   app.setErrorHandler((err, _req, reply) => {
     deps.logger.error('unhandled route error', { err: (err as Error).message })

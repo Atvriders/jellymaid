@@ -25,6 +25,10 @@ function serverFor(trustProxyEnv?: string) {
       start: () => ({ scanId: 1 }), cancel: () => false, isRunning: () => false,
       status: () => ({ running: false, scanId: null, phase: null, done: 0, total: null, lastScan: null }),
     } as never,
+    // Unused by this trust-proxy test — plans.test.ts covers the plan/execute/trash routes.
+    plannerDeps: (() => ({})) as never,
+    trashDeps: (() => ({})) as never,
+    executor: {} as never,
   })
   // The login lockout keys on req.ip; this echoes exactly the value it would key on.
   app.get('/__ip', async (req) => ({ ip: req.ip }))

@@ -43,6 +43,10 @@ function app(items?: (opts: { startIndex: number; limit: number }) => Promise<{ 
     } as never,
     logger: createLogger({ level: 'error', sink: () => {} }),
     scanRunner: fakeScanRunner() as never,
+    // Unused by these path-map tests — plans.test.ts covers the plan/execute/trash routes.
+    plannerDeps: (() => ({})) as never,
+    trashDeps: (() => ({})) as never,
+    executor: {} as never,
   })
 }
 
