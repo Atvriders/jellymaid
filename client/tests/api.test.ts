@@ -122,6 +122,52 @@ describe('api', () => {
     })
   })
 
+  describe('trash', () => {
+    // Finding 4: GET /api/trash grew limit/offset/includeRestored query params and a `total` in
+    // its response. `trash()` must keep working with zero arguments — every existing caller — and
+    // only add a query string when the caller actually asks for pagination.
+    it('requests the bare route with no query string when called with no arguments', async () => {
+      let url = ''
+      const f = (async (u: string) => { url = String(u); return new Response('{"entries":[],"total":0}', { status: 200 }) }) as unknown as typeof fetch
+      await api(f).trash()
+      expect(url).toBe('/api/trash')
+    })
+
+    it('serialises limit/offset/includeRestored into the query string, including the boolean', async () => {
+      let url = ''
+      const f = (async (u: string) => { url = String(u); return new Response('{"entries":[],"total":0}', { status: 200 }) }) as unknown as typeof fetch
+      await api(f).trash({ limit: 10, offset: 20, includeRestored: false })
+      expect(url).toContain('limit=10')
+      expect(url).toContain('offset=20')
+      expect(url).toContain('includeRestored=false')
+    })
+
+    it('resolves the total alongside the entries', async () => {
+      const f = (async () => new Response('{"entries":[],"total":42}', { status: 200 })) as unknown as typeof fetch
+      const result = await api(f).trash()
+      expect(result.total).toBe(42)
+    })
+  })
+
+  describe('duplicates', () => {
+    // Finding 6: the server now joins matchedBy onto each group and video_range/has_subtitles onto
+    // each member. This is a pure passthrough (createApi does not reshape response bodies), so the
+    // point of this test is to pin the wire shape the client contract now promises, not to exercise
+    // any transformation logic.
+    it('passes matchedBy and the per-member quality facts through untouched', async () => {
+      const f = (async () => new Response(JSON.stringify({
+        groups: [{
+          id: 'g1', tier: 'exact', keeperItemId: 'b', scores: {}, matchedBy: ['dupe.provider-id'],
+          members: [{ id: 'a', name: 'Heat', video_range: 'SDR', has_subtitles: 0 }],
+        }],
+      }), { status: 200 })) as unknown as typeof fetch
+      const { groups } = await api(f).duplicates()
+      expect(groups[0]!.matchedBy).toEqual(['dupe.provider-id'])
+      expect(groups[0]!.members[0]!.video_range).toBe('SDR')
+      expect(groups[0]!.members[0]!.has_subtitles).toBe(0)
+    })
+  })
+
   describe('restoreTrash', () => {
     // src/api/plans.ts sends restoreFromTrash's own refusal — { restored: false, reason } — on a
     // 409, with no `error` key at all (unlike every other route's failure shape). A generic

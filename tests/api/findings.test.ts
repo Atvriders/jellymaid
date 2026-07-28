@@ -171,4 +171,94 @@ describe('GET /api/duplicates', () => {
     expect(body.groups[0].members).toHaveLength(2)
     expect(body.groups[0].members[0]).toHaveProperty('name')
   })
+
+  // Finding 6a: `exact` does not mean byte-verified — dupe.provider-id and dupe.series-episode
+  // both emit 'exact' from pure metadata, and dupe.identical-file's 'exact' rests on a HEAD+TAIL
+  // sampled hash, not the whole file. The Duplicates screen needs to show WHICH matcher(s) agreed,
+  // not just the tier. That list is only ever persisted in the finding's evidence_json
+  // (dupe.group's `matchedBy`, src/rules/dupes/adapter.ts), joinable on evidence.groupId ===
+  // dupe_groups.id — dupe_groups itself never stored it.
+  it('carries matchedBy, joined from the dupe.group finding that produced this group', async () => {
+    db.prepare(`INSERT INTO dupe_groups (id, tier, members_json, keeper_item_id, scores_json, status)
+      VALUES ('g1','exact','["a","b"]','b','{}','open')`).run()
+    for (const id of ['a', 'b']) {
+      db.prepare(`INSERT INTO jellyfin_items (id, scan_id, type, name, container_path, size_bytes, height, has_primary_image)
+        VALUES (?,1,'Movie','Heat','/mnt/m/' || ? || '.mkv', 100, 1080, 1)`).run(id, id)
+    }
+    db.prepare(`INSERT INTO findings (id, rule_id, class, severity, confidence, subjects_json,
+      evidence_json, reclaimable_bytes, status, first_seen, last_seen)
+      VALUES ('finding-g1','dupe.group','duplicate','warning','exact','[]',?,0,'open','T','T')`)
+      .run(JSON.stringify({
+        groupId: 'g1', keeperId: 'b', scores: {},
+        matchedBy: ['dupe.provider-id', 'dupe.series-episode'], links: [], crossLibrary: false,
+      }))
+
+    const body = (await build().inject({ method: 'GET', url: '/api/duplicates', headers: auth() })).json()
+    expect(body.groups[0].matchedBy).toEqual(['dupe.provider-id', 'dupe.series-episode'])
+  })
+
+  it('reports an empty matchedBy, rather than throwing, for a group with no corresponding finding', async () => {
+    db.prepare(`INSERT INTO dupe_groups (id, tier, members_json, keeper_item_id, scores_json, status)
+      VALUES ('g2','exact','["a","b"]','b','{}','open')`).run()
+    for (const id of ['a', 'b']) {
+      db.prepare(`INSERT INTO jellyfin_items (id, scan_id, type, name, container_path, size_bytes, height, has_primary_image)
+        VALUES (?,1,'Movie','Heat','/mnt/m/' || ? || '.mkv', 100, 1080, 1)`).run(id, id)
+    }
+    const body = (await build().inject({ method: 'GET', url: '/api/duplicates', headers: auth() })).json()
+    expect(body.groups[0].matchedBy).toEqual([])
+  })
+
+  it('does not confuse a dismissed dupe.group finding for a currently-open one when joining matchedBy', async () => {
+    // A finding that was dismissed (or belongs to a different, unrelated groupId) must not leak
+    // its matchedBy onto this group.
+    db.prepare(`INSERT INTO dupe_groups (id, tier, members_json, keeper_item_id, scores_json, status)
+      VALUES ('g4','exact','["a","b"]','b','{}','open')`).run()
+    for (const id of ['a', 'b']) {
+      db.prepare(`INSERT INTO jellyfin_items (id, scan_id, type, name, container_path, size_bytes, height, has_primary_image)
+        VALUES (?,1,'Movie','Heat','/mnt/m/' || ? || '.mkv', 100, 1080, 1)`).run(id, id)
+    }
+    db.prepare(`INSERT INTO findings (id, rule_id, class, severity, confidence, subjects_json,
+      evidence_json, reclaimable_bytes, status, first_seen, last_seen)
+      VALUES ('finding-g4-stale','dupe.group','duplicate','warning','exact','[]',?,0,'dismissed','T','T')`)
+      .run(JSON.stringify({ groupId: 'g4', keeperId: 'b', scores: {}, matchedBy: ['dupe.provider-id'], links: [], crossLibrary: false }))
+
+    const body = (await build().inject({ method: 'GET', url: '/api/duplicates', headers: auth() })).json()
+    expect(body.groups[0].matchedBy).toEqual([])
+  })
+
+  // Finding 6b: the keeper score shows e.g. "HDR 300 vs 0" with nothing to corroborate it.
+  // video_range and has_subtitles already live on jellyfin_items (004_item_quality_signals.sql) —
+  // the same table this route already SELECTs members from — so exposing them is two column names,
+  // no join.
+  it('carries the video_range and has_subtitles facts behind each member\'s keeper score', async () => {
+    db.prepare(`INSERT INTO dupe_groups (id, tier, members_json, keeper_item_id, scores_json, status)
+      VALUES ('g3','exact','["a","b"]','b','{}','open')`).run()
+    db.prepare(`INSERT INTO jellyfin_items (id, scan_id, type, name, container_path, size_bytes, height,
+      has_primary_image, video_range, has_subtitles)
+      VALUES ('a',1,'Movie','Heat','/mnt/m/a.mkv', 100, 1080, 1, 'SDR', 0)`).run()
+    db.prepare(`INSERT INTO jellyfin_items (id, scan_id, type, name, container_path, size_bytes, height,
+      has_primary_image, video_range, has_subtitles)
+      VALUES ('b',1,'Movie','Heat','/mnt/m/b.mkv', 100, 2160, 1, 'HDR10', 1)`).run()
+
+    const body = (await build().inject({ method: 'GET', url: '/api/duplicates', headers: auth() })).json()
+    const a = body.groups[0].members.find((m: { id: string }) => m.id === 'a')
+    const b = body.groups[0].members.find((m: { id: string }) => m.id === 'b')
+    expect(a.video_range).toBe('SDR')
+    expect(a.has_subtitles).toBe(0)
+    expect(b.video_range).toBe('HDR10')
+    expect(b.has_subtitles).toBe(1)
+  })
+
+  it('reports video_range as null, not a guessed value, for an item this Jellyfin never reported it for', async () => {
+    db.prepare(`INSERT INTO dupe_groups (id, tier, members_json, keeper_item_id, scores_json, status)
+      VALUES ('g5','exact','["a","b"]','b','{}','open')`).run()
+    for (const id of ['a', 'b']) {
+      db.prepare(`INSERT INTO jellyfin_items (id, scan_id, type, name, container_path, size_bytes, height, has_primary_image)
+        VALUES (?,1,'Movie','Heat','/mnt/m/' || ? || '.mkv', 100, 1080, 1)`).run(id, id)
+    }
+    const body = (await build().inject({ method: 'GET', url: '/api/duplicates', headers: auth() })).json()
+    const a = body.groups[0].members.find((m: { id: string }) => m.id === 'a')
+    expect(a.video_range).toBeNull()
+    expect(a.has_subtitles).toBe(0)
+  })
 })

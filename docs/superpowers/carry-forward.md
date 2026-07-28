@@ -63,6 +63,33 @@ close it. Nothing here is a known-broken behaviour today; they are traps set for
 - Cosmetic: `/api/pathmap/detect`'s 400 returns a static string where `PUT` returns parsed issues; the `try` around `readFileSync`+`JSON.parse` reports an EACCES as "not valid JSON"; `src/fs/pathmap.ts` boundary-checks with `'/'` in one place and `path.sep` in another; a migration named `01_x.sql` would collide with `001_init.sql`; `src/index.ts` has no SIGTERM handler and never closes the database.
 - **No login is logged.** Successful logins, failures and lockout trips leave no record anywhere — Fastify's own logger is off so request bodies never reach stdout, but that also means no audit trail on the security boundary.
 
+## Added by the Plan 5 UI review fix wave — known limits, accepted
+
+`/api/duplicates` now exposes `matchedBy` and the raw `video_range`/`has_subtitles` facts behind
+each member's keeper score (`src/api/findings.ts`), so the Duplicates screen can show WHICH
+matcher(s) agreed on a group and corroborate the HDR/subtitles weights with something other than a
+bare number. Two real limits remain underneath those facts, not fixable by a route change:
+
+- **Subtitle and audio facts are coarser than what they corroborate.** `hasSubtitles` collapses
+  subtitle count and language down to a single boolean at ingest (`src/connectors/jellyfin.ts:123`,
+  `streams.some((s) => s.Type === 'Subtitle')`) — two members that both report `has_subtitles: 1`
+  are not necessarily equally well-subtitled (one English track vs. five languages read the same).
+  Worse, only the FIRST audio stream of a media source survives normalization at all
+  (`jellyfin.ts:79` picks `streams.find((s) => s.Type === 'Audio')`, and `audioChannels` at
+  `jellyfin.ts:118` is read from that one stream) — a file with a 2.0 commentary track listed before
+  its 7.1 main track would report `audioChannels: 2`. Closing this needs a re-scan plus a schema
+  change (a subtitle count/language column, a real audio-streams table), not a route change — it is
+  an ingest-time information loss the API cannot recover after the fact.
+- **`isHdr` cannot distinguish "confirmed SDR" from "Jellyfin never said."** `src/rules/keeper.ts`'s
+  `hdr: isHdr ? w.hdr : 0` scores both identically at `0`: a genuinely SDR copy and a copy whose
+  `video_range` is simply `null` (an older Jellyfin, or a library scan that predates the column)
+  collect the same absence of bonus. Exposing the raw `video_range` per member (rather than only the
+  derived boolean) lets an operator tell the two apart by eye on the Duplicates screen, but the
+  SCORE itself still cannot — `isHdrRange` (`src/rules/dupes/adapter.ts`) folds `null` and `'SDR'`
+  into the same `false`, by design (an absent signal must contribute nothing, not a guessed bonus),
+  so a three-state score (confirmed-SDR / confirmed-HDR / unknown) would be a `keeper.ts` change,
+  not a display one.
+
 ## Fixed during Plan 1 — do not reintroduce
 
 Each of these was found by review, has a regression test, and has a comment at the site explaining

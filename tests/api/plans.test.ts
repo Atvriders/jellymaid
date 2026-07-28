@@ -326,6 +326,68 @@ describe('GET /api/trash', () => {
     expect(afterRestore.id).toBe(id)
     expect(afterRestore.restoredAt).not.toBeNull()
   })
+
+  // Finding 4: with no offset and a fixed LIMIT 200, anything past row 200 (and every slot an
+  // already-restored row still occupies) was permanently unreachable — there was no way to page
+  // past it and no way to filter restored rows out of the way.
+  function seedTrash(pathMap: ReturnType<typeof createPathMap>, name: string, deletedAt: string, restored = false) {
+    const path = join(root, `${name}.mkv`)
+    writeFileSync(path, 'x')
+    const result = moveToTrash({ db, config: fileConfigSchema.parse({}), pathMap }, { path, planId: 'p1', sizeBytes: 1 })
+    if (!result.trashed) throw new Error(`test setup failed: ${JSON.stringify(result)}`)
+    const id = (db.prepare('SELECT id FROM trash WHERE original_path = ?').get(path) as { id: string }).id
+    // deleted_at is forced to a deterministic value rather than trusted to differ across two
+    // `moveToTrash` calls a few milliseconds apart — the route orders by it, and this suite must
+    // not depend on wall-clock granularity to get a stable order.
+    db.prepare('UPDATE trash SET deleted_at = ? WHERE id = ?').run(deletedAt, id)
+    if (restored) db.prepare('UPDATE trash SET restored_at = ? WHERE id = ?').run(deletedAt, id)
+    return id
+  }
+
+  it('paginates with limit/offset and reports the total across the whole table, not just the page', async () => {
+    const pathMap = createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }])
+    seedTrash(pathMap, 'a', 'T1')
+    seedTrash(pathMap, 'b', 'T2')
+    seedTrash(pathMap, 'c', 'T3')
+
+    const res = await build().inject({ method: 'GET', url: '/api/trash?limit=1&offset=1', headers: auth() })
+    expect(res.statusCode).toBe(200)
+    const body = res.json()
+    expect(body.entries).toHaveLength(1)
+    // Newest first (T3, T2, T1); offset 1 skips T3, so the one row returned is T2.
+    expect(body.entries[0].originalPath).toBe(join(root, 'b.mkv'))
+    expect(body.total).toBe(3)
+  })
+
+  it('rejects a malformed limit/offset with 400 rather than a raw datatype-mismatch 500', async () => {
+    expect((await build().inject({ method: 'GET', url: '/api/trash?limit=0', headers: auth() })).statusCode).toBe(400)
+    expect((await build().inject({ method: 'GET', url: '/api/trash?offset=-1', headers: auth() })).statusCode).toBe(400)
+    expect((await build().inject({ method: 'GET', url: '/api/trash?limit=not-a-number', headers: auth() })).statusCode).toBe(400)
+  })
+
+  it('excludes already-restored entries when includeRestored=false, with a total reflecting the same filter', async () => {
+    const pathMap = createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }])
+    seedTrash(pathMap, 'a', 'T1', true)
+    seedTrash(pathMap, 'b', 'T2', false)
+
+    const res = await build().inject({ method: 'GET', url: '/api/trash?includeRestored=false', headers: auth() })
+    expect(res.statusCode).toBe(200)
+    const body = res.json()
+    expect(body.entries).toHaveLength(1)
+    expect(body.entries[0].originalPath).toBe(join(root, 'b.mkv'))
+    expect(body.total).toBe(1)
+  })
+
+  it('still includes restored entries by default, unchanged from before pagination existed', async () => {
+    const pathMap = createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }])
+    seedTrash(pathMap, 'a', 'T1', true)
+    seedTrash(pathMap, 'b', 'T2', false)
+
+    const res = await build().inject({ method: 'GET', url: '/api/trash', headers: auth() })
+    const body = res.json()
+    expect(body.entries).toHaveLength(2)
+    expect(body.total).toBe(2)
+  })
 })
 
 describe('GET /api/config/thresholds', () => {
@@ -346,5 +408,35 @@ describe('GET /api/config/thresholds', () => {
       trashMaxBytes: parsed.trash.maxBytes,
       trashRetentionDays: parsed.trash.retentionDays,
     })
+  })
+
+  // Finding 5: `guards.privateTrackerHosts` is the operator's private-tracker list, and this
+  // read-only settings display has no business publishing it. Configured non-empty here (unlike
+  // the test above, which uses an all-defaults config where an accidental leak would be invisible
+  // — an empty array leaking looks identical to no leak at all) so a regression actually shows up.
+  it('never publishes the private tracker host list', async () => {
+    const app = Fastify()
+    app.register(cookie)
+    registerPlanRoutes(app, {
+      db,
+      sessionSecret: SECRET,
+      plannerDeps: () => ({
+        db,
+        config: fileConfigSchema.parse({ guards: { privateTrackerHosts: ['tracker.example', 'secret.example'] } }),
+        pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }]),
+        qbittorrent: { torrents: async () => [] },
+        radarr: null,
+        sonarr: null,
+      }),
+      executor: { execute: async () => ({ planId: 'p', status: 'completed', done: 0, failed: 0, skipped: 0, blocked: 0, bytesFreed: 0 }), isRunning: () => false },
+      trashDeps: () => ({ db, config: fileConfigSchema.parse({}), pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }]) }),
+      jellyfin: { mergeVersions: async () => {} },
+    } as never)
+
+    const res = await app.inject({ method: 'GET', url: '/api/config/thresholds', headers: auth() })
+    expect(res.statusCode).toBe(200)
+    const body = res.json()
+    expect(body).not.toHaveProperty('privateTrackerHosts')
+    expect(JSON.stringify(body)).not.toContain('tracker.example')
   })
 })

@@ -89,18 +89,79 @@ describe('/api/explorer', () => {
     expect(body.entries.find((e: { name: string }) => e.name === 'junk.nfo').flags).toEqual([])
   })
 
-  it('does not let a directory name that contains a LIKE wildcard pull in an unrelated sibling\'s bytes', async () => {
-    // `_` (and `%`) are SQL LIKE wildcards, not just characters — and scene-release naming makes
-    // `_` routine in real directory names. Unescaped, `LIKE '.../Movie_Name/%'` would also match
-    // the completely unrelated `/mnt/m/MovieXName` sibling (`_` matching any one character).
-    entry('/mnt/m/Movie_Name', { is_dir: 1 })
-    entry('/mnt/m/Movie_Name/a.mkv', { is_media: 1, size_bytes: 100 })
-    entry('/mnt/m/MovieXName', { is_dir: 1 })
-    entry('/mnt/m/MovieXName/b.mkv', { is_media: 1, size_bytes: 9000 })
+  it('rolls up correctly for a directory name containing %, _ and a literal backslash, without pulling in an unrelated sibling\'s bytes', async () => {
+    // `%`, `_` and `\` are SQL LIKE metacharacters, not just directory-name characters — and
+    // scene-release naming makes `_` routine in real directory names. The rollup query no longer
+    // uses LIKE at all (see the range-scan rewrite in src/api/explorer.ts, finding 1), so none of
+    // this needs escaping any more — but the regression this test used to guard (an unescaped `_`
+    // silently pulling in `/mnt/m/MovieXName`'s bytes) must still be impossible under the new
+    // query, and a directory name carrying all three characters at once must still roll up to
+    // exactly its own bytes.
+    entry('/mnt/m/Movie_Name%Extra\\End', { is_dir: 1 })
+    entry('/mnt/m/Movie_Name%Extra\\End/a.mkv', { is_media: 1, size_bytes: 100 })
+    entry('/mnt/m/MovieXNameXExtraXEnd', { is_dir: 1 })
+    entry('/mnt/m/MovieXNameXExtraXEnd/b.mkv', { is_media: 1, size_bytes: 9000 })
     const body = (await build().inject({ method: 'GET', url: '/api/explorer?path=/mnt/m', headers: auth() })).json()
-    const dir = body.entries.find((e: { name: string }) => e.name === 'Movie_Name')
+    const dir = body.entries.find((e: { name: string }) => e.name === 'Movie_Name%Extra\\End')
     expect(dir.sizeBytes).toBe(100)
     expect(dir.fileCount).toBe(1)
+  })
+
+  // Finding 2: a trailing slash used to miss the root-equality check (`requested === root.container`)
+  // and the child query's exact `parent_path = ?` bind, so a populated root reported a phantom
+  // self-referential parent AND zero entries.
+  describe('trailing slash normalization', () => {
+    it('treats a trailing slash on the root the same as the bare root', async () => {
+      entry('/mnt/m/Heat', { is_dir: 1 })
+      entry('/mnt/m/Heat/a.mkv', { is_media: 1, size_bytes: 100 })
+      const body = (await build().inject({ method: 'GET', url: '/api/explorer?path=/mnt/m/', headers: auth() })).json()
+      expect(body.parent).toBeNull()
+      expect(body.path).toBe('/mnt/m')
+      expect(body.entries.map((e: { name: string }) => e.name)).toEqual(['Heat'])
+    })
+
+    it('treats a trailing slash on a non-root directory the same as its slash-less form', async () => {
+      entry('/mnt/m/Heat', { is_dir: 1 })
+      entry('/mnt/m/Heat/Extras', { is_dir: 1 })
+      entry('/mnt/m/Heat/Extras/a.mkv', { is_media: 1, size_bytes: 50 })
+      const body = (await build().inject({ method: 'GET', url: '/api/explorer?path=/mnt/m/Heat/', headers: auth() })).json()
+      expect(body.parent).toBe('/mnt/m')
+      expect(body.entries.map((e: { name: string }) => e.name)).toEqual(['Extras'])
+    })
+
+    it('does not strip a lone "/" into an empty path', async () => {
+      // A lone "/" is not a trailing slash on some longer path — stripping it would produce "",
+      // which this route already treats as "no path given" (the configured-roots listing), a
+      // completely different response shape than a (rejected, since no root is literally "/")
+      // directory listing would be.
+      const res = await build().inject({ method: 'GET', url: '/api/explorer?path=/', headers: auth() })
+      expect(res.statusCode).toBe(400)
+    })
+  })
+
+  // Finding 3: flagMap used to load and JSON.parse every open filesystem finding in the database,
+  // unbounded by the directory being listed. This proves it stays scoped: a finding belonging to a
+  // path outside the current listing must never leak into it, however many other open findings exist.
+  it('scopes finding flags to the requested directory, not the whole findings table', async () => {
+    entry('/mnt/m/here.mkv', { is_media: 1 })
+    db.prepare(`INSERT INTO findings (id, rule_id, class, severity, confidence, subjects_json,
+      evidence_json, reclaimable_bytes, status, first_seen, last_seen)
+      VALUES ('here-finding','fs.orphan-media','filesystem','warning','exact',
+              '[{"kind":"path","path":"/mnt/m/here.mkv","label":"x"}]','{}',1,'open','T','T')`).run()
+    // A large number of open filesystem findings for paths that are NOT in this listing — under
+    // the old unscoped query these were all loaded and parsed on every request to this directory.
+    const insertElsewhere = db.prepare(`INSERT INTO findings (id, rule_id, class, severity, confidence,
+      subjects_json, evidence_json, reclaimable_bytes, status, first_seen, last_seen)
+      VALUES (@id,'fs.junk','filesystem','warning','exact',@subjects,'{}',1,'open','T','T')`)
+    const tx = db.transaction(() => {
+      for (let i = 0; i < 500; i += 1) {
+        insertElsewhere.run({ id: `elsewhere-${i}`, subjects: JSON.stringify([{ kind: 'path', path: `/mnt/other/${i}.nfo`, label: 'x' }]) })
+      }
+    })
+    tx()
+    const body = (await build().inject({ method: 'GET', url: '/api/explorer?path=/mnt/m', headers: auth() })).json()
+    const here = body.entries.find((e: { name: string }) => e.name === 'here.mkv')
+    expect(here.flags).toEqual(['orphan'])
   })
 
   it('refuses a path outside every configured root', async () => {
@@ -150,6 +211,52 @@ describe('/api/explorer', () => {
         method: 'GET', url: `/api/explorer?path=${encodeURIComponent(outside)}`, headers: auth(),
       })
       expect(res.statusCode).toBe(400)
+    })
+  })
+
+  // Finding 1: rollupSize/rollupCount ran an unindexable full table scan (a `LIKE ? || '/%' ESCAPE
+  // '\'`, which SQLite's LIKE-to-range optimization refuses to fire on) for EVERY directory row in
+  // a listing. At this exact shape — 200 sibling directories, 20,200 total fs_entries rows — the
+  // old query measured ~818ms for one listing; the fixed range-scan query measures ~35ms. 200ms is
+  // a threshold the fix clears with room to spare and the old query missed by 4x, so this fails
+  // loudly against a regression without being flaky on a slower CI box.
+  describe('performance regression — finding 1 (rollup must be an index seek, not a table scan)', () => {
+    it('lists a directory with 200 sibling subdirectories and 20,000 files well under a second', async () => {
+      const insert = db.prepare(`INSERT INTO fs_entries (container_path, scan_id, parent_path, name, ext,
+        is_dir, size_bytes, mtime, dev, inode, nlink, is_media, library_root, root_role)
+        VALUES (@container_path,1,@parent_path,@name,@ext,@is_dir,@size_bytes,0,1,@inode,1,@is_media,'/mnt/m','library')`)
+      const numDirs = 200
+      const filesPerDir = 100
+      let inode = 0
+      const seed = db.transaction(() => {
+        for (let d = 0; d < numDirs; d += 1) {
+          const dirPath = `/mnt/m/Dir${d}`
+          inode += 1
+          insert.run({
+            container_path: dirPath, parent_path: '/mnt/m', name: `Dir${d}`, ext: null,
+            is_dir: 1, size_bytes: 0, inode, is_media: 0,
+          })
+          for (let f = 0; f < filesPerDir; f += 1) {
+            inode += 1
+            insert.run({
+              container_path: `${dirPath}/file${f}.mkv`, parent_path: dirPath, name: `file${f}.mkv`,
+              ext: '.mkv', is_dir: 0, size_bytes: 100, inode, is_media: 1,
+            })
+          }
+        }
+      })
+      seed()
+
+      const started = performance.now()
+      const res = await build().inject({ method: 'GET', url: '/api/explorer?path=/mnt/m', headers: auth() })
+      const elapsedMs = performance.now() - started
+
+      expect(res.statusCode).toBe(200)
+      const body = res.json()
+      expect(body.entries).toHaveLength(numDirs)
+      expect(body.entries[0].fileCount).toBe(filesPerDir)
+      expect(body.entries[0].sizeBytes).toBe(filesPerDir * 100)
+      expect(elapsedMs).toBeLessThan(200)
     })
   })
 })

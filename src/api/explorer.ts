@@ -33,7 +33,16 @@ export function registerExplorerRoutes(
   app.get('/api/explorer', { preHandler: requireSession(deps.sessionSecret) }, async (req, reply) => {
     const parsed = explorerQuery.safeParse(req.query)
     if (!parsed.success) return reply.code(400).send({ error: 'invalid query' })
-    const requested = parsed.data.path
+    // A trailing slash names the same directory as its slash-less form (`/mnt/m/` === `/mnt/m`),
+    // but neither the root-equality check just below nor the child query's exact `parent_path`
+    // match treats them as equal strings — normalize it away once, up front, so both agree on one
+    // canonical form. Without this, `?path=/mnt/m/` at a root of `/mnt/m` fails the `===` check
+    // (reporting a parent that points right back at itself) AND binds `parent_path = '/mnt/m/'`
+    // against rows stored as `/mnt/m/Something` (never `/mnt/m/`), so a populated root reports
+    // zero entries. A lone "/" is left alone: stripping it would leave an empty string, which this
+    // route already treats as "no path" (see explorerQuery's comment above), not as the root.
+    let requested = parsed.data.path
+    if (requested && requested.length > 1 && requested.endsWith('/')) requested = requested.slice(0, -1)
 
     if (!requested) {
       // The top level of the tree: every configured mount (library AND download roots — an
@@ -87,49 +96,72 @@ export function registerExplorerRoutes(
 }
 
 /**
- * `%` and `_` are SQL LIKE wildcards, not just directory-name characters — and scene-release
- * naming makes `_` routine in real media directory names (`Movie_Name_2020`). Left unescaped,
- * `LIKE '/mnt/m/Movie_Name/%'` also matches a completely unrelated sibling like
- * `/mnt/m/MovieXName/...` (`_` matching any one character), silently pulling another folder's
- * bytes into this one's rollup on the one screen an operator trusts as ground truth. Every
- * occurrence of the escape character itself, then of `%` and `_`, is prefixed with `\` before the
- * prefix is bound, and the query declares `\` as the escape character to match.
+ * Reads the INDEX, never the live filesystem — this is what keeps the screen fast at 100k+
+ * entries (see the task brief). A bounded range scan on `fs_entries.container_path`'s own PRIMARY
+ * KEY, not a LIKE-prefix scan: `container_path` is `TEXT PRIMARY KEY` under SQLite's default
+ * BINARY collation (src/index/migrations/001_init.sql), so every true descendant of `prefix` —
+ * one level down or a hundred — sorts strictly between `prefix + '/'` and `prefix + '0'`. `/` is
+ * 0x2F and `0` is 0x30, the very next byte, so nothing that isn't a descendant can fall in that
+ * gap and nothing that is one can fall outside it; the directory row itself (bare `prefix`, with
+ * nothing appended) sorts below the lower bound, so it is never double-counted.
+ *
+ * This used to be `LIKE ? || '/%' ESCAPE '\'` with a hand-escaped prefix (`%`/`_`/`\` are LIKE
+ * metacharacters, and scene-release naming makes `_` routine in real directory names). That was a
+ * full table scan on every call: SQLite's LIKE-to-range optimization refuses to fire once a LIKE
+ * declares an ESCAPE clause, and this table's default collation made escaping the pattern
+ * mandatory for correctness. Comparing `container_path` directly with `>`/`<` needs no escaping at
+ * all — a `%`, `_`, or literal `\` inside a directory NAME is just three ordinary bytes to a plain
+ * comparison — and SQLite proves the bound directly against the PK's index
+ * (`sqlite_autoindex_fs_entries_1`), turning what was a full scan per directory into an index
+ * range seek. Measured on 100,500 rows / 500 sibling directories: the old query took ~13.5s for a
+ * single listing; this one takes ~22ms (see fixwave-server-report.md for the full before/after).
  */
-function escapeLikePrefix(raw: string): string {
-  return raw.replace(/[\\%_]/g, (c) => `\\${c}`)
+const descendantBounds = (prefix: string): [string, string] => [`${prefix}/`, `${prefix}0`]
+
+const rollupSize = (db: Db, prefix: string): number => {
+  const [lo, hi] = descendantBounds(prefix)
+  return (db.prepare(
+    'SELECT COALESCE(SUM(size_bytes),0) s FROM fs_entries WHERE is_dir = 0 AND container_path > ? AND container_path < ?',
+  ).get(lo, hi) as { s: number }).s
 }
 
-/** Reads the INDEX, never the live filesystem — this is what keeps the screen fast at 100k+
- * entries (see the task brief). `LIKE prefix || '/%'` matches true descendants only, never the
- * directory row itself, so a directory never counts its own (always-0) size_bytes twice. */
-const rollupSize = (db: Db, prefix: string): number =>
-  (db.prepare(
-    "SELECT COALESCE(SUM(size_bytes),0) s FROM fs_entries WHERE is_dir = 0 AND container_path LIKE ? || '/%' ESCAPE '\\'",
-  ).get(escapeLikePrefix(prefix)) as { s: number }).s
+const rollupCount = (db: Db, prefix: string): number => {
+  const [lo, hi] = descendantBounds(prefix)
+  return (db.prepare(
+    'SELECT COUNT(*) c FROM fs_entries WHERE is_dir = 0 AND container_path > ? AND container_path < ?',
+  ).get(lo, hi) as { c: number }).c
+}
 
-const rollupCount = (db: Db, prefix: string): number =>
-  (db.prepare(
-    "SELECT COUNT(*) c FROM fs_entries WHERE is_dir = 0 AND container_path LIKE ? || '/%' ESCAPE '\\'",
-  ).get(escapeLikePrefix(prefix)) as { c: number }).c
-
-/** Only `status = 'open'` findings count — a dismissed or resolved finding must not keep marking
- * an entry as suspect on the one screen an operator falls back to for ground truth. */
+/**
+ * Only `status = 'open'` findings count — a dismissed or resolved finding must not keep marking
+ * an entry as suspect on the one screen an operator falls back to for ground truth.
+ *
+ * Scoped to exactly `paths` (the directory being listed), not every open filesystem finding in the
+ * database: this used to load ALL of them and `JSON.parse` every `subjects_json`, unbounded by
+ * what was actually being shown. That cost was negligible next to the rollup scan finding 1 fixed,
+ * but with that scan now an index seek, an unscoped load-and-parse-everything pass would become
+ * the dominant cost on a large, heavily-flagged library. `json_each`/`json_extract` (SQLite's
+ * built-in JSON1, bundled with better-sqlite3) push both the "does this finding even mention one of
+ * these paths" filter and the path extraction into SQL, so only rows that actually match come back
+ * to be walked in JS at all — the shape already used for member-id lookups elsewhere in this file's
+ * neighboring routes (see e.g. the placeholder-list pattern in findings.ts's /api/duplicates).
+ */
 function flagMap(db: Db, paths: string[]): Map<string, string[]> {
   const out = new Map<string, string[]>()
   if (!paths.length) return out
+  const placeholders = paths.map(() => '?').join(',')
   const rows = db.prepare(
-    "SELECT rule_id, subjects_json FROM findings WHERE status = 'open' AND class = 'filesystem'",
-  ).all() as Array<{ rule_id: string; subjects_json: string }>
-  const wanted = new Set(paths)
+    `SELECT DISTINCT f.rule_id AS rule_id, json_extract(je.value, '$.path') AS path
+     FROM findings f, json_each(f.subjects_json) je
+     WHERE f.status = 'open' AND f.class = 'filesystem'
+       AND json_extract(je.value, '$.path') IN (${placeholders})`,
+  ).all(...paths) as Array<{ rule_id: string; path: string | null }>
   for (const row of rows) {
     const flag = FLAG_BY_RULE[row.rule_id]
-    if (!flag) continue
-    for (const subject of JSON.parse(row.subjects_json) as Array<{ path?: string }>) {
-      if (!subject.path || !wanted.has(subject.path)) continue
-      const list = out.get(subject.path) ?? []
-      if (!list.includes(flag)) list.push(flag)
-      out.set(subject.path, list)
-    }
+    if (!flag || !row.path) continue
+    const list = out.get(row.path) ?? []
+    if (!list.includes(flag)) list.push(flag)
+    out.set(row.path, list)
   }
   return out
 }

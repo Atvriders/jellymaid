@@ -177,6 +177,23 @@ export interface DupeMember {
   audio_channels: number | null
   container: string | null
   library_name: string | null
+  /**
+   * The video stream's colour range exactly as Jellyfin reported it ('SDR' | 'HDR10' | 'HLG' |
+   * 'Dolby Vision' | ...), or null when this row predates the column or this Jellyfin does not
+   * report one. Corroborates the keeper score's `hdr` weight (src/rules/keeper.ts) — that score
+   * alone cannot say whether a 0 means "confirmed SDR" or "we never found out"; this is the fact
+   * behind it. NOT collapsed to a boolean here on purpose: see docs/superpowers/carry-forward.md
+   * for why `hdr: isHdr ? 300 : 0` itself still cannot make that distinction.
+   */
+  video_range: string | null
+  /**
+   * Whether this item carries ANY subtitle stream, per Jellyfin's own stream list — a single
+   * boolean, not a count or a language list. Corroborates the keeper score's `subtitles` weight.
+   * Known limit (see docs/superpowers/carry-forward.md): ingest keeps only whether a subtitle
+   * stream exists at all, not how many or in what languages, so two members both reporting `1`
+   * here may not be equally well-subtitled.
+   */
+  has_subtitles: number
 }
 
 export interface DupeGroup {
@@ -185,6 +202,15 @@ export interface DupeGroup {
   keeperItemId: string | null
   scores: Record<string, { total: number; breakdown: Record<string, number> }>
   members: DupeMember[]
+  /**
+   * Which duplicate matcher(s) (`dupe.provider-id`, `dupe.identical-file`, ...) actually agreed on
+   * this group — never inferred from `tier` alone: `tier` is the HIGHEST confidence any single
+   * matcher reported, and 'exact' does not mean byte-verified. `dupe.provider-id` and
+   * `dupe.series-episode` both emit 'exact' from pure metadata, and `dupe.identical-file`'s 'exact'
+   * rests on a head+tail SAMPLED hash, not the whole file (src/fs/hasher.ts). Empty when the group
+   * has no corresponding open `dupe.group` finding to join against — never fabricated.
+   */
+  matchedBy: string[]
 }
 
 export interface ExplorerEntry {
@@ -197,7 +223,7 @@ export interface ExplorerEntry {
   flags: string[]
 }
 
-function qs(params: Record<string, string | number | undefined>): string {
+function qs(params: Record<string, string | number | boolean | undefined>): string {
   const sp = new URLSearchParams()
   for (const [k, v] of Object.entries(params)) if (v !== undefined) sp.set(k, String(v))
   const s = sp.toString()
@@ -311,7 +337,12 @@ export function createApi(opts: { baseUrl: string; fetchImpl?: typeof fetch }) {
     pathmapVerify: () => post<VerifyReport>('/api/pathmap/verify'),
     pathmapDetect: (mountRoots: string[]) => post<{ proposed: PathMapping[] }>('/api/pathmap/detect', { mountRoots }),
 
-    trash: () => call<{ entries: TrashEntry[] }>('/api/trash'),
+    // `opts` defaults to `{}` so existing zero-argument callers (`api.trash()`) keep working
+    // unchanged — the query string it produces is identical to before pagination existed. `total`
+    // is additive on the response: it lets a caller say "showing N of M" instead of the old
+    // behaviour of silently truncating at a fixed 200-row limit with no way to page past it.
+    trash: (opts: { limit?: number; offset?: number; includeRestored?: boolean } = {}) =>
+      call<{ entries: TrashEntry[]; total: number }>(`/api/trash${qs(opts)}`),
     configThresholds: () => call<Thresholds>('/api/config/thresholds'),
 
     // Task 5 wires the server side of this (src/api/explorer.ts is not registered yet); the

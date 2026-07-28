@@ -24,6 +24,21 @@ const planBody = z.object({ actions: z.array(actionSchema).min(1) })
 // listQuery does, turns that into a clean 400 instead.
 const auditQuery = z.object({ limit: z.coerce.number().int().min(1).max(1000).default(200) })
 
+// Mirrors auditQuery above: a malformed ?limit/?offset coerced by a bare `Number()` becomes NaN,
+// and better-sqlite3 throws `datatype mismatch` on a NaN bound parameter — an uncaught 500 for
+// something that is really the caller's fault. `includeRestored` is spelled as an explicit
+// 'true'/'false' enum rather than `z.coerce.boolean()`: zod's boolean coercion runs every non-empty
+// string through the JS `Boolean()` constructor, so `?includeRestored=false` would coerce to
+// `true` — the exact opposite of what the caller asked for.
+const trashQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(1000).default(200),
+  offset: z.coerce.number().int().min(0).default(0),
+  // Defaults to including restored rows: this is the pre-pagination behaviour (every row, restored
+  // or not — see GET /api/trash's own doc comment below), preserved so an existing caller that
+  // never learns about this flag keeps seeing exactly what it always saw.
+  includeRestored: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
+})
+
 const sessionOf = (req: FastifyRequest) => (req as FastifyRequest & { session: SessionPayload }).session
 
 /**
@@ -250,17 +265,30 @@ export function registerPlanRoutes(app: FastifyInstance, deps: PlanRoutesDeps): 
   /**
    * History (Plan 5, Task 6) needs somewhere to read the trash back from: `restoreFromTrash` only
    * ever takes an id it is handed, and until now nothing handed the operator one. Every row,
-   * restored or not — a restored entry's Restore button is not offered a second time (the same
-   * `restored_at IS NULL` replay guard `restoreFromTrash` itself enforces), but hiding it entirely
-   * would erase the one record that a file was ever moved there and later put back.
+   * restored or not, is eligible by default — a restored entry's Restore button is not offered a
+   * second time (the same `restored_at IS NULL` replay guard `restoreFromTrash` itself enforces),
+   * but hiding it entirely would erase the one record that a file was ever moved there and later
+   * put back. `includeRestored=false` lets a caller narrow to only what is still restorable.
+   *
+   * Finding 4: this used to be a bare `ORDER BY deleted_at DESC LIMIT 200` with no offset and no
+   * restored filter — anything past row 200 (and every slot an already-restored row still
+   * occupied) was permanently unreachable, forever, on a library that trashes more than 200 files
+   * in its lifetime. `limit`/`offset` mirror `auditQuery` above; `total` — counted under the SAME
+   * `includeRestored` filter as the page itself — is what lets a caller say "showing N of M"
+   * instead of silently truncating.
    */
-  app.get('/api/trash', guard, async (_req, reply) => {
+  app.get('/api/trash', guard, async (req, reply) => {
+    const parsed = trashQuery.safeParse(req.query)
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid query' })
+    const { limit, offset, includeRestored } = parsed.data
+    const restrictClause = includeRestored ? '' : 'WHERE restored_at IS NULL'
+    const total = (deps.db.prepare(`SELECT COUNT(*) c FROM trash ${restrictClause}`).get() as { c: number }).c
     const entries = deps.db.prepare(
       `SELECT id, original_path AS originalPath, size_bytes AS sizeBytes, deleted_at AS deletedAt,
               purge_after AS purgeAfter, restored_at AS restoredAt, plan_id AS planId
-       FROM trash ORDER BY deleted_at DESC LIMIT 200`,
-    ).all()
-    return reply.send({ entries })
+       FROM trash ${restrictClause} ORDER BY deleted_at DESC LIMIT ? OFFSET ?`,
+    ).all(limit, offset)
+    return reply.send({ entries, total })
   })
 
   /**
@@ -270,16 +298,24 @@ export function registerPlanRoutes(app: FastifyInstance, deps: PlanRoutesDeps): 
    * Nothing here can be written back through this route — editing these values is a config-file
    * change, not a Jellymaid API call — so there is no risk of this becoming a second, competing
    * way to set what `evaluateGuards`/`moveToTrash` actually enforce.
+   *
+   * `config.guards` also carries `privateTrackerHosts` — the operator's private-tracker list, and
+   * not something this read-only settings display has any business publishing. Deliberately NOT
+   * destructured into a local `guards`/`trash` object the way this route used to: a `const {
+   * guards, trash } = ...config` sitting in scope is an invitation for some future edit to shortcut
+   * a new field with `...guards`, silently republishing the whole object, host list included.
+   * Reading each field off `deps.plannerDeps().config` directly leaves no such object lying around
+   * to spread.
    */
   app.get('/api/config/thresholds', guard, async (_req, reply) => {
-    const { guards, trash } = deps.plannerDeps().config
+    const config = deps.plannerDeps().config
     return reply.send({
-      minRatio: guards.minRatio,
-      minSeedTimeDays: guards.minSeedTimeDays,
-      protectedCategories: guards.protectedCategories,
-      protectedTags: guards.protectedTags,
-      trashMaxBytes: trash.maxBytes,
-      trashRetentionDays: trash.retentionDays,
+      minRatio: config.guards.minRatio,
+      minSeedTimeDays: config.guards.minSeedTimeDays,
+      protectedCategories: config.guards.protectedCategories,
+      protectedTags: config.guards.protectedTags,
+      trashMaxBytes: config.trash.maxBytes,
+      trashRetentionDays: config.trash.retentionDays,
     })
   })
 }

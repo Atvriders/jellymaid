@@ -131,16 +131,41 @@ export function registerFindingsRoutes(app: FastifyInstance, deps: { db: Db; ses
   app.get('/api/duplicates', guard, async (_req, reply) => {
     const groups = deps.db.prepare("SELECT * FROM dupe_groups WHERE status = 'open' ORDER BY tier, id")
       .all() as Array<{ id: string; tier: string; members_json: string; keeper_item_id: string | null; scores_json: string }>
+
+    // Finding 6a: `dupe_groups` never stored WHICH matcher(s) agreed on a group — `tier` alone
+    // cannot distinguish a byte-verified match from two items that merely share a TMDB id
+    // (dupe.provider-id and dupe.series-episode both emit 'exact' from pure metadata). That list
+    // — `matchedBy` — is only ever persisted in the `dupe.group` finding's `evidence_json`
+    // (src/rules/dupes/adapter.ts), keyed there by `evidence.groupId`, which is the same value as
+    // `dupe_groups.id`. Joined here rather than added to `dupe_groups` itself (a migration) — the
+    // data already exists, so a join is all this needs. Only `status = 'open'` findings are
+    // eligible, matching every other read of this table: a dismissed finding's stale evidence must
+    // never be attributed to a group that has since been re-evaluated.
+    const matchedByRows = deps.db.prepare(
+      "SELECT evidence_json AS evidenceJson FROM findings WHERE rule_id = 'dupe.group' AND class = 'duplicate' AND status = 'open'",
+    ).all() as Array<{ evidenceJson: string }>
+    const matchedByGroup = new Map<string, string[]>()
+    for (const row of matchedByRows) {
+      const evidence = JSON.parse(row.evidenceJson) as { groupId?: string; matchedBy?: string[] }
+      if (evidence.groupId && Array.isArray(evidence.matchedBy)) matchedByGroup.set(evidence.groupId, evidence.matchedBy)
+    }
+
     const detail = groups.map((g) => {
       const memberIds = JSON.parse(g.members_json) as string[]
       const placeholders = memberIds.map(() => '?').join(',')
+      // Finding 6b: video_range and has_subtitles (004_item_quality_signals.sql) already live on
+      // this exact table this query already reads from — the two column names below are the whole
+      // fix for surfacing the real signals behind the keeper score's HDR/subtitles weights,
+      // instead of leaving the operator to trust a bare number with nothing to corroborate it.
       const members = deps.db.prepare(
         `SELECT id, name, container_path, size_bytes, height, bitrate, video_codec, audio_channels,
-                container, library_name FROM jellyfin_items WHERE id IN (${placeholders})`,
+                container, library_name, video_range, has_subtitles
+         FROM jellyfin_items WHERE id IN (${placeholders})`,
       ).all(...memberIds)
       return {
         id: g.id, tier: g.tier, keeperItemId: g.keeper_item_id,
         scores: JSON.parse(g.scores_json), members,
+        matchedBy: matchedByGroup.get(g.id) ?? [],
       }
     })
     return reply.send({ groups: detail })
