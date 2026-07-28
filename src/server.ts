@@ -33,11 +33,13 @@ export interface ServerDeps {
    * (`Pick`-restricted) views. Radarr/Sonarr are `null` exactly when the operator never
    * configured that optional instance (src/index.ts); qBittorrent is mandatory config, so it is
    * never null in production, but the type stays as permissive as Radarr/Sonarr's so tests do not
-   * need a real client.
+   * need a real client. Radarr/Sonarr also carry `inventory` (beyond plain `ping`) so `/healthz`
+   * can surface the `arrUnmappable` count (carry-forward.md:49) from the same read `resolveTarget`
+   * uses — see src/api/health.ts.
    */
   qbittorrent: Pick<QbitClient, 'ping'>
-  radarr: Pick<ArrClient, 'ping'> | null
-  sonarr: Pick<ArrClient, 'ping'> | null
+  radarr: Pick<ArrClient, 'ping' | 'inventory'> | null
+  sonarr: Pick<ArrClient, 'ping' | 'inventory'> | null
   logger: Logger
   scanRunner: ScanRunner
   /** Thunk, not a value: the planner needs a fresh *arr/qBittorrent view for every build, and a
@@ -77,6 +79,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     qbittorrent: deps.qbittorrent,
     radarr: deps.radarr,
     sonarr: deps.sonarr,
+    pathMap: deps.pathMap,
   })
   registerAuthRoutes(app, {
     jellyfin: deps.jellyfin,

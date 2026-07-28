@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
 import { buildServer } from '../../src/server.js'
 import { openDb } from '../../src/index/db.js'
 import { createLogger } from '../../src/core/logger.js'
@@ -92,5 +92,24 @@ describe('spa fallback', () => {
     // No SPA to fall back to, and no fastify-static registered to shadow the default 404 —
     // Fastify's own default not-found handler applies.
     expect(res.statusCode).toBe(404)
+  })
+
+  // CRITICAL 1 (@fastify/static upgrade, 4 high-severity advisories fixed in v9.1.1/v10.1.1/v10.1.2):
+  // the real-world stakes are that `/data/.session-secret` sits on the same container as this
+  // static root. None of the fixed advisories are a root-escape in this app's own configuration
+  // (they are all timing bugs in a caller-registered `allowedPath`/route-guard check, and this
+  // route registers no such guard on top of @fastify/static) — but a plain traversal attempt out of
+  // `clientDir`, encoded or not, must still never reach a file that lives next to it. Defense in
+  // depth for the exact shape of file this app keeps beside the served root.
+  it('does not escape clientDir to serve a file that merely sits next to it, plain or encoded', async () => {
+    const dir = buildClientDir()
+    const secretPath = join(dirname(dir), `sibling-secret-${Date.now()}.txt`)
+    writeFileSync(secretPath, 'do-not-serve-me')
+    const app = buildServer(testDeps(dir))
+    const secretName = secretPath.slice(dirname(dir).length + 1)
+    for (const url of [`/../${secretName}`, `/%2e%2e/${secretName}`, `/..%2f${secretName}`]) {
+      const res = await app.inject({ method: 'GET', url })
+      expect(res.body).not.toBe('do-not-serve-me')
+    }
   })
 })

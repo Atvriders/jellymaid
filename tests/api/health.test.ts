@@ -111,6 +111,7 @@ describe('GET /healthz', () => {
       qbittorrent: null,
       radarr: null,
       sonarr: null,
+      pathMap: createPathMap([]),
       now: () => t,
     })
     await app.inject({ method: 'GET', url: '/healthz' })
@@ -178,6 +179,7 @@ describe('GET /healthz — finding MAJOR 2 (a hanging connector must not delay t
       qbittorrent: null,
       radarr: null,
       sonarr: null,
+      pathMap: createPathMap([]),
       probeDeadlineMs: 50,
     })
     const started = performance.now()
@@ -202,6 +204,7 @@ describe('GET /healthz — finding MAJOR 2 (a hanging connector must not delay t
       qbittorrent: { ping: async () => {} },
       radarr: null,
       sonarr: null,
+      pathMap: createPathMap([]),
       probeDeadlineMs: 50,
     })
     const res = await app.inject({ method: 'GET', url: '/healthz' })
@@ -255,6 +258,7 @@ describe('GET /healthz — finding MINOR 4 (indexCounts must be TTL-cached like 
       qbittorrent: null,
       radarr: null,
       sonarr: null,
+      pathMap: createPathMap([]),
       now: () => t,
     })
     await app.inject({ method: 'GET', url: '/healthz' })
@@ -266,5 +270,150 @@ describe('GET /healthz — finding MINOR 4 (indexCounts must be TTL-cached like 
     t = 10_000 // past the TTL
     await app.inject({ method: 'GET', url: '/healthz' })
     expect(countQueries).toBe(afterFirst * 2)
+  })
+})
+
+// Carry-forward.md:49 (Plan 4's addition, "Plan 6, before ship"): `arrUnmappable` (src/plan/resolve.ts)
+// blocks every delete non-overridably (src/plan/guards.ts), but was reachable only by building a
+// plan and reading its failure message. Surfaced here as a COUNT only — /healthz is unauthenticated,
+// and the *arr paths themselves (root-folder names, library layout) are not safe to hand to an
+// anonymous caller the way a bare integer is.
+const arrRecord = (arrPath: string | null) => ({
+  kind: 'radarr' as const, instance: 'radarr', remoteId: 1, title: 'Heat', arrPath,
+  monitored: true, seriesId: null, episodeId: null, episodeFileId: null,
+})
+
+describe('GET /healthz — MAJOR 2 (surface arrUnmappable count)', () => {
+  it('reports evaluated:true and count:0 when neither *arr is configured', async () => {
+    const app = buildServer(depsWith({
+      jellyfin: { ping: async () => {} }, qbittorrent: { ping: async () => {} }, radarr: null, sonarr: null,
+    }))
+    const body = (await app.inject({ method: 'GET', url: '/healthz' })).json()
+    expect(body.arrUnmappable).toEqual({ evaluated: true, count: 0 })
+  })
+
+  it('counts a radarr record whose *arr path no mapping covers', async () => {
+    const app = buildServer(depsWith({
+      jellyfin: { ping: async () => {} },
+      qbittorrent: { ping: async () => {} },
+      radarr: {
+        ping: async () => {},
+        inventory: async () => ({ records: [arrRecord('/data/movies/Heat.mkv')], complete: true }),
+      } as never,
+      sonarr: null,
+    }))
+    const body = (await app.inject({ method: 'GET', url: '/healthz' })).json()
+    expect(body.arrUnmappable).toEqual({ evaluated: true, count: 1 })
+  })
+
+  it('sums unmappable records across both radarr and sonarr', async () => {
+    const app = buildServer(depsWith({
+      jellyfin: { ping: async () => {} },
+      qbittorrent: { ping: async () => {} },
+      radarr: { ping: async () => {}, inventory: async () => ({ records: [arrRecord('/data/movies/Heat.mkv')], complete: true }) } as never,
+      sonarr: { ping: async () => {}, inventory: async () => ({ records: [arrRecord('/data/tv/Show.mkv')], complete: true }) } as never,
+    }))
+    const body = (await app.inject({ method: 'GET', url: '/healthz' })).json()
+    expect(body.arrUnmappable).toEqual({ evaluated: true, count: 2 })
+  })
+
+  it('does not count a record with no *arr path at all', async () => {
+    const app = buildServer(depsWith({
+      jellyfin: { ping: async () => {} },
+      qbittorrent: { ping: async () => {} },
+      radarr: { ping: async () => {}, inventory: async () => ({ records: [arrRecord(null)], complete: true }) } as never,
+      sonarr: null,
+    }))
+    const body = (await app.inject({ method: 'GET', url: '/healthz' })).json()
+    expect(body.arrUnmappable).toEqual({ evaluated: true, count: 0 })
+  })
+
+  it('does not count a record whose *arr path a mapping DOES translate', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jm-hc-arrmap-'))
+    const app = Fastify()
+    registerHealthRoutes(app, {
+      db: openDb(join(dir, 'db.sqlite')),
+      jellyfin: { ping: async () => {} },
+      qbittorrent: null,
+      radarr: { ping: async () => {}, inventory: async () => ({ records: [arrRecord('/movies/Heat.mkv')], complete: true }) } as never,
+      sonarr: null,
+      pathMap: createPathMap([{ role: 'library', jellyfin: '/movies', container: '/data/movies', qbit: null }]),
+    })
+    const body = (await app.inject({ method: 'GET', url: '/healthz' })).json()
+    expect(body.arrUnmappable).toEqual({ evaluated: true, count: 0 })
+  })
+
+  it('never leaks the unmapped *arr path itself into the response body', async () => {
+    const app = buildServer(depsWith({
+      jellyfin: { ping: async () => {} },
+      qbittorrent: { ping: async () => {} },
+      radarr: { ping: async () => {}, inventory: async () => ({ records: [arrRecord('/data/movies/Heat.mkv')], complete: true }) } as never,
+      sonarr: null,
+    }))
+    const body = (await app.inject({ method: 'GET', url: '/healthz' })).json()
+    expect(body.arrUnmappable.count).toBe(1)
+    expect(JSON.stringify(body)).not.toContain('Heat.mkv')
+  })
+
+  it('reports evaluated:false, not a false zero, when a configured *arr inventory fetch fails', async () => {
+    const app = buildServer(depsWith({
+      jellyfin: { ping: async () => {} },
+      qbittorrent: { ping: async () => {} },
+      radarr: { ping: async () => {}, inventory: async () => { throw new Error('unreachable') } } as never,
+      sonarr: null,
+    }))
+    const body = (await app.inject({ method: 'GET', url: '/healthz' })).json()
+    expect(body.arrUnmappable).toEqual({ evaluated: false, count: 0 })
+  })
+
+  it('does not flip top-level status to degraded from a non-zero arrUnmappable count', async () => {
+    const app = buildServer(depsWith({
+      jellyfin: { ping: async () => {} },
+      qbittorrent: { ping: async () => {} },
+      radarr: { ping: async () => {}, inventory: async () => ({ records: [arrRecord('/data/movies/Heat.mkv')], complete: true }) } as never,
+      sonarr: null,
+    }))
+    const body = (await app.inject({ method: 'GET', url: '/healthz' })).json()
+    expect(body.arrUnmappable.count).toBe(1)
+    expect(body.status).toBe('ok')
+  })
+
+  it('does not flip top-level status to degraded when arrUnmappable could not be evaluated', async () => {
+    const app = buildServer(depsWith({
+      jellyfin: { ping: async () => {} },
+      qbittorrent: { ping: async () => {} },
+      radarr: { ping: async () => {}, inventory: async () => { throw new Error('unreachable') } } as never,
+      sonarr: null,
+    }))
+    const body = (await app.inject({ method: 'GET', url: '/healthz' })).json()
+    // The connector's own ping is what reports reachability; a narrower inventory-only failure
+    // must not duplicate that signal through a second, unrelated field.
+    expect(body.connectors.radarr).toBe('ok')
+    expect(body.arrUnmappable.evaluated).toBe(false)
+    expect(body.status).toBe('ok')
+  })
+
+  it('caches the *arr inventory fetch within the TTL, like the connector pings', async () => {
+    let calls = 0
+    let t = 0
+    const dir = mkdtempSync(join(tmpdir(), 'jm-hc-arrcache-'))
+    const app = Fastify()
+    registerHealthRoutes(app, {
+      db: openDb(join(dir, 'db.sqlite')),
+      jellyfin: { ping: async () => {} },
+      qbittorrent: null,
+      radarr: { ping: async () => {}, inventory: async () => { calls += 1; return { records: [], complete: true } } } as never,
+      sonarr: null,
+      pathMap: createPathMap([]),
+      now: () => t,
+    })
+    await app.inject({ method: 'GET', url: '/healthz' })
+    expect(calls).toBe(1)
+    await app.inject({ method: 'GET', url: '/healthz' })
+    expect(calls).toBe(1) // still within the TTL — no new inventory fetch
+
+    t = 10_000 // past the TTL
+    await app.inject({ method: 'GET', url: '/healthz' })
+    expect(calls).toBe(2)
   })
 })
