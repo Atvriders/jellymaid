@@ -58,6 +58,10 @@ const providerIdRule: DupeRule = {
         if (list) list.push(row); else buckets.set(key, [row])
       }
     }
+    // A pair sharing two provider namespaces (e.g. both tmdb and imdb agree) lands in two
+    // buckets and is intentionally emitted twice, once per namespace: each occurrence is
+    // corroborating evidence, not noise, and collapsing them would silently drop whichever
+    // namespace's evidence was deduplicated away.
     return pairsWithin(buckets, (a, b, key) => ({
       ruleId: 'dupe.provider-id', a: a.id, b: b.id, confidence: 'exact', evidence: { providerId: key },
     }))
@@ -102,7 +106,14 @@ const runtimeRule: DupeRule = {
     const cfg = ctx.config.rules['dupe.runtime']
     if (!cfg.enabled) return []
     const tolerance = cfg.toleranceSeconds * TICKS_PER_SECOND
-    const rows = loadItems(ctx).filter((r) => r.runtime_ticks !== null)
+    // Movies only, matching dupe.title-year and dupe.fuzzy-title. Unrelated shows reuse generic
+    // episode titles ("Pilot", "Reunion", "Part 1") that normalize identically, and broadcast
+    // content is authored to standard slot lengths — so two episodes of different series can
+    // easily share a normalized title and a runtime within tolerance, especially once an
+    // operator raises toleranceSeconds to catch re-encodes. Episode duplicates are already
+    // covered exactly by dupe.series-episode (same series/season/episode) and by
+    // dupe.identical-file, so nothing is lost by excluding them here. Do not add Episode back.
+    const rows = loadItems(ctx).filter((r) => r.type === 'Movie' && r.runtime_ticks !== null)
     const out: DupeLink[] = []
     for (const [, group] of bucket(rows, (r) => normalizeTitle(r.name) || null)) {
       for (let i = 0; i < group.length; i += 1) {
@@ -146,7 +157,7 @@ const fuzzyTitleRule: DupeRule = {
     const rows = loadItems(ctx)
       .filter((r) => r.type === 'Movie')
       .map((r) => ({ id: r.id, key: normalizeTitle(r.name) }))
-      .filter((r) => r.key.length >= 3)
+      .filter((r) => r.key.length >= cfg.minTitleLength)
     // Bucket by first letter to keep this O(n²) pass tractable on a 100k library.
     const byLetter = bucket(rows, (r) => r.key[0] ?? null)
     const out: DupeLink[] = []

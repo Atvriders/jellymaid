@@ -109,6 +109,21 @@ describe('dupe.runtime', () => {
     item({ id: 'b', name: 'Heat', runtime_ticks: 206_920_000_000 })
     expect(rule('dupe.runtime').link(ctx())).toHaveLength(0)
   })
+
+  it('does not link same-titled episodes of different series, even within tolerance', () => {
+    // Unrelated shows reuse generic episode titles ("Pilot") that normalize identically, and
+    // standard broadcast slot lengths mean two unrelated episodes can land inside the runtime
+    // tolerance too. Episode duplicates are dupe.series-episode's job, not this rule's.
+    item({
+      id: 'a', type: 'Episode', name: 'Pilot', year: null,
+      series_id: 's1', season_no: 1, episode_no: 1, runtime_ticks: 13_200_000_000,
+    })
+    item({
+      id: 'b', type: 'Episode', name: 'Pilot', year: null,
+      series_id: 's2', season_no: 1, episode_no: 1, runtime_ticks: 13_210_000_000,
+    })
+    expect(rule('dupe.runtime').link(ctx())).toHaveLength(0)
+  })
 })
 
 describe('dupe.identical-file', () => {

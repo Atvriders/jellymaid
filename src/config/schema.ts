@@ -62,7 +62,11 @@ export const fileConfigSchema = z.object({
     arr: z.object({ concurrency: z.number().int().min(1).default(2), minDelayMs: z.number().int().min(0).default(100) }).default({}),
   }).default({}),
   rules: z.object({
-    'dupe.fuzzy-title': z.object({ enabled: z.boolean().default(true), similarity: z.number().min(0).max(1).default(0.88) }).default({}),
+    'dupe.fuzzy-title': z.object({
+      enabled: z.boolean().default(true),
+      similarity: z.number().min(0).max(1).default(0.88),
+      minTitleLength: z.number().int().min(1).default(3),
+    }).default({}),
     'dupe.runtime': z.object({ enabled: z.boolean().default(true), toleranceSeconds: z.number().min(0).default(2) }).default({}),
     'quality.low-bitrate': z.object({
       enabled: z.boolean().default(true),
