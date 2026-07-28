@@ -162,6 +162,15 @@ export const filesystemPhase: Phase = {
       return { status: 'skipped', reason, counts: { entries: written, stale, errors: errors.length, sweepSkipped, pruned } }
     }
 
+    // fs.permission reads this back to report every path the walk could not describe (a locked
+    // subtree, a file that vanished between readdir and lstat, …). Written unconditionally —
+    // including as an empty array — so a clean pass clears out a prior pass's stale errors instead
+    // of leaving fs.permission reporting on paths that read fine now. Capped: an operator with a
+    // badly broken mount does not need tens of thousands of identical rows, and this key is read
+    // back whole, not paginated.
+    ctx.db.prepare("INSERT OR REPLACE INTO kv (key, value_json) VALUES ('scan.fsErrors', ?)")
+      .run(JSON.stringify(errors.slice(0, 500)))
+
     return { status: 'completed', counts: { entries: written, stale, errors: errors.length, sweepSkipped, pruned } }
   },
 }
