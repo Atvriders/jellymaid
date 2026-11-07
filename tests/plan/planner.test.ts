@@ -3,9 +3,12 @@ import { mkdtempSync, mkdirSync, writeFileSync, linkSync, statSync } from 'node:
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { openDb, type Db } from '../../src/index/db.js'
-import { buildPlan, getPlan, approvePlan } from '../../src/plan/planner.js'
-import { createPathMap } from '../../src/fs/pathmap.js'
-import { fileConfigSchema } from '../../src/config/schema.js'
+import { buildPlan, getPlan, approvePlan, PlanRefusal } from '../../src/plan/planner.js'
+import { createPathMap, normalizeMappings, type PathMap } from '../../src/fs/pathmap.js'
+import { fileConfigSchema, type FileConfig } from '../../src/config/schema.js'
+import { createActivityLock } from '../../src/core/activity.js'
+import { writeVerification } from '../../src/scan/verification.js'
+import { configStoreOf, verifyMappings } from './support.js'
 
 let db: Db
 let dir: string
@@ -13,31 +16,61 @@ let a: string
 let b: string
 
 const torrent = (over = {}) => ({
-  hash: 'H1', name: 'Heat', savePath: '/downloads', contentPath: '/downloads/Heat.mkv',
-  category: null, tags: [] as string[], state: 'stalledUP', ratio: 5, seedingTimeSeconds: 30 * 86_400,
-  isPrivate: false, trackerHost: 't', sizeBytes: 10, progress: 1, ...over,
+  instanceId: 'box-a', hash: 'H1', name: 'Heat', savePath: '/downloads', contentPath: '/downloads/Heat.mkv',
+  rootPath: null, category: null, tags: [] as string[], state: 'stalledUP', ratio: 5, seedingTimeSeconds: 30 * 86_400,
+  isPrivate: false, trackerHost: 't', sizeBytes: 10, progress: 1, addedOn: null, ...over,
 })
 
+type QbitDouble = { torrents?: () => Promise<Array<Record<string, unknown>>>; files?: unknown }
+
+/**
+ * The library root every default test plans against. A test that hands in a qBittorrent double is
+ * describing torrents box A saved straight into the library; one that does not is describing a
+ * library no torrent client writes to. The difference matters: in a torrent-backed root, a file no
+ * torrent owns is `guard.untracked`'s to block.
+ */
+const libraryMap = (torrentBacked: boolean) => createPathMap([{
+  role: 'library', jellyfin: '/media', container: join(dir, 'lib'),
+  qbit: torrentBacked ? '/downloads' : null, qbitInstance: torrentBacked ? 'box-a' : null,
+}])
+
+/**
+ * Tests describe ONE qBittorrent, instance 'box-a', through `qbittorrent`, and the config and path
+ * map through `config`/`pathMap`; this turns them into the PlannerDeps the planner takes. Every
+ * build is gated on a clean verification of the mapping set, so one is written for the store here,
+ * as a real Verify would; the gate tests overwrite it.
+ */
 function deps(over: Record<string, unknown> = {}) {
-  const merged: Record<string, unknown> = {
-    db,
-    config: fileConfigSchema.parse({}),
-    pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: join(dir, 'lib'), qbit: '/downloads' }]),
-    qbittorrent: { torrents: async () => [] },
-    radarr: null,
-    sonarr: null,
-    ...over,
-  }
+  const { qbittorrent: given, config, pathMap, ...rest } = over
+  const torrentBacked = 'qbittorrent' in over
+  const qb = (torrentBacked ? given : { torrents: async () => [] }) as QbitDouble | null
   // A real qBittorrent knows its own file list, and guard.torrent-scope reads it: without one every
   // matched torrent is "scope unknown" and blocks. Each double gets a single-file listing derived
   // from its own fixture, which is what these torrents are.
-  const qb = merged.qbittorrent as { torrents?: () => Promise<Array<Record<string, unknown>>>; files?: unknown } | null
   if (qb && !qb.files) {
     qb.files = async (hash: string) => {
       const t = (await qb.torrents!()).find((x) => x.hash === hash)
       const content = t?.contentPath as string | undefined
       return content ? [{ index: 0, relPath: content.split('/').pop()!, sizeBytes: (t?.sizeBytes as number) ?? 0 }] : []
     }
+  }
+  const qbittorrents = (rest.qbittorrents as Map<string, unknown> | undefined)
+    ?? (qb ? new Map([['box-a', { instanceId: 'box-a', ...qb }]]) : new Map())
+  const map = (pathMap as PathMap | undefined) ?? libraryMap(torrentBacked)
+  const configStore = configStoreOf(
+    () => (config as FileConfig | undefined) ?? fileConfigSchema.parse({}),
+    () => map,
+    qbittorrents.size > 0 ? [...qbittorrents.keys()] : ['box-a'],
+  )
+  verifyMappings(db, configStore)
+  const merged: Record<string, unknown> = {
+    db,
+    configStore,
+    radarr: null,
+    sonarr: null,
+    activity: createActivityLock(),
+    ...rest,
+    qbittorrents,
   }
   return merged as unknown as Parameters<typeof buildPlan>[0]
 }
@@ -243,20 +276,41 @@ describe('buildPlan', () => {
     expect(plan.actions[0]!.status).toBe('pending')
   })
 
-  it('refuses an override for a guard that does not block this action', async () => {
+  it('stale overrides are dropped into droppedOverrides instead of a 400', async () => {
     // A blank cheque, not a decision: nothing about guard.torrent-scope is blocking here, so the
-    // override has nothing to clear NOW and stands ready to clear whatever blocks at execute time
-    // — a block the operator was never shown. Refused at build time, which the route turns into a
-    // 400, so they are asked again with the block actually on screen.
-    await expect(buildPlan(deps(), { createdBy: 'bob', actions: [
+    // override has nothing to clear NOW and would stand ready to clear whatever blocks at execute
+    // time — a block the operator was never shown. It is dropped, said so, and never stored.
+    const plan = await buildPlan(deps(), { createdBy: 'bob', actions: [
       { type: 'delete-media', targetPath: a, overrides: ['guard.torrent-scope'] },
-    ] })).rejects.toThrow(/refusing to pre-authorise guard\.torrent-scope/i)
+    ] })
+    expect(plan.actions[0]!.status).toBe('pending')
+    expect(plan.droppedOverrides).toEqual([{ seq: 0, guard: 'guard.torrent-scope' }])
+    const row = db.prepare('SELECT override_by, override_reason, payload_json FROM plan_actions').get() as
+      { override_by: string | null; override_reason: string | null; payload_json: string }
+    expect(JSON.parse(row.payload_json).overrides).toEqual([])
+    expect(row.override_by).toBeNull()
+    expect(row.override_reason).toBeNull()
+    // And it survives a fresh read, for the screen that polls it.
+    expect(getPlan(db, plan.id)!.droppedOverrides).toEqual([{ seq: 0, guard: 'guard.torrent-scope' }])
   })
 
-  it('refuses an override on an action that has no guards at all', async () => {
-    await expect(buildPlan(deps(), { createdBy: 'bob', actions: [
+  it('drops every override on an action that has no guards at all', async () => {
+    const plan = await buildPlan(deps(), { createdBy: 'bob', actions: [
       { type: 'merge-versions', itemIds: ['a', 'b'], overrides: ['guard.private-ratio'] },
-    ] })).rejects.toThrow(/refusing to pre-authorise/i)
+    ] })
+    expect(plan.droppedOverrides).toEqual([{ seq: 0, guard: 'guard.private-ratio' }])
+  })
+
+  it('keeps the override that still answers a block and drops the one that no longer does', async () => {
+    const plan = await buildPlan(deps({
+      config: fileConfigSchema.parse({ guards: { minRatio: 10 } }),
+      qbittorrent: { torrents: async () => [torrent({ isPrivate: true, ratio: 1, contentPath: '/downloads/A.mkv' })] },
+    }), { createdBy: 'bob', actions: [
+      { type: 'delete-media', targetPath: a, overrides: ['guard.private-ratio', 'guard.cross-seed'] },
+    ] })
+    expect(plan.actions[0]!.status).toBe('pending')
+    expect(plan.actions[0]!.payload.overrides).toEqual(['guard.private-ratio'])
+    expect(plan.droppedOverrides).toEqual([{ seq: 0, guard: 'guard.cross-seed' }])
   })
 
   it('accepts an override for a guard that really is blocking this action', async () => {
@@ -424,5 +478,288 @@ describe('approvePlan', () => {
       qbittorrent: { torrents: async () => [torrent({ state: 'downloading', contentPath: '/downloads/A.mkv' })] },
     }), { createdBy: 'bob', actions: [{ type: 'delete-media', targetPath: a }] })
     expect(() => approvePlan(db, plan.id, 'bob')).toThrow(/no executable actions/i)
+  })
+})
+
+describe('buildPlan — live configuration and instances', () => {
+  it('reads thresholds and the path map from the config store once per build, so a change shows on the next build', async () => {
+    let config = fileConfigSchema.parse({ guards: { minRatio: 10 } })
+    const pathMap = libraryMap(true)
+    let reads = 0
+    const configStore = configStoreOf(() => { reads += 1; return config }, () => pathMap)
+    verifyMappings(db, configStore)
+    const d = deps({ qbittorrent: { torrents: async () => [torrent({ isPrivate: true, ratio: 1, contentPath: '/downloads/A.mkv' })] } })
+    const live = { ...(d as unknown as Record<string, unknown>), configStore } as unknown as Parameters<typeof buildPlan>[0]
+
+    const before = await buildPlan(live, { createdBy: 'bob', actions: [{ type: 'delete-media', targetPath: a }] })
+    expect(before.actions[0]!.status).toBe('blocked')
+    expect(reads).toBe(1)
+
+    config = fileConfigSchema.parse({ guards: { minRatio: 0.5 } })
+    const after = await buildPlan(live, { createdBy: 'bob', actions: [{ type: 'delete-media', targetPath: a }] })
+    expect(after.actions[0]!.status).toBe('pending')
+  })
+
+  it('private-ratio keeps AND semantics with thresholds read from configStore at build time', async () => {
+    // Ratio 2 is plenty; 5 days of seeding is not. Only BOTH minimums met may delete a private torrent.
+    let config = fileConfigSchema.parse({ guards: { minRatio: 1, minSeedTimeDays: 14 } })
+    const d = deps({
+      qbittorrent: { torrents: async () => [torrent({ isPrivate: true, ratio: 2, seedingTimeSeconds: 5 * 86_400, contentPath: '/downloads/A.mkv' })] },
+    })
+    const store = configStoreOf(() => config, () => libraryMap(true))
+    const live = { ...(d as unknown as Record<string, unknown>), configStore: store } as unknown as Parameters<typeof buildPlan>[0]
+    const statusNow = async () => (await buildPlan(live, { createdBy: 'bob', actions: [{ type: 'delete-media', targetPath: a }] })).actions[0]!.status
+
+    expect(await statusNow()).toBe('blocked')
+    config = fileConfigSchema.parse({ guards: { minRatio: 1, minSeedTimeDays: 3 } })
+    expect(await statusNow()).toBe('pending')
+    config = fileConfigSchema.parse({ guards: { minRatio: 3, minSeedTimeDays: 3 } })
+    expect(await statusNow()).toBe('blocked')
+  })
+
+  it('torrent list cache serves one snapshot per plan build', async () => {
+    let lists = 0
+    const list = [torrent({ hash: 'ha', contentPath: '/downloads/A.mkv' }), torrent({ hash: 'hb', contentPath: '/downloads/B.mkv' })]
+    const d = deps({
+      qbittorrent: {
+        torrents: async () => { lists += 1; return list },
+        files: async (hash: string) => [{ index: 0, relPath: hash === 'ha' ? 'A.mkv' : 'B.mkv', sizeBytes: 1 }],
+      },
+    })
+    const request = { createdBy: 'bob', actions: [
+      { type: 'delete-media' as const, targetPath: a }, { type: 'delete-media' as const, targetPath: b },
+    ] }
+    const plan = await buildPlan(d, request)
+    expect(plan.actions.map((x) => x.payload.resolution!.torrents.map((t) => t.hash))).toEqual([['ha'], ['hb']])
+    expect(lists).toBe(1)
+    // The next build takes its own snapshot: it is never judged from a list an earlier build read.
+    await buildPlan(d, request)
+    expect(lists).toBe(2)
+  })
+
+  it('counts a torrent per instance, so the same infohash on two boxes is two torrents removed', async () => {
+    mkdirSync(join(dir, 'b'), { recursive: true })
+    const onB = join(dir, 'b', 'A.mkv')
+    writeFileSync(onB, 'b'.repeat(10))
+    const pathMap = createPathMap([
+      { role: 'library', jellyfin: '/media', container: join(dir, 'lib'), qbit: '/downloads', qbitInstance: 'box-a' },
+      { role: 'library', jellyfin: '/media-b', container: join(dir, 'b'), qbit: '/downloads', qbitInstance: 'box-b' },
+    ])
+    const box = (id: string) => ({
+      instanceId: id,
+      torrents: async () => [torrent({ instanceId: id, hash: 'same', contentPath: '/downloads/A.mkv' })],
+      files: async () => [{ index: 0, relPath: 'A.mkv', sizeBytes: 10 }],
+    })
+    const plan = await buildPlan(deps({
+      pathMap,
+      qbittorrents: new Map([['box-a', box('box-a')], ['box-b', box('box-b')]]),
+    }), { createdBy: 'bob', actions: [{ type: 'delete-media', targetPath: a }, { type: 'delete-media', targetPath: onB }] })
+    expect(plan.actions.map((x) => x.status)).toEqual(['pending', 'pending'])
+    expect(plan.actions.map((x) => x.payload.resolution!.torrents.map((t) => t.instanceId))).toEqual([['box-a'], ['box-b']])
+    expect(plan.dryRun.torrentsRemoved).toBe(2)
+  })
+})
+
+describe('buildPlan — refusals before anything is resolved', () => {
+  const request = () => ({ createdBy: 'bob', actions: [{ type: 'delete-media' as const, targetPath: a }] })
+
+  async function refusal(promise: Promise<unknown>): Promise<PlanRefusal> {
+    const err = await promise.then(() => null, (e: unknown) => e)
+    expect(err).toBeInstanceOf(PlanRefusal)
+    return err as PlanRefusal
+  }
+
+  it('refuses with "verification" when the mapping set was never verified, has changed, or failed verification', async () => {
+    const d = deps()
+    db.prepare('DELETE FROM kv').run()
+    expect((await refusal(buildPlan(d, request()))).code).toBe('verification')
+
+    // A record for some other mapping set.
+    writeVerification(db, { at: 'T', mappingsHash: 'not-this-set', jellyfin: { sampled: 1, resolved: 1, failures: [] }, qbit: [] })
+    expect((await refusal(buildPlan(d, request()))).message).toMatch(/changed since/i)
+
+    // The right set, but box A's half did not resolve.
+    writeVerification(db, {
+      at: 'T', mappingsHash: d.configStore.mappingsHash(), jellyfin: { sampled: 1, resolved: 1, failures: [] },
+      qbit: [{ instanceId: 'box-a', sampled: 2, resolved: 1, failures: [{ qbitPath: '/downloads/X', reason: 'missing' }] }],
+    })
+    const failing = await refusal(buildPlan(d, request()))
+    expect(failing.code).toBe('verification')
+    expect(failing.message).toMatch(/box-a/)
+    // Nothing was written: a refused build leaves no plan behind.
+    expect((db.prepare('SELECT COUNT(*) c FROM plans').get() as { c: number }).c).toBe(0)
+  })
+
+  it('refuses with "busy" while a scan or a plan run holds the activity lock, and builds once it is free', async () => {
+    const activity = createActivityLock()
+    const d = deps({ activity })
+    activity.tryAcquire('scan', 'scan-7')
+    const busy = await refusal(buildPlan(d, request()))
+    expect(busy.code).toBe('busy')
+    expect(busy.message).toMatch(/scan/)
+    activity.release('scan', 'scan-7')
+
+    activity.tryAcquire('plan', 'plan-1')
+    expect((await refusal(buildPlan(d, request()))).message).toMatch(/plan/)
+    activity.release('plan', 'plan-1')
+
+    expect((await buildPlan(d, request())).status).toBe('draft')
+  })
+})
+
+describe('buildPlan — the dry run', () => {
+  /** A movie as the owner's torrents deliver it: the film, an .nfo and a sample beside it. */
+  function movieRelease(name: string, sizes: { film: number; nfo: number; sample: number }) {
+    const folder = join(dir, 'lib', name)
+    mkdirSync(join(folder, 'Sample'), { recursive: true })
+    writeFileSync(join(folder, `${name}.mkv`), 'f'.repeat(sizes.film))
+    writeFileSync(join(folder, `${name}.nfo`), 'n'.repeat(sizes.nfo))
+    writeFileSync(join(folder, 'Sample', 'sample.mkv'), 's'.repeat(sizes.sample))
+    return {
+      film: join(folder, `${name}.mkv`),
+      files: [
+        { index: 0, relPath: `${name}/${name}.mkv`, sizeBytes: sizes.film },
+        { index: 1, relPath: `${name}/${name}.nfo`, sizeBytes: sizes.nfo },
+        { index: 2, relPath: `${name}/Sample/sample.mkv`, sizeBytes: sizes.sample },
+      ],
+    }
+  }
+
+  it('dry run reports companionFiles and byInstance', async () => {
+    mkdirSync(join(dir, 'b'), { recursive: true })
+    const heat = movieRelease('Heat', { film: 1000, nfo: 10, sample: 50 })
+    const roninOnB = join(dir, 'b', 'Ronin.mkv')
+    writeFileSync(roninOnB, 'r'.repeat(700))
+    const pathMap = createPathMap([
+      { role: 'library', jellyfin: '/media', container: join(dir, 'lib'), qbit: '/movies', qbitInstance: 'box-a' },
+      { role: 'library', jellyfin: '/media-b', container: join(dir, 'b'), qbit: '/movies', qbitInstance: 'box-b' },
+    ])
+    const plan = await buildPlan(deps({
+      pathMap,
+      qbittorrents: new Map([
+        ['box-a', {
+          instanceId: 'box-a',
+          torrents: async () => [torrent({ instanceId: 'box-a', hash: 'ha', name: 'Heat', savePath: '/movies', contentPath: '/movies/Heat', sizeBytes: 1060 })],
+          files: async () => heat.files,
+        }],
+        ['box-b', {
+          instanceId: 'box-b',
+          torrents: async () => [torrent({ instanceId: 'box-b', hash: 'hb', name: 'Ronin', savePath: '/movies', contentPath: '/movies/Ronin.mkv', sizeBytes: 700 })],
+          files: async () => [{ index: 0, relPath: 'Ronin.mkv', sizeBytes: 700 }],
+        }],
+      ]),
+    }), { createdBy: 'bob', actions: [
+      { type: 'delete-media', targetPath: heat.film }, { type: 'delete-media', targetPath: roninOnB },
+    ] })
+
+    expect(plan.actions.map((x) => x.status)).toEqual(['pending', 'pending'])
+    expect(plan.actions[0]!.payload.resolution!.torrents[0]!.companionCount).toBe(2)
+    expect(plan.dryRun.companionFiles).toBe(2)
+    expect(plan.dryRun.byInstance).toEqual({ 'box-a': { torrents: 1, bytes: 1060 }, 'box-b': { torrents: 1, bytes: 700 } })
+    expect(plan.dryRun.torrentsRemoved).toBe(2)
+    expect(plan.dryRun.bytesFreed).toBe(1760)
+  })
+
+  it('bytes freed credit each removed torrent once', async () => {
+    // Two episodes of one pack, both queued: one torrent goes, with its .nfo, and is counted once —
+    // not once per action, and not as just the two files the plan happened to name.
+    const pack = join(dir, 'lib', 'Pack')
+    mkdirSync(pack, { recursive: true })
+    const e01 = join(pack, 'E01.mkv')
+    const e02 = join(pack, 'E02.mkv')
+    writeFileSync(e01, '1'.repeat(400)); writeFileSync(e02, '2'.repeat(500)); writeFileSync(join(pack, 'Pack.nfo'), 'n'.repeat(30))
+    const plan = await buildPlan(deps({
+      qbittorrent: {
+        torrents: async () => [torrent({ hash: 'hp', name: 'Pack', contentPath: '/downloads/Pack', sizeBytes: 930 })],
+        files: async () => [
+          { index: 0, relPath: 'Pack/E01.mkv', sizeBytes: 400 },
+          { index: 1, relPath: 'Pack/E02.mkv', sizeBytes: 500 },
+          { index: 2, relPath: 'Pack/Pack.nfo', sizeBytes: 30 },
+        ],
+      },
+    }), { createdBy: 'bob', actions: [{ type: 'delete-media', targetPath: e01 }, { type: 'delete-media', targetPath: e02 }] })
+    expect(plan.actions.map((x) => x.status)).toEqual(['pending', 'pending'])
+    expect(plan.dryRun.torrentsRemoved).toBe(1)
+    expect(plan.dryRun.bytesFreed).toBe(930)
+    expect(plan.dryRun.byInstance).toEqual({ 'box-a': { torrents: 1, bytes: 930 } })
+    expect(plan.dryRun.companionFiles).toBe(1)
+  })
+
+  it('credits bytes two cross-seeded torrents share only once', async () => {
+    // Two torrents over the very same file: removing both frees the file once, not twice.
+    const plan = await buildPlan(deps({
+      qbittorrent: {
+        torrents: async () => [
+          torrent({ hash: 'h1', contentPath: '/downloads/A.mkv', sizeBytes: 1000 }),
+          torrent({ hash: 'h2', contentPath: '/downloads/A.mkv', sizeBytes: 1000 }),
+        ],
+      },
+    }), { createdBy: 'bob', actions: [{ type: 'delete-media', targetPath: a, overrides: ['guard.cross-seed'] }] })
+    expect(plan.actions[0]!.status).toBe('pending')
+    expect(plan.dryRun.torrentsRemoved).toBe(2)
+    expect(plan.dryRun.bytesFreed).toBe(1000)
+  })
+
+  it('reports progress as the actions that reached an end state, out of all of them', async () => {
+    const plan = await buildPlan(deps({
+      qbittorrent: { torrents: async () => [torrent({ state: 'downloading', contentPath: '/downloads/A.mkv' })] },
+    }), { createdBy: 'bob', actions: [
+      { type: 'delete-media', targetPath: a }, { type: 'merge-versions', itemIds: ['x', 'y'] },
+    ] })
+    // The blocked delete will never run, so it is already finished; the merge is still to come.
+    expect(plan.progress).toEqual({ total: 2, finished: 1 })
+    expect(plan.error).toBeNull()
+  })
+
+  it('reads a plan written before companionFiles and byInstance existed', () => {
+    db.prepare("INSERT INTO plans (id, created_at, created_by, status, dry_run_json) VALUES ('old','T','bob','completed',?)")
+      .run(JSON.stringify({ deleteCount: 1, bytesFreed: 5, torrentsRemoved: 1, blockedCount: 0 }))
+    const plan = getPlan(db, 'old')!
+    expect(plan.dryRun).toMatchObject({ deleteCount: 1, bytesFreed: 5, companionFiles: 0, byInstance: {} })
+    expect(plan.droppedOverrides).toEqual([])
+    expect(plan.progress).toEqual({ total: 0, finished: 0 })
+  })
+})
+
+describe('buildPlan — a mapping hole fails closed', () => {
+  /** A delete the operator has overridden every overridable guard for: only guard.protected is left. */
+  const everyOverride = ['guard.private-ratio', 'guard.cross-seed', 'guard.torrent-scope', 'guard.untracked'] as const
+
+  async function planThrough(mappings: Parameters<typeof normalizeMappings>[0], instanceIds: string[]) {
+    const asked: string[] = []
+    const { mappings: normalized } = normalizeMappings(mappings, instanceIds)
+    const plan = await buildPlan(deps({
+      pathMap: createPathMap(normalized),
+      qbittorrents: new Map(instanceIds.map((id) => [id, {
+        instanceId: id,
+        torrents: async () => { asked.push(id); return [] },
+        files: async () => [],
+      }])),
+    }), { createdBy: 'bob', actions: [{ type: 'delete-media', targetPath: a, overrides: [...everyOverride] }] })
+    return { plan, asked, protectedVerdict: plan.actions[0]!.guardVerdicts.find((v) => v.guard === 'guard.protected')! }
+  }
+
+  it('a legacy qbit mapping with two instances: no instance can be determined, so guard.protected blocks', async () => {
+    const { plan, asked, protectedVerdict } = await planThrough(
+      [{ role: 'library', jellyfin: '/media', container: join(dir, 'lib'), qbit: '/downloads', qbitInstance: null }],
+      ['box-a', 'box-b'],
+    )
+    expect(plan.actions[0]!.payload.resolution!.torrentSource).toMatchObject({ kind: 'unknown' })
+    expect(plan.actions[0]!.status).toBe('blocked')
+    expect(protectedVerdict).toMatchObject({ outcome: 'block', overridable: false })
+    expect(protectedVerdict.reason).toMatch(/no instance/)
+    expect(asked).toEqual([])
+    expect(() => approvePlan(db, plan.id, 'bob')).toThrow(/no executable actions/i)
+  })
+
+  it('a qbitInstance naming an unconfigured instance: that instance is unavailable, so guard.protected blocks', async () => {
+    const { plan, protectedVerdict } = await planThrough(
+      [{ role: 'library', jellyfin: '/media', container: join(dir, 'lib'), qbit: '/downloads', qbitInstance: 'box-z' }],
+      ['box-a'],
+    )
+    expect(plan.actions[0]!.payload.resolution!.sourcesUnavailable).toEqual(['qbittorrent:box-z'])
+    expect(plan.actions[0]!.status).toBe('blocked')
+    expect(protectedVerdict).toMatchObject({ outcome: 'block', overridable: false })
+    expect(protectedVerdict.reason).toMatch(/box-z/)
   })
 })

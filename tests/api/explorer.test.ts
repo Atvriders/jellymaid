@@ -17,13 +17,14 @@ const SECRET = 'e'.repeat(32)
 // (tests/api/findings.test.ts, tests/api/pathmap.test.ts) sets it; this one must too.
 const auth = () => ({ cookie: `jellymaid_session=${signSession({ username: 'bob', userId: 'u', issuedAt: Date.now(), isAdministrator: true }, SECRET)}` })
 
-const DEFAULT_MAPPINGS: PathMapping[] = [{ role: 'library', jellyfin: '/media', container: '/mnt/m', qbit: null }]
+const DEFAULT_MAPPINGS: PathMapping[] = [{ role: 'library', jellyfin: '/media', container: '/mnt/m', qbit: null, qbitInstance: null }]
 
 let db: Db
 function build(mappings: PathMapping[] = DEFAULT_MAPPINGS) {
   const app = Fastify()
   app.register(cookie)
-  registerExplorerRoutes(app, { db, sessionSecret: SECRET, pathMap: createPathMap(mappings) })
+  const pathMap = createPathMap(mappings)
+  registerExplorerRoutes(app, { db, sessionSecret: SECRET, configStore: { pathMap: () => pathMap } })
   return app
 }
 
@@ -48,6 +49,22 @@ describe('/api/explorer', () => {
     const body = (await build().inject({ method: 'GET', url: '/api/explorer', headers: auth() })).json()
     expect(body.entries.map((e: { path: string }) => e.path)).toEqual(['/mnt/m'])
     expect(body.parent).toBeNull()
+  })
+
+  // The paging fields are part of every response, so a client's pager never has to special-case
+  // the top level — and they have to be true there too, not placeholders.
+  it('reports total, offset and limit for the list of roots as well', async () => {
+    const two: PathMapping[] = [
+      ...DEFAULT_MAPPINGS,
+      { role: 'download', jellyfin: null, container: '/mnt/d', qbit: null, qbitInstance: null },
+    ]
+    const all = (await build(two).inject({ method: 'GET', url: '/api/explorer', headers: auth() })).json()
+    expect(all).toMatchObject({ total: 2, offset: 0, limit: 500 })
+    expect(all.entries).toHaveLength(2)
+
+    const second = (await build(two).inject({ method: 'GET', url: '/api/explorer?limit=1&offset=1', headers: auth() })).json()
+    expect(second).toMatchObject({ total: 2, offset: 1, limit: 1 })
+    expect(second.entries.map((e: { path: string }) => e.path)).toEqual(['/mnt/d'])
   })
 
   it('lists the children of a directory', async () => {
@@ -178,7 +195,7 @@ describe('/api/explorer', () => {
   describe('containment — escape attempts', () => {
     it('refuses a symlink planted inside a library root that resolves outside it', async () => {
       const base = mkdtempSync(join(tmpdir(), 'jm-exp-symlink-'))
-      const libRoot: PathMapping = { role: 'library', jellyfin: '/media', container: join(base, 'lib'), qbit: null }
+      const libRoot: PathMapping = { role: 'library', jellyfin: '/media', container: join(base, 'lib'), qbit: null, qbitInstance: null }
       mkdirSync(libRoot.container, { recursive: true })
       mkdirSync(join(base, 'secret'), { recursive: true })
       const escapeLink = join(libRoot.container, 'escape-link')
@@ -192,7 +209,7 @@ describe('/api/explorer', () => {
 
     it('refuses a .. traversal that lexically starts under the root but resolves outside it', async () => {
       const base = mkdtempSync(join(tmpdir(), 'jm-exp-dotdot-'))
-      const libRoot: PathMapping = { role: 'library', jellyfin: '/media', container: join(base, 'lib'), qbit: null }
+      const libRoot: PathMapping = { role: 'library', jellyfin: '/media', container: join(base, 'lib'), qbit: null, qbitInstance: null }
       mkdirSync(libRoot.container, { recursive: true })
       mkdirSync(join(base, 'secret'), { recursive: true })
       const traversal = `${libRoot.container}/../secret`
@@ -233,15 +250,58 @@ describe('/api/explorer', () => {
       tx()
     }
 
-    // 33,000 clears SQLite's 32,766 bind-variable ceiling with room to spare, so a batched/chunked
-    // flagMap query is what makes this pass rather than a lucky count that happens to sit under it.
+    // 33,000 clears SQLite's 32,766 bind-variable ceiling with room to spare. A page is capped at
+    // 1,000 entries now (C12), so no single request can reach that ceiling any more; what this still
+    // pins is that a directory far past it lists, counts and pages without an SQLITE_ERROR, and that
+    // the largest page (two flag-lookup batches) works.
     it('does not 500 with SQLITE_ERROR when a directory has more children than the SQL bind-variable ceiling', async () => {
       seedFlatChildren(33_000)
-      const res = await build().inject({ method: 'GET', url: '/api/explorer?path=/mnt/m&limit=33000', headers: auth() })
+      const res = await build().inject({ method: 'GET', url: '/api/explorer?path=/mnt/m&limit=1000', headers: auth() })
       expect(res.statusCode).toBe(200)
       const body = res.json()
-      expect(body.entries).toHaveLength(33_000)
+      expect(body.entries).toHaveLength(1_000)
       expect(body.total).toBe(33_000)
+    })
+
+    it('explorer pages a 3,000-entry directory and reports total', async () => {
+      seedFlatChildren(3_000)
+      const get = async (query: string) => {
+        const res = await build().inject({ method: 'GET', url: `/api/explorer?path=/mnt/m${query}`, headers: auth() })
+        expect(res.statusCode).toBe(200)
+        return res.json()
+      }
+
+      // No parameters: the default page, and the response says which page that was.
+      const first = await get('')
+      expect(first.entries).toHaveLength(500)
+      expect(first).toMatchObject({ total: 3_000, offset: 0, limit: 500 })
+
+      // Walk the directory at the largest page size: every entry exactly once, no gaps, no repeats.
+      const seen: string[] = []
+      for (const offset of [0, 1_000, 2_000]) {
+        const page = await get(`&limit=1000&offset=${offset}`)
+        expect(page).toMatchObject({ total: 3_000, offset, limit: 1_000 })
+        expect(page.entries).toHaveLength(1_000)
+        seen.push(...page.entries.map((e: { name: string }) => e.name))
+      }
+      expect(new Set(seen).size).toBe(3_000)
+
+      // A page that straddles the end is short, and one past the end is empty — with the same total.
+      const tail = await get('&limit=1000&offset=2500')
+      expect(tail.entries).toHaveLength(500)
+      expect(tail.total).toBe(3_000)
+      const past = await get('&limit=1000&offset=3000')
+      expect(past.entries).toEqual([])
+      expect(past.total).toBe(3_000)
+    })
+
+    it('caps a page at 1,000 entries, refusing a larger limit rather than quietly serving fewer', async () => {
+      seedFlatChildren(1_200)
+      const atCap = await build().inject({ method: 'GET', url: '/api/explorer?path=/mnt/m&limit=1000', headers: auth() })
+      expect(atCap.statusCode).toBe(200)
+      expect(atCap.json().entries).toHaveLength(1_000)
+      const over = await build().inject({ method: 'GET', url: '/api/explorer?path=/mnt/m&limit=1001', headers: auth() })
+      expect(over.statusCode).toBe(400)
     })
 
     it('paginates by default so a large directory does not ship every row as one response', async () => {
@@ -280,7 +340,7 @@ describe('/api/explorer', () => {
   // ground truth ("degraded means not evaluated, never zero").
   describe('finding MINOR 6 — rollup at a mapping container of "/"', () => {
     it('rolls up real descendant bytes and count instead of silently reporting zero', async () => {
-      const rootMappings: PathMapping[] = [{ role: 'library', jellyfin: '/media', container: '/', qbit: null }]
+      const rootMappings: PathMapping[] = [{ role: 'library', jellyfin: '/media', container: '/', qbit: null, qbitInstance: null }]
       entry('/a.mkv', { is_media: 1, size_bytes: 123 })
       entry('/sub', { is_dir: 1 })
       entry('/sub/b.mkv', { is_media: 1, size_bytes: 456 })

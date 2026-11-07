@@ -629,6 +629,14 @@ button {
   color: var(--ink-muted);
 }
 
+/* An instance's version, or the error it answered with — reported by the instance itself. */
+.connector-detail {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+}
+
 .scan-progress {
   display: flex;
   align-items: center;
@@ -804,6 +812,7 @@ button {
 
 .dupe-group-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
   gap: 0.75rem;
   border-bottom: none;
@@ -818,6 +827,14 @@ button {
 
 .dupe-table {
   margin-top: 0.25rem;
+}
+
+.table-scroll {
+  overflow-x: auto;
+}
+
+.dupe-table td.subject-path {
+  min-width: 11rem;
 }
 
 .dupe-keeper-radio {
@@ -893,12 +910,94 @@ button {
   margin: -0.3rem 0 0;
 }
 
-.dupe-hidden-notice {
+/* The receipt a server-side Dismiss leaves, with its Undo — same slip shape as any alert. */
+.dupe-dismissed-notice {
   align-items: center;
 }
 
-.dupe-hidden-notice .btn {
-  margin-left: 0.4em;
+.dupe-dismissed-notice .btn {
+  margin-left: auto;
+}
+
+/* The toolbar above hundreds of groups: filters on one row, the bulk queue on the next, and the
+   page count last, so the operator reads what the bulk button will cover before reaching it. */
+.dupe-toolbar .filters {
+  align-items: flex-end;
+  margin-bottom: 1rem;
+}
+
+.dupe-toolbar .filters .field input[type='search'] {
+  min-width: 14rem;
+}
+
+.dupe-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45em;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-muted);
+  padding-bottom: 0.6em;
+  cursor: pointer;
+}
+
+.dupe-bulk {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem 1.25rem;
+  border-top: 1px solid var(--line);
+  padding-top: 0.9rem;
+}
+
+.dupe-bulk .dupe-toggle {
+  padding-bottom: 0;
+}
+
+.dupe-provenance {
+  font-size: 12px;
+  color: var(--ink-muted);
+  margin: 0.9rem 0 0;
+}
+
+.dupe-reclaimable {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-muted);
+  white-space: nowrap;
+}
+
+.dupe-box {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* A copy's torrent: its name, then the facts that decide whether it may go — state, privacy,
+   H&R, ratio and seeding time — as one wrapping row of tags and plain figures. */
+.dupe-torrent {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3em;
+  min-width: 12rem;
+}
+
+.dupe-torrent-facts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3em 0.45em;
+}
+
+.dupe-fact {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ink-muted);
+  white-space: nowrap;
 }
 
 /* The receipt a Delete non-keepers click leaves behind: a positive-tint echo of exactly what was
@@ -1060,6 +1159,69 @@ button {
   margin: 0;
 }
 
+/* "Override <guard> for all N blocked rows" — one quiet button per overridable guard; the weight
+   goes to the confirmation it opens, not to the button itself. */
+.plan-override-all {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0 0 0.9em;
+}
+
+.plan-progress {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 1rem 0 0;
+  font-size: 13.5px;
+}
+
+.plan-progress progress {
+  flex: 1 1 14rem;
+  height: 0.75rem;
+  appearance: none;
+  border: 1px solid var(--line-strong);
+  border-radius: 2px;
+  background: var(--panel-alt);
+  overflow: hidden;
+}
+
+.plan-progress progress::-webkit-progress-bar {
+  background: var(--panel-alt);
+}
+
+.plan-progress progress::-webkit-progress-value {
+  background: var(--accent);
+}
+
+.plan-progress progress::-moz-progress-bar {
+  background: var(--accent);
+}
+
+.plan-torrents {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.plan-torrents li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3em 0.5em;
+}
+
+.plan-torrent-fact {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ink-muted);
+  white-space: nowrap;
+}
+
 /* ---------- Settings ---------- */
 
 .settings-mapping-actions {
@@ -1086,6 +1248,73 @@ button {
   margin: 0.5em 0 0;
   padding-left: 1.1em;
   font-size: 13px;
+}
+
+.settings-verify-at {
+  font-size: 13px;
+  color: var(--ink-muted);
+  margin: 0 0 0.6em;
+}
+
+/* One block per half of the verification — Jellyfin, then each qBittorrent instance — so a pass
+   on one box can never be read as a pass for the other. */
+.settings-verify-part {
+  background: var(--panel-alt);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.6em 0.75em;
+  margin: 0 0 0.6em;
+  font-size: 13.5px;
+}
+
+.settings-verify-part h3 {
+  display: flex;
+  align-items: center;
+  gap: 0.6em;
+  font-size: 13px;
+  margin: 0 0 0.3em;
+}
+
+.settings-verify-part p {
+  margin: 0;
+}
+
+/* Torrents outside every mapped folder: informational, so muted, with the examples folded away. */
+.settings-verify-ignored {
+  margin: 0.4em 0 0;
+  font-size: 13px;
+  color: var(--ink-muted);
+}
+
+.settings-verify-ignored summary {
+  cursor: pointer;
+}
+
+.settings-verify-ignored ul {
+  margin: 0.3em 0 0;
+  padding-left: 1.1em;
+}
+
+/* Server-reported mapping problems: a list inside the warn slip, so the slip stacks. */
+.settings-problems {
+  flex-direction: column;
+  gap: 0.3em;
+}
+
+.settings-problems ul {
+  margin: 0;
+  padding-left: 1.1em;
+}
+
+.settings-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 0 1rem;
+}
+
+.settings-field-note {
+  font-size: 12px;
+  color: var(--warn-strong);
 }
 
 .settings-proposed-table caption {
@@ -1160,4 +1389,69 @@ button {
 .empty {
   color: var(--ink-muted);
   font-size: 13.5px;
+}
+
+/* ---------- Shared: inline confirmation and paging ----------
+   A confirmation sits right under the control that raised it, never in a modal: the operator
+   reads the counts next to the rows they describe. Same hard-left-rule slip as `.alert`, in the
+   warn tint — it is a question, not a refusal. */
+
+.confirm {
+  background: var(--warn-tint);
+  border: 1px solid var(--warn-line);
+  border-left: 3px solid var(--warn-strong);
+  border-radius: var(--radius);
+  color: var(--ink);
+  padding: 0.85em 1em;
+  margin: 0.9rem 0;
+  font-size: 13.5px;
+}
+
+.confirm p {
+  margin: 0 0 0.6em;
+}
+
+.confirm-title {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--warn-strong);
+}
+
+.confirm-list {
+  margin: 0 0 0.75em;
+  padding-left: 1.1em;
+  color: var(--ink-muted);
+}
+
+.confirm-list:empty {
+  display: none;
+}
+
+.confirm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+  margin: 0.9rem 0;
+}
+
+.pager-status {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-muted);
+}
+
+.pager-buttons {
+  display: flex;
+  gap: 0.4rem;
 }

@@ -17,7 +17,7 @@ let file: string
 const deps = (config = fileConfigSchema.parse({})) => ({
   db,
   config,
-  pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }]),
+  pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null, qbitInstance: null }]),
 })
 
 beforeEach(() => {
@@ -175,6 +175,22 @@ describe('restoreFromTrash', () => {
     const res = restoreFromTrash(deps(), id)
     expect(res.restored).toBe(false)
     expect(readFileSync(file, 'utf8')).toBe('new content')
+  })
+
+  it('forgets the deleted_paths row of a file it puts back — the file is not deleted any more', () => {
+    // The executor records a trashed file as deleted, so the read models hide it. A restored file
+    // that stayed recorded would stay hidden for good: the row clears only once Jellyfin no longer
+    // lists the path, and Jellyfin lists it again once it is back.
+    const other = join(root, 'other.mkv')
+    writeFileSync(other, 'o')
+    moveToTrash(deps(), { path: file, planId: 'p1', sizeBytes: 4 })
+    moveToTrash(deps(), { path: other, planId: 'p1', sizeBytes: 1 })
+    const record = db.prepare('INSERT INTO deleted_paths (container_path, plan_id, deleted_at) VALUES (?,?,?)')
+    record.run(file, 'p1', 'T'); record.run(other, 'p1', 'T')
+    const id = (db.prepare('SELECT id FROM trash WHERE original_path = ?').get(file) as { id: string }).id
+    expect(restoreFromTrash(deps(), id).restored).toBe(true)
+    expect((db.prepare('SELECT container_path FROM deleted_paths').all() as Array<{ container_path: string }>)
+      .map((r) => r.container_path)).toEqual([other])
   })
 })
 

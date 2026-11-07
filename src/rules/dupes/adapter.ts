@@ -1,13 +1,15 @@
 import type { Finding, Subject } from '../../core/types.js'
 import { findingId } from '../../core/types.js'
+import type { KeeperPolicy } from '../../config/schema.js'
 import type { DupeLink, DupeRule, Rule, RuleContext, SubRun } from '../types.js'
 import { unavailableSourcesReason } from '../types.js'
 import { DUPE_RULES } from './index.js'
 import { buildDupeGroups } from '../grouping.js'
 import { DEFAULT_KEEPER_WEIGHTS, pickKeeper, type MemberFacts } from '../keeper.js'
+import { editionOf, isMultiEpisodeFile } from '../normalize.js'
 
 interface MemberRow {
-  id: string; name: string; container_path: string | null; size_bytes: number | null
+  id: string; name: string; jf_path: string | null; container_path: string | null; size_bytes: number | null
   height: number | null; bitrate: number | null; video_codec: string | null
   audio_channels: number | null; library_name: string | null
   video_range: string | null; has_subtitles: number
@@ -40,11 +42,33 @@ export function isHdrRange(videoRange: string | null): boolean {
  */
 interface DupeGroupEvidence extends Record<string, unknown> {
   groupId: string
-  keeperId: string
+  /** Null when the policy pre-selects nothing (`none`, or `smallest` with no known size). */
+  keeperId: string | null
+  /**
+   * The policy `keeperId` was chosen under. A policy change takes effect at the next scan, so the
+   * read model reports this rather than whatever the configuration says now.
+   */
+  keeperPolicy: KeeperPolicy
   scores: ReturnType<typeof pickKeeper>['scores']
   matchedBy: string[]
   links: DupeLink[]
   crossLibrary: boolean
+  /** Each member's `editionOf` its file path, by item id. */
+  editions: Record<string, string | null>
+  /**
+   * True when two members name different editions, an unnamed copy counting as one more edition.
+   * A different cut is not a spare copy: such a group's non-keepers are never pre-selected for
+   * deletion.
+   */
+  editionsDiffer: boolean
+  /**
+   * True when a member's file holds more than one episode (`S01E01E02`; see `isMultiEpisodeFile`).
+   * Jellyfin files such a file under its first episode, so it groups with that episode's copies —
+   * but it is not a spare copy of it: deleting it also deletes the episodes after the first, which
+   * no other member may hold. Like `editionsDiffer`, such a group's non-keepers are never bulk
+   * queued unless the operator includes these groups.
+   */
+  multiEpisode: boolean
 }
 
 /** The two matchers with a config `enabled` flag; every other matcher id has none. */
@@ -113,7 +137,8 @@ const lastPassOutcomes = new Map<number, Map<string, MatcherOutcome>>()
  * (see `DupeGroupEvidence`) and `confidence`/`subjects`, and `persist()` below — which the runner
  * calls separately, only after `run()` has already succeeded and query_only is back off — reads it
  * back out of those findings and writes `dupe_groups` from them. No second pass over the database,
- * no recomputation: `persist()` is a pure reshape of what `run()` already produced.
+ * no recomputation: `persist()` is a reshape of what `run()` already produced, plus one keyed read
+ * per group of that group's finding status (see `persist()`).
  */
 export const dupeGroupRule: Rule = {
   id: 'dupe.group',
@@ -147,12 +172,13 @@ export const dupeGroupRule: Rule = {
     const groups = buildDupeGroups(links)
     if (!groups.length) return []
 
+    const keeperPolicy = ctx.config.keeper.policy
     const findings: Finding[] = []
     for (const group of groups) {
       const placeholders = group.memberIds.map(() => '?').join(',')
-      const rows = ctx.db.prepare(`SELECT id, name, container_path, size_bytes, height, bitrate,
+      const rows = ctx.db.prepare(`SELECT id, name, jf_path, container_path, size_bytes, height, bitrate,
         video_codec, audio_channels, library_name, video_range, has_subtitles
-        FROM jellyfin_items WHERE id IN (${placeholders})`)
+        FROM jellyfin_items WHERE id IN (${placeholders}) ORDER BY id`)
         .all(...group.memberIds) as MemberRow[]
       if (rows.length < 2) continue
 
@@ -166,22 +192,31 @@ export const dupeGroupRule: Rule = {
         hasSubtitles: r.has_subtitles === 1,
         sizeBytes: r.size_bytes,
       }))
-      const { keeperId, scores } = pickKeeper(facts, DEFAULT_KEEPER_WEIGHTS)
+      const { keeperId, scores } = pickKeeper(facts, DEFAULT_KEEPER_WEIGHTS, keeperPolicy)
 
       const subjects: Subject[] = rows.map((r) => ({
         kind: 'item', id: r.id, label: r.name, path: r.container_path ?? undefined,
       }))
-      const reclaimable = rows
+      // With no keeper nothing is pre-selected for deletion, so nothing is counted as reclaimable.
+      const reclaimable = keeperId === null ? 0 : rows
         .filter((r) => r.id !== keeperId)
         .reduce((sum, r) => sum + (r.size_bytes ?? 0), 0)
+      const editions = Object.fromEntries(
+        rows.map((r) => [r.id, editionOf(r.container_path ?? r.jf_path ?? r.name)]),
+      ) as Record<string, string | null>
 
       const evidence: DupeGroupEvidence = {
         groupId: group.id,
         keeperId,
+        keeperPolicy,
         scores,
         matchedBy: [...new Set(group.links.map((l) => l.ruleId))],
         links: group.links,
         crossLibrary: new Set(rows.map((r) => r.library_name)).size > 1,
+        editions,
+        editionsDiffer: new Set(Object.values(editions)).size > 1,
+        // The same reading `episodePair` makes (src/rules/dupes/index.ts): either path's own name.
+        multiEpisode: rows.some((r) => [r.container_path, r.jf_path].some((p) => p !== null && isMultiEpisodeFile(p))),
       }
 
       findings.push({
@@ -205,6 +240,17 @@ export const dupeGroupRule: Rule = {
     // Full replace: dupe_groups mirrors exactly this pass's groups. A group that no longer forms
     // (because a duplicate was deleted, or its links stopped matching) simply isn't among
     // `findings` and its old row is dropped along with everyone else's, in the same DELETE.
+    //
+    // A row's status mirrors its group's `dupe.group` finding, and a dismissal sticks. Both ids are
+    // functions of the member set, so "same member set" is "same finding id": the runner calls
+    // persist() BEFORE it upserts this pass's findings, so that row still holds the status the
+    // operator last gave it, and the upsert itself never un-dismisses a finding. Reading the
+    // finding, not the old dupe_groups row, is deliberate: every route that dismisses or reopens a
+    // group changes its finding too (the findings routes mirror onto the group, the duplicates
+    // routes onto the finding), but a database written before the findings routes mirrored holds
+    // dismissals on the finding alone, and the operator's latest word must win.
+    // A changed member set is a new id, a new finding and a group the operator has not seen: open.
+    const findingStatus = ctx.db.prepare('SELECT status FROM findings WHERE id = ?')
     ctx.db.prepare('DELETE FROM dupe_groups').run()
     const insertGroup = ctx.db.prepare(
       'INSERT OR REPLACE INTO dupe_groups (id, tier, members_json, keeper_item_id, scores_json, status) VALUES (?,?,?,?,?,?)',
@@ -215,13 +261,14 @@ export const dupeGroupRule: Rule = {
       const memberIds = f.subjects
         .filter((s): s is Extract<Subject, { kind: 'item' }> => s.kind === 'item')
         .map((s) => s.id)
+      const prior = findingStatus.get(f.id) as { status: string } | undefined
       insertGroup.run(
         evidence.groupId,
         f.confidence,
         JSON.stringify(memberIds),
         evidence.keeperId,
         JSON.stringify(evidence.scores),
-        'open',
+        prior?.status === 'dismissed' ? 'dismissed' : 'open',
       )
     }
   },

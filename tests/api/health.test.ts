@@ -7,10 +7,16 @@ import { buildServer } from '../../src/server.js'
 import { registerHealthRoutes } from '../../src/api/health.js'
 import { openDb } from '../../src/index/db.js'
 import { createLogger } from '../../src/core/logger.js'
-import { fileConfigSchema } from '../../src/config/schema.js'
+import { createConfigStore } from '../../src/config/store.js'
 import { createPathMap } from '../../src/fs/pathmap.js'
 
-type Pingable = { ping: () => Promise<void> } | null
+type Pingable = { ping: () => Promise<unknown> } | null
+
+/** One instance, 'box-a', serving the given double; null = no qBittorrent instance at all. */
+const qbitMap = (client: Pingable) => (client ? new Map([['box-a', client]]) : new Map())
+
+/** The route reads only the path map from the store. */
+const storeWith = (pathMap = createPathMap([])) => ({ pathMap: () => pathMap })
 
 /**
  * Builds the same stub ServerDeps every route test in this file needs, with each of the four
@@ -20,18 +26,15 @@ type Pingable = { ping: () => Promise<void> } | null
 function depsWith(connectors: { jellyfin: Pingable; qbittorrent: Pingable; radarr: Pingable; sonarr: Pingable }) {
   const dir = mkdtempSync(join(tmpdir(), 'jm-srv-'))
   return {
-    config: {
-      env: {
-        dataDir: dir, port: 0, trustProxy: 0, sessionSecret: 'x'.repeat(32),
-        jellyfin: { url: 'http://jf', apiKey: 'k' },
-        qbittorrent: { url: 'http://qb', user: 'u', pass: 'p' },
-        radarr: null, sonarr: null,
-      },
-      file: fileConfigSchema.parse({}),
-    },
+    configStore: createConfigStore({
+      dataDir: dir, port: 0, trustProxy: 0, sessionSecret: 'x'.repeat(32),
+      jellyfin: { url: 'http://jf', apiKey: 'k' },
+      qbittorrents: [{ id: 'box-a', url: 'http://qb', user: null, pass: null }],
+      radarr: null, sonarr: null,
+    }),
     db: openDb(join(dir, 'db.sqlite')),
     jellyfin: connectors.jellyfin as never,
-    qbittorrent: connectors.qbittorrent as never,
+    qbittorrents: qbitMap(connectors.qbittorrent) as never,
     radarr: connectors.radarr as never,
     sonarr: connectors.sonarr as never,
     logger: createLogger({ level: 'error', sink: () => {} }),
@@ -43,7 +46,6 @@ function depsWith(connectors: { jellyfin: Pingable; qbittorrent: Pingable; radar
     plannerDeps: (() => ({})) as never,
     trashDeps: (() => ({})) as never,
     executor: {} as never,
-    pathMap: createPathMap([]),
   }
 }
 
@@ -108,16 +110,205 @@ describe('GET /healthz', () => {
     registerHealthRoutes(app, {
       db: openDb(join(dir, 'db.sqlite')),
       jellyfin: { ping: async () => { pings += 1 } },
-      qbittorrent: null,
+      qbittorrents: qbitMap(null),
       radarr: null,
       sonarr: null,
-      pathMap: createPathMap([]),
+      configStore: storeWith(),
       now: () => t,
     })
     await app.inject({ method: 'GET', url: '/healthz' })
     t = 10_000
     await app.inject({ method: 'GET', url: '/healthz' })
     expect(pings).toBe(2)
+  })
+})
+
+describe('GET /healthz — qBittorrent instances', () => {
+  const withBoxes = (
+    boxes: Record<string, () => Promise<unknown>>,
+    extra: { now?: () => number; probeDeadlineMs?: number } = {},
+  ) => {
+    const dir = mkdtempSync(join(tmpdir(), 'jm-hc-boxes-'))
+    const app = Fastify()
+    registerHealthRoutes(app, {
+      db: openDb(join(dir, 'db.sqlite')),
+      jellyfin: { ping: async () => {} },
+      qbittorrents: new Map(Object.entries(boxes).map(([id, ping]) => [id, { ping }])),
+      radarr: null,
+      sonarr: null,
+      configStore: storeWith(),
+      ...extra,
+    })
+    return app
+  }
+  const kindError = (kind: string) => () => Promise.reject(Object.assign(new Error('x'), { kind }))
+  const probe = async (app: ReturnType<typeof withBoxes>) => (await app.inject({ method: 'GET', url: '/healthz' })).json()
+
+  it('reports qbittorrent ok only when every instance answers', async () => {
+    const app = withBoxes({ 'box-a': async () => ({ version: 'v5.2.2' }), 'box-b': async () => ({ version: 'v5.1.2' }) })
+    const body = (await app.inject({ method: 'GET', url: '/healthz' })).json()
+    expect(body.connectors.qbittorrent).toBe('ok')
+    expect(body.status).toBe('ok')
+  })
+
+  it('reports the worst instance, so one healthy box cannot hide a dead one', async () => {
+    const app = withBoxes({
+      'box-a': async () => ({ version: 'v5.2.2' }),
+      'box-b': async () => { throw Object.assign(new Error('x'), { kind: 'auth' }) },
+    })
+    const body = (await app.inject({ method: 'GET', url: '/healthz' })).json()
+    expect(body.connectors.qbittorrent).toBe('auth')
+    expect(body.status).toBe('degraded')
+  })
+
+  it('healthz lists every qBittorrent instance with version; connectors.qbittorrent is the worst', async () => {
+    const body = await probe(withBoxes({
+      'box-a': async () => ({ version: 'v5.2.2' }),
+      'box-b': async () => ({ version: 'v5.1.2' }),
+      'box-c': kindError('auth'),
+      'box-d': kindError('unreachable'),
+    }))
+    expect(body.connectors.qbitInstances).toEqual({
+      'box-a': { status: 'ok', version: 'v5.2.2' },
+      'box-b': { status: 'ok', version: 'v5.1.2' },
+      'box-c': { status: 'auth', error: 'auth' },
+      'box-d': { status: 'unreachable', error: 'unreachable' },
+    })
+    // Not the first failure in list order (that would be 'auth'): an unreachable box outranks one
+    // that merely rejects credentials, and a healthy box outranks nothing.
+    expect(body.connectors.qbittorrent).toBe('unreachable')
+    expect(body.status).toBe('degraded')
+  })
+
+  it('lists healthy instances with their versions and keeps the aggregate ok', async () => {
+    const body = await probe(withBoxes({
+      'box-a': async () => ({ version: 'v5.2.2' }),
+      'box-b': async () => ({ version: 'v5.1.2' }),
+    }))
+    expect(body.connectors.qbitInstances).toEqual({
+      'box-a': { status: 'ok', version: 'v5.2.2' },
+      'box-b': { status: 'ok', version: 'v5.1.2' },
+    })
+    expect(body.connectors.qbittorrent).toBe('ok')
+    expect(body.status).toBe('ok')
+  })
+
+  it('names the failing box, so a healthy one cannot hide it', async () => {
+    const body = await probe(withBoxes({ 'box-a': async () => ({ version: 'v5.2.2' }), 'box-b': kindError('auth') }))
+    expect(body.connectors.qbitInstances['box-a']).toEqual({ status: 'ok', version: 'v5.2.2' })
+    expect(body.connectors.qbitInstances['box-b']).toEqual({ status: 'auth', error: 'auth' })
+    expect(body.connectors.qbittorrent).toBe('auth')
+  })
+
+  it('reports an instance whose ping gives no version as ok without one', async () => {
+    const body = await probe(withBoxes({ 'box-a': async () => {} }))
+    expect(body.connectors.qbitInstances['box-a']).toEqual({ status: 'ok' })
+  })
+
+  // The per-instance status is the contract's four-value union; the detail it cannot carry
+  // (a timeout, a rate limit, a malformed answer) goes in `error`, from the same allowlist of
+  // connector-error kinds the aggregate uses — never the error's own message.
+  it.each(['timeout', 'rate-limited', 'bad-response', 'cancelled'])(
+    'reports a %s failure as unreachable with the kind in error, and the aggregate keeps the kind',
+    async (kind) => {
+      const body = await probe(withBoxes({ 'box-a': kindError(kind) }))
+      expect(body.connectors.qbitInstances['box-a']).toEqual({ status: 'unreachable', error: kind })
+      expect(body.connectors.qbittorrent).toBe(kind)
+      expect(body.status).toBe('degraded')
+    },
+  )
+
+  it('ranks failures so the aggregate does not depend on the order instances are listed in', async () => {
+    const failures = { 'box-a': kindError('auth'), 'box-b': kindError('unreachable') }
+    expect((await probe(withBoxes(failures))).connectors.qbittorrent).toBe('unreachable')
+    expect((await probe(withBoxes({ 'box-b': failures['box-b'], 'box-a': failures['box-a'] }))).connectors.qbittorrent).toBe('unreachable')
+  })
+
+  it('never puts an error message, URL or credential in the unauthenticated response', async () => {
+    const body = await probe(withBoxes({
+      'box-a': async () => { throw new Error('connect ECONNREFUSED http://operator:hunter2@198.51.100.10:8080/api/v2/app/version') },
+      'box-b': async () => { throw Object.assign(new Error('boom'), { kind: '…?apikey=SECRET-abcdef' }) },
+    }))
+    expect(body.connectors.qbitInstances['box-a']).toEqual({ status: 'unreachable', error: 'unreachable' })
+    expect(body.connectors.qbitInstances['box-b']).toEqual({ status: 'unreachable', error: 'unreachable' })
+    const text = JSON.stringify(body)
+    for (const leaked of ['hunter2', 'operator', '198.51.100', 'SECRET', 'ECONNREFUSED']) expect(text).not.toContain(leaked)
+  })
+
+  // A version is text the qBittorrent server chose, served with no authentication: only something
+  // shaped like a version number is passed through.
+  it.each([
+    ['markup', '<script>alert(1)</script>'],
+    ['a sentence', 'v5.2.2 is running on host nas.example'],
+    ['an over-long string', `v${'9'.repeat(200)}`],
+    ['a non-string', 5],
+    ['an empty string', ''],
+  ])('omits a version that is %s', async (_label, version) => {
+    const body = await probe(withBoxes({ 'box-a': async () => ({ version }) }))
+    expect(body.connectors.qbitInstances['box-a']).toEqual({ status: 'ok' })
+  })
+
+  it('passes ordinary version spellings through', async () => {
+    const body = await probe(withBoxes({
+      'box-a': async () => ({ version: 'v5.2.2' }),
+      'box-b': async () => ({ version: '4.6.7' }),
+      'box-c': async () => ({ version: 'v5.0.0rc1' }),
+    }))
+    expect(Object.values(body.connectors.qbitInstances).map((i) => (i as { version: string }).version))
+      .toEqual(['v5.2.2', '4.6.7', 'v5.0.0rc1'])
+  })
+
+  it('has no instances to list, and reports qbittorrent as not-configured, when none is configured', async () => {
+    const body = await probe(withBoxes({}))
+    expect(body.connectors.qbitInstances).toEqual({})
+    expect(body.connectors.qbittorrent).toBe('not-configured')
+    expect(body.status).toBe('ok')
+  })
+
+  it('pings each instance once within the TTL and again after it, so an anonymous caller cannot spend a box\'s budget', async () => {
+    const pings = { a: 0, b: 0 }
+    let t = 0
+    const app = withBoxes(
+      { 'box-a': async () => { pings.a += 1; return { version: 'v5.2.2' } }, 'box-b': async () => { pings.b += 1; return { version: 'v5.1.2' } } },
+      { now: () => t },
+    )
+    await Promise.all([probe(app), probe(app), probe(app)])
+    expect(pings).toEqual({ a: 1, b: 1 })
+    t = 10_000
+    const later = await probe(app)
+    expect(pings).toEqual({ a: 2, b: 2 })
+    expect(later.connectors.qbitInstances['box-a'].version).toBe('v5.2.2')
+  })
+
+  // No wall-clock assertion: if the deadline did not cut the hung box off, `probe` would never
+  // return and this test would hit its own timeout, which is the failure that matters.
+  it('reports a box that hangs as timed out without holding up the other box', async () => {
+    const body = await probe(withBoxes(
+      { 'box-a': async () => ({ version: 'v5.2.2' }), 'box-b': () => new Promise<void>(() => { /* never settles */ }) },
+      { probeDeadlineMs: 50 },
+    ))
+    expect(body.connectors.qbitInstances['box-a']).toEqual({ status: 'ok', version: 'v5.2.2' })
+    expect(body.connectors.qbitInstances['box-b']).toEqual({ status: 'unreachable', error: 'timeout' })
+    expect(body.connectors.qbittorrent).toBe('timeout')
+    expect(body.status).toBe('degraded')
+  }, 10_000)
+
+  it('still answers with a status when config.json cannot be read, reporting arrUnmappable as not evaluated', async () => {
+    // The container HEALTHCHECK needs a JSON `status`; a config typo must not make this probe 500.
+    const dir = mkdtempSync(join(tmpdir(), 'jm-hc-badcfg-'))
+    const app = Fastify()
+    registerHealthRoutes(app, {
+      db: openDb(join(dir, 'db.sqlite')),
+      jellyfin: { ping: async () => {} },
+      qbittorrents: qbitMap({ ping: async () => ({ version: 'v5.2.2' }) }),
+      radarr: null,
+      sonarr: null,
+      configStore: { pathMap: () => { throw new Error('config.json is not valid JSON') } },
+    })
+    const res = await app.inject({ method: 'GET', url: '/healthz' })
+    expect(res.statusCode).toBe(200)
+    expect(typeof res.json().status).toBe('string')
+    expect(res.json().arrUnmappable).toEqual({ evaluated: false, count: 0 })
   })
 })
 
@@ -130,7 +321,10 @@ describe('GET /healthz — all connectors', () => {
       sonarr: null,
     }))
     const body = (await app.inject({ method: 'GET', url: '/healthz' })).json()
-    expect(body.connectors).toEqual({ jellyfin: 'ok', qbittorrent: 'ok', radarr: 'ok', sonarr: 'not-configured' })
+    expect(body.connectors).toEqual({
+      jellyfin: 'ok', qbittorrent: 'ok', radarr: 'ok', sonarr: 'not-configured',
+      qbitInstances: { 'box-a': { status: 'ok' } },
+    })
   })
 
   it('distinguishes not-configured from unreachable', async () => {
@@ -176,10 +370,10 @@ describe('GET /healthz — finding MAJOR 2 (a hanging connector must not delay t
     registerHealthRoutes(app, {
       db: openDb(join(dir, 'db.sqlite')),
       jellyfin: { ping: () => new Promise<void>(() => { /* never settles */ }) },
-      qbittorrent: null,
+      qbittorrents: qbitMap(null),
       radarr: null,
       sonarr: null,
-      pathMap: createPathMap([]),
+      configStore: storeWith(),
       probeDeadlineMs: 50,
     })
     const started = performance.now()
@@ -187,13 +381,17 @@ describe('GET /healthz — finding MAJOR 2 (a hanging connector must not delay t
     const elapsedMs = performance.now() - started
     // Generous relative to the 50ms deadline configured above — the point is this is nowhere near
     // the tens of seconds a real hung connector would otherwise cost, not a tight timing assertion.
-    expect(elapsedMs).toBeLessThan(1000)
+    // The ping never settles, so without the deadline this response would never come at all; any
+    // finite bound proves the property. It was 1000ms, which a loaded host does not honor: with the
+    // suite running in parallel on a disk under IO pressure, this one 50ms timer was measured firing
+    // 1.6-2.9s late (no other work in the window), failing 2 runs in 3 at the plain lane merge.
+    expect(elapsedMs).toBeLessThan(10_000)
     expect(res.statusCode).toBe(200)
     const body = res.json()
     expect(body.connectors.jellyfin).toBe('timeout')
     // A probe that timed out is neither "ok" nor "not-configured" — it must still fail closed.
     expect(body.status).toBe('degraded')
-  }, 2000)
+  }, 15_000)
 
   it('still reports a fast connector normally when a different connector hangs', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'jm-hc-deadline-mixed-'))
@@ -201,10 +399,10 @@ describe('GET /healthz — finding MAJOR 2 (a hanging connector must not delay t
     registerHealthRoutes(app, {
       db: openDb(join(dir, 'db.sqlite')),
       jellyfin: { ping: () => new Promise<void>(() => { /* never settles */ }) },
-      qbittorrent: { ping: async () => {} },
+      qbittorrents: qbitMap({ ping: async () => {} }),
       radarr: null,
       sonarr: null,
-      pathMap: createPathMap([]),
+      configStore: storeWith(),
       probeDeadlineMs: 50,
     })
     const res = await app.inject({ method: 'GET', url: '/healthz' })
@@ -255,10 +453,10 @@ describe('GET /healthz — finding MINOR 4 (indexCounts must be TTL-cached like 
     registerHealthRoutes(app, {
       db,
       jellyfin: { ping: async () => {} },
-      qbittorrent: null,
+      qbittorrents: qbitMap(null),
       radarr: null,
       sonarr: null,
-      pathMap: createPathMap([]),
+      configStore: storeWith(),
       now: () => t,
     })
     await app.inject({ method: 'GET', url: '/healthz' })
@@ -334,10 +532,10 @@ describe('GET /healthz — MAJOR 2 (surface arrUnmappable count)', () => {
     registerHealthRoutes(app, {
       db: openDb(join(dir, 'db.sqlite')),
       jellyfin: { ping: async () => {} },
-      qbittorrent: null,
+      qbittorrents: qbitMap(null),
       radarr: { ping: async () => {}, inventory: async () => ({ records: [arrRecord('/movies/Heat.mkv')], complete: true }) } as never,
       sonarr: null,
-      pathMap: createPathMap([{ role: 'library', jellyfin: '/movies', container: '/data/movies', qbit: null }]),
+      configStore: storeWith(createPathMap([{ role: 'library', jellyfin: '/movies', container: '/data/movies', qbit: null, qbitInstance: null }])),
     })
     const body = (await app.inject({ method: 'GET', url: '/healthz' })).json()
     expect(body.arrUnmappable).toEqual({ evaluated: true, count: 0 })
@@ -401,10 +599,10 @@ describe('GET /healthz — MAJOR 2 (surface arrUnmappable count)', () => {
     registerHealthRoutes(app, {
       db: openDb(join(dir, 'db.sqlite')),
       jellyfin: { ping: async () => {} },
-      qbittorrent: null,
+      qbittorrents: qbitMap(null),
       radarr: { ping: async () => {}, inventory: async () => { calls += 1; return { records: [], complete: true } } } as never,
       sonarr: null,
-      pathMap: createPathMap([]),
+      configStore: storeWith(),
       now: () => t,
     })
     await app.inject({ method: 'GET', url: '/healthz' })

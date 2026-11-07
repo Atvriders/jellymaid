@@ -20,6 +20,9 @@ export const filesystemPhase: Phase = {
     // Root-level open failures only (mount down, deleted, permissions) — not subtree errors.
     // Used to tell "every root failed outright" from "every root walked, some imperfectly".
     const rootOpenFailures: Array<{ path: string; reason: string }> = []
+    // Roots that opened and walked clean but empty while the index holds rows for them.
+    const unmounted: string[] = []
+    const indexHoldsRows = ctx.db.prepare('SELECT 1 FROM fs_entries WHERE library_root = ? LIMIT 1')
     let written = 0
     let stale = 0
     let sweepSkipped = 0
@@ -48,6 +51,7 @@ export const filesystemPhase: Phase = {
       // tell every filesystem rule every file in it just vanished, when in fact we just failed
       // to look. Also feeds whether the PHASE can claim it walked anything at all.
       let rootOpenFailed = false
+      let rootRows = 0
 
       try {
         for await (const batch of walkRoot({
@@ -85,6 +89,7 @@ export const filesystemPhase: Phase = {
           }
           writeBatch(rows)
           written += rows.length
+          rootRows += rows.length
           ctx.progress(written, null)
         }
       } catch (err) {
@@ -95,7 +100,17 @@ export const filesystemPhase: Phase = {
         rootOpenFailures.push(failure)
       }
 
-      if (!rootOpenFailed) anyRootWalked = true
+      // An empty walk of a root the index already knows is what an unmounted share looks like:
+      // its mount point stays behind as an empty directory, which opens and walks without a
+      // single error. "Saw nothing" is not "there is nothing" here any more than for a root that
+      // would not open — the same unobserved-not-gone rule applies, and sweeping would tell every
+      // filesystem rule the whole library just vanished. A root the index has never held rows
+      // for is simply empty: nothing to protect, nothing lost by sweeping.
+      const walkedEmpty = !rootHadErrors && !ctx.signal.aborted && rootRows === 0
+        && indexHoldsRows.get(root.container) !== undefined
+      if (walkedEmpty) unmounted.push(root.container)
+
+      if (!rootOpenFailed && !walkedEmpty) anyRootWalked = true
 
       // THE licence to delete anything under this root. A sweep is only ever justified by a
       // COMPLETE observation: the walk must have both run to completion and errored nowhere.
@@ -106,7 +121,7 @@ export const filesystemPhase: Phase = {
       // breaks out of its loops and flushes the trailing batch; see src/fs/walker.ts), so the
       // `for await` above exits exactly as it does on a finished walk. Without this check a
       // cancelled scan would sweep everything the walk never reached.
-      const sweepLicensed = !rootHadErrors && !ctx.signal.aborted
+      const sweepLicensed = !rootHadErrors && !ctx.signal.aborted && !walkedEmpty
 
       if (!sweepLicensed) {
         // Recorded, not silently dropped.
@@ -154,12 +169,22 @@ export const filesystemPhase: Phase = {
       ).run(...configured).changes
     }
 
-    if (!anyRootWalked && errors.length) {
-      // Every configured root failed before it could even be opened — this is a total
-      // filesystem-connectivity failure disguised as "nothing found" unless it says so. Name
-      // every failed root so an operator knows which mount is down.
-      const reason = `every configured root failed to open: ${rootOpenFailures.map((f) => `${f.path} (${f.reason})`).join('; ')}`
-      return { status: 'skipped', reason, counts: { entries: written, stale, errors: errors.length, sweepSkipped, pruned } }
+    const unmountedNote = `walked empty while the index holds entries for it, so it was treated as unmounted and not swept`
+    const counts = { entries: written, stale, errors: errors.length, sweepSkipped, pruned, unmounted: unmounted.length }
+
+    if (!anyRootWalked && (rootOpenFailures.length || unmounted.length)) {
+      // Every configured root failed before it could even be opened, or walked empty as an
+      // unmounted share does — this is a total filesystem-connectivity failure disguised as
+      // "nothing found" unless it says so. Name every failed root so an operator knows which
+      // mount is down.
+      const roots = [
+        ...rootOpenFailures.map((f) => `${f.path} (${f.reason})`),
+        ...unmounted.map((p) => `${p} (${unmountedNote})`),
+      ]
+      const reason = unmounted.length
+        ? `no configured root could be read: ${roots.join('; ')}`
+        : `every configured root failed to open: ${roots.join('; ')}`
+      return { status: 'skipped', reason, counts }
     }
 
     // fs.permission reads this back to report every path the walk could not describe (a locked
@@ -180,6 +205,11 @@ export const filesystemPhase: Phase = {
     ctx.db.prepare("INSERT OR REPLACE INTO kv (key, value_json) VALUES ('scan.fsErrors', ?)")
       .run(JSON.stringify(errors.slice(0, 500)))
 
-    return { status: 'completed', counts: { entries: written, stale, errors: errors.length, sweepSkipped, pruned } }
+    // Other roots were observed, so the phase completed — but a root it did not sweep is said
+    // out loud, not left for an operator to infer from a count.
+    if (unmounted.length) {
+      return { status: 'completed', reason: unmounted.map((p) => `${p} ${unmountedNote}`).join('; '), counts }
+    }
+    return { status: 'completed', counts }
   },
 }

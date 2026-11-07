@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import type { Db } from '../index/db.js'
-import type { PathMap } from '../fs/pathmap.js'
+import type { ConfigStore } from '../config/store.js'
 import { requireSession } from './auth.js'
 
 /**
@@ -26,9 +26,15 @@ const FLAG_BY_RULE: Record<string, string> = {
  * authenticated caller may explicitly request, not the common case; `DEFAULT_PAGE_SIZE` is what an
  * unparameterized request gets, comfortably above what any reasonably-organized library directory
  * holds.
+ *
+ * The ceiling is 1,000 (C12), not the 50,000 it used to be: the screen pages with `offset`/`limit`
+ * and shows `total`, so nothing needs a whole directory in one response, and a ceiling this low
+ * keeps the slowest part of a listing — a rollup subquery per subdirectory on the page — bounded by
+ * a number rather than by however large a directory a caller names. A larger `limit` is a 400, like
+ * every other malformed query on this route, not a quietly shorter page the caller did not ask for.
  */
 const DEFAULT_PAGE_SIZE = 500
-const MAX_PAGE_SIZE = 50_000
+const MAX_PAGE_SIZE = 1000
 
 /** A plain non-negative integer in decimal — rejects arrays, floats, and non-numeric junk alike,
  * the same "SHAPE matters" discipline `path` documents below, rather than coercing and hoping. */
@@ -47,11 +53,15 @@ const explorerQuery = z.object({
 
 export function registerExplorerRoutes(
   app: FastifyInstance,
-  deps: { db: Db; sessionSecret: string; pathMap: PathMap },
+  deps: { db: Db; sessionSecret: string; configStore: Pick<ConfigStore, 'pathMap'> },
 ): void {
   app.get('/api/explorer', { preHandler: requireSession(deps.sessionSecret) }, async (req, reply) => {
     const parsed = explorerQuery.safeParse(req.query)
     if (!parsed.success) return reply.code(400).send({ error: 'invalid query' })
+    // The live path map — the same one the planner and executor read — so the containment check
+    // below is the identical `isWithinRoot` every destructive path trusts, never a copy of the
+    // mappings from before the last edit.
+    const pathMap = deps.configStore.pathMap()
     // A trailing slash names the same directory as its slash-less form (`/mnt/m/` === `/mnt/m`),
     // but neither the root-equality check just below nor the child query's exact `parent_path`
     // match treats them as equal strings — normalize it away once, up front, so both agree on one
@@ -63,14 +73,25 @@ export function registerExplorerRoutes(
     let requested = parsed.data.path
     if (requested && requested.length > 1 && requested.endsWith('/')) requested = requested.slice(0, -1)
 
+    const limit = parsed.data.limit ?? DEFAULT_PAGE_SIZE
+    const offset = parsed.data.offset ?? 0
+
     if (!requested) {
       // The top level of the tree: every configured mount (library AND download roots — an
       // operator inspecting "why did this not get cleaned up" needs to see the download side
       // too), not live-stat'd, just the index's rollup for each.
+      //
+      // Paged by the same `offset`/`limit` as a directory, so `total`, `offset` and `limit` mean
+      // the same thing on every response and a client's pager has no top-level special case. A
+      // handful of mounts never reach the default page, so this only ever slices when asked to.
+      const roots = pathMap.all()
       return reply.send({
         path: '',
         parent: null,
-        entries: deps.pathMap.all().map((m) => ({
+        total: roots.length,
+        limit,
+        offset,
+        entries: roots.slice(offset, offset + limit).map((m) => ({
           name: m.container,
           path: m.container,
           isDir: true,
@@ -87,13 +108,10 @@ export function registerExplorerRoutes(
     // resolving somewhere else entirely), and `isWithinRoot` (src/fs/pathmap.ts) is what actually
     // resolves symlinks and fails closed on anything it cannot resolve. Both must pass — reusing
     // that one function rather than re-deriving a second containment check here.
-    const root = deps.pathMap.rootFor(requested)
-    if (!root || !deps.pathMap.isWithinRoot(requested, root)) {
+    const root = pathMap.rootFor(requested)
+    if (!root || !pathMap.isWithinRoot(requested, root)) {
       return reply.code(400).send({ error: 'path is outside every configured root' })
     }
-
-    const limit = parsed.data.limit ?? DEFAULT_PAGE_SIZE
-    const offset = parsed.data.offset ?? 0
 
     // The total sibling count independent of the page below — a caller must be able to tell "500
     // of 33,000" from "all 500 there are" without ever pulling all 33,000 rows into one response.

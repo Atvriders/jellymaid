@@ -51,10 +51,13 @@ export function TierBadge({ tier }: { tier: string }) {
   return <span className={cls}>{tier}</span>
 }
 
-export function GuardVerdictList({ verdicts, overrides, onToggleOverride }: {
+export function GuardVerdictList({ verdicts, overrides, onToggleOverride, readOnly = false }: {
   verdicts: GuardVerdict[]
   overrides: string[]
   onToggleOverride: (guard: string) => void
+  /** Once a plan is past draft its overrides are fixed: show them as fact, offer no control. The
+   * caller must then pass the overrides the plan STORES, not any local selection. */
+  readOnly?: boolean
 }) {
   return (
     <ul className="guards">
@@ -66,7 +69,9 @@ export function GuardVerdictList({ verdicts, overrides, onToggleOverride }: {
               must never be interpreted as markup. */}
           <span className="guard-name">{v.guard}</span>
           <span className="guard-reason">{v.reason}</span>
-          {v.overridable ? (
+          {v.overridable && readOnly ? (
+            overrides.includes(v.guard) ? <span className="guard-override">overridden</span> : null
+          ) : v.overridable ? (
             <label className="guard-override">
               <input
                 type="checkbox"
@@ -108,4 +113,74 @@ export function NotEvaluatedNotice({ items }: { items: Array<{ ruleId: string; r
 
 export function EmptyState({ children }: { children: ReactNode }) {
   return <p className="empty">{children}</p>
+}
+
+/** Counts read at a glance at the owner's scale ("1,200", never "1200"). */
+function formatCount(n: number): string {
+  return n.toLocaleString('en-US')
+}
+
+/**
+ * An inline confirmation, rendered right where the question arose rather than in a modal: the
+ * operator reads the consequences next to the rows they describe. Focus lands on Cancel, so a
+ * reflexive Enter backs out instead of agreeing to something nobody read.
+ */
+export function ConfirmBox({ title, children, confirmLabel, confirmClassName = 'btn btn-primary', busy = false, disabled = false, onConfirm, onCancel }: {
+  title: string
+  children?: ReactNode
+  confirmLabel: string
+  confirmClassName?: string
+  busy?: boolean
+  disabled?: boolean
+  onConfirm: () => void
+  onCancel: () => void
+}) {
+  return (
+    <div className="confirm" role="alertdialog" aria-label={title}>
+      <p className="confirm-title">{title}</p>
+      {children}
+      <div className="confirm-actions">
+        <button type="button" className={confirmClassName} disabled={busy || disabled} aria-busy={busy} onClick={onConfirm}>
+          {confirmLabel}
+        </button>
+        {/* eslint-disable-next-line jsx-a11y/no-autofocus -- deliberate: the safe answer gets focus */}
+        <button type="button" className="btn btn-quiet" autoFocus onClick={onCancel}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * "1–50 of 900 groups" plus Previous/Next for any list that pages by offset. The buttons appear
+ * only when there is more than one page; the count line always says how much there is.
+ */
+export function Pager({ offset, limit, total, noun, onOffset }: {
+  offset: number
+  limit: number
+  total: number
+  /** Singular and plural noun for the count line, e.g. ['group', 'groups']. */
+  noun: readonly [string, string]
+  onOffset: (offset: number) => void
+}) {
+  const last = Math.min(offset + limit, total)
+  const word = total === 1 ? noun[0] : noun[1]
+  return (
+    <div className="pager">
+      <span className="pager-status">
+        {total > limit ? `${formatCount(offset + 1)}–${formatCount(last)} of ${formatCount(total)} ${word}` : `${formatCount(total)} ${word}`}
+      </span>
+      {total > limit ? (
+        <span className="pager-buttons">
+          <button type="button" className="btn btn-quiet" disabled={offset <= 0} onClick={() => onOffset(Math.max(0, offset - limit))}>
+            Previous
+          </button>
+          <button type="button" className="btn btn-quiet" disabled={last >= total} onClick={() => onOffset(offset + limit)}>
+            Next
+          </button>
+        </span>
+      ) : null}
+    </div>
+  )
 }

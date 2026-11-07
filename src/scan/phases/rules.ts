@@ -1,6 +1,7 @@
 import type { Phase, PhaseContext, PhaseName, PhaseResult } from './types.js'
 import type { Db } from '../../index/db.js'
 import { runRules } from '../../rules/runner.js'
+import { ALL_RULES } from '../../rules/registry.js'
 import type { SourceName, SourceReasons } from '../../rules/types.js'
 
 /** The phase that observes each source, and the table its observation lands in. */
@@ -94,21 +95,41 @@ export const rulesPhase: Phase = {
   name: 'rules',
   async run(ctx: PhaseContext): Promise<PhaseResult> {
     const availability = availableSources(ctx.db, ctx.priorResults)
-    const summary = runRules({
-      db: ctx.db,
-      config: ctx.deps.config,
-      scanId: ctx.scanId,
-      availableSources: availability.sources,
-      sourceReasons: availability.reasons,
-    })
-    return {
-      status: 'completed',
-      counts: {
-        created: summary.created,
-        resolved: summary.resolved,
-        reopened: summary.reopened,
-        notEvaluated: summary.notEvaluated.length,
-      },
-    }
+    const now = new Date().toISOString()
+    const total = ALL_RULES.length
+    const counts = { created: 0, resolved: 0, reopened: 0, notEvaluated: 0 }
+
+    // One runRules call per rule, so progress can be reported as each rule finishes. The pass is
+    // still ONE pass:
+    //  - The outer transaction keeps it all-or-nothing, which runRules' own transaction gives a
+    //    single call. Its per-call transactions nest inside as savepoints, so a failure part-way
+    //    through rolls back every rule, never leaving some with rule_runs rows and others without.
+    //  - A call resolves only the stale findings of the rules it evaluated, so per-rule calls
+    //    resolve exactly what one call over the registry would. The one difference is timing: a
+    //    rule's stale findings resolve when it finishes rather than at the end of the pass, which
+    //    only a rule reading ANOTHER rule's findings could notice, and none does.
+    //  - One `now` for every call, so the pass stamps one time as a single call would.
+    // Progress goes out from inside the transaction on purpose: postMessage reaches the main
+    // thread without this thread yielding, so the status bar moves while the pass runs.
+    ctx.progress(0, total)
+    ctx.db.transaction(() => {
+      ALL_RULES.forEach((rule, i) => {
+        const summary = runRules({
+          db: ctx.db,
+          config: ctx.deps.config,
+          scanId: ctx.scanId,
+          availableSources: availability.sources,
+          sourceReasons: availability.reasons,
+          rules: [rule],
+          now,
+        })
+        counts.created += summary.created
+        counts.resolved += summary.resolved
+        counts.reopened += summary.reopened
+        counts.notEvaluated += summary.notEvaluated.length
+        ctx.progress(i + 1, total)
+      })
+    })()
+    return { status: 'completed', counts }
   },
 }

@@ -5,26 +5,22 @@ import { join, dirname } from 'node:path'
 import { buildServer } from '../../src/server.js'
 import { openDb } from '../../src/index/db.js'
 import { createLogger } from '../../src/core/logger.js'
-import { fileConfigSchema } from '../../src/config/schema.js'
-import { createPathMap } from '../../src/fs/pathmap.js'
+import { createConfigStore } from '../../src/config/store.js'
 
 // Same stub-deps shape as tests/api/health.test.ts, plus `clientDir` pointing at a temp
 // directory containing a built SPA's index.html.
 function testDeps(clientDir: string) {
   const dir = mkdtempSync(join(tmpdir(), 'jm-srv-static-'))
   return {
-    config: {
-      env: {
-        dataDir: dir, port: 0, trustProxy: 0, sessionSecret: 'x'.repeat(32),
-        jellyfin: { url: 'http://jf', apiKey: 'k' },
-        qbittorrent: { url: 'http://qb', user: 'u', pass: 'p' },
-        radarr: null, sonarr: null,
-      },
-      file: fileConfigSchema.parse({}),
-    },
+    configStore: createConfigStore({
+      dataDir: dir, port: 0, trustProxy: 0, sessionSecret: 'x'.repeat(32),
+      jellyfin: { url: 'http://jf', apiKey: 'k' },
+      qbittorrents: [{ id: 'box-a', url: 'http://qb', user: null, pass: null }],
+      radarr: null, sonarr: null,
+    }),
     db: openDb(join(dir, 'db.sqlite')),
     jellyfin: { ping: async () => {} } as never,
-    qbittorrent: { ping: async () => {} },
+    qbittorrents: new Map([['box-a', { ping: async () => ({ version: 'v5.2.2' }), torrents: async () => [] }]]),
     radarr: null,
     sonarr: null,
     logger: createLogger({ level: 'error', sink: () => {} }),
@@ -35,7 +31,6 @@ function testDeps(clientDir: string) {
     plannerDeps: (() => ({})) as never,
     trashDeps: (() => ({})) as never,
     executor: {} as never,
-    pathMap: createPathMap([]),
     clientDir,
   }
 }

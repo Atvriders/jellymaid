@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { findingId, FINDING_CLASSES, ACTION_TYPES, GUARD_IDS } from '../../src/core/types.js'
+import { findingId, torrentKey, FINDING_CLASSES, ACTION_TYPES, GUARD_IDS } from '../../src/core/types.js'
 
 describe('findingId', () => {
   it('is stable for the same rule and subject key', () => {
@@ -42,9 +42,24 @@ describe('enumerations', () => {
     ])
   })
 
-  it('covers the five guards', () => {
+  it('covers the six guards', () => {
     expect([...GUARD_IDS].sort()).toEqual([
       'guard.cross-seed', 'guard.hardlink', 'guard.private-ratio', 'guard.protected', 'guard.torrent-scope',
+      'guard.untracked',
     ])
+  })
+})
+
+describe('torrentKey', () => {
+  it('keys a torrent by instance AND hash, so one infohash on two boxes is two torrents', () => {
+    expect(torrentKey({ instanceId: 'box-a', hash: 'abc' })).not.toBe(torrentKey({ instanceId: 'box-b', hash: 'abc' }))
+  })
+
+  it('lowercases the hash, so the casing a source happened to use cannot split one torrent in two', () => {
+    expect(torrentKey({ instanceId: 'box-a', hash: 'ABC' })).toBe(torrentKey({ instanceId: 'box-a', hash: 'abc' }))
+  })
+
+  it('joins with a NUL byte, which can occur in neither an instance id nor a hash', () => {
+    expect(torrentKey({ instanceId: 'box-a', hash: 'abc' })).toBe('box-a\0abc')
   })
 })

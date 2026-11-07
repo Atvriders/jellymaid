@@ -2,25 +2,35 @@ import { statSync } from 'node:fs'
 import { join, sep } from 'node:path'
 import type { Db } from '../index/db.js'
 import type { PathMap } from '../fs/pathmap.js'
-import type { PathMapping } from '../core/types.js'
+import { torrentKey, type PathMapping, type TorrentSource } from '../core/types.js'
+import { companionFlags, type CompanionConfig } from '../core/companions.js'
 import type { QbitClient, Torrent, PrivacySource } from '../connectors/qbittorrent.js'
 import type { ArrClient, ArrInventory } from '../connectors/arr.js'
 
 /** How many unmappable *arr paths to carry as examples; the count is always exact. */
 const UNMAPPABLE_SAMPLES = 5
 
+/** One file a torrent owns: its path inside the torrent, where that lands in the container, its size. */
+export interface TorrentFileEntry { relPath: string; containerPath: string | null; sizeBytes: number }
+
+/** REPLACES { count, paths }. entries.length === count. Complete = count > 0 and every containerPath non-null. */
 export interface TorrentFileSet {
   /**
    * How many files the torrent owns IN TOTAL, including any whose path no mapping covers.
    * Understating this is what would let "remove the torrent with its data" quietly take files
-   * nobody counted, so the count comes from the file list itself, never from `paths.length`.
+   * nobody counted, so every file keeps its entry — an unmappable one with `containerPath: null`.
    */
   count: number
-  /** Container paths for the files that could be mapped; never longer than `count`. */
-  paths: string[]
+  entries: TorrentFileEntry[]
 }
 
 export interface TorrentMatch {
+  /**
+   * The instance that reported this torrent. The executor removes it through this instance's
+   * client and no other: the same infohash on another box is a different torrent over different
+   * bytes.
+   */
+  instanceId: string
   hash: string
   name: string
   category: string | null
@@ -33,6 +43,8 @@ export interface TorrentMatch {
    * privacy signal that could not be determined and was forced to `true` (fail safe). */
   privacySource: PrivacySource
   trackerHost: string | null
+  /** The torrent's total size as qBittorrent reports it: what removing it with its data takes. */
+  sizeBytes: number
   /**
    * How this torrent was tied to the target, weakest last:
    *  - 'inode' — the same bytes, whatever the paths say. Authoritative.
@@ -50,6 +62,8 @@ export interface TorrentMatch {
   matchedBy: 'inode' | 'file' | 'path'
   /** Every file this torrent owns, or null when the list could not be read at all. */
   files: TorrentFileSet | null
+  /** Companion files in `files` (C2, sized per Ruling 11 — see `companionFlags`); null when files is null. */
+  companionCount: number | null
 }
 
 export interface ArrMatch {
@@ -107,12 +121,16 @@ export interface Resolution {
   arr: ArrMatch[]
   jellyfin: JellyfinOwnership
   root: PathMapping | null
+  /** Which qBittorrent instance may own this path, per the root it lies under (`PathMap.torrentSourceFor`). */
+  torrentSource: TorrentSource
   /**
-   * Every source this resolution could NOT verify, by label ('qbittorrent', 'radarr', 'sonarr').
-   * A source lands here on outright failure (unreachable, threw) AND on a partial result it
-   * cannot vouch for as complete (a Sonarr fetch that skipped a series). Downstream guards read
-   * this to fail closed: an empty `torrents`/`arr` list must never be trusted as "nothing found"
-   * when the source that would have reported it could not be trusted either.
+   * Every source this resolution could NOT verify, by label: 'qbittorrent' (no instance could be
+   * determined — a root naming a qbit prefix with no instance), 'qbittorrent:<id>' (that instance
+   * failed or has no client), 'radarr', 'sonarr'. A source lands here on outright failure
+   * (unreachable, threw) AND on a partial result it cannot vouch for as complete (a Sonarr fetch
+   * that skipped a series). Downstream guards read this to fail closed: an empty `torrents`/`arr`
+   * list must never be trusted as "nothing found" when the source that would have reported it
+   * could not be trusted either.
    */
   sourcesUnavailable: string[]
   /**
@@ -127,17 +145,56 @@ export interface Resolution {
   arrUnmappable: { count: number; samples: string[] }
 }
 
+/**
+ * One torrent list per instance, reused while it is younger than `maxAgeMs`. A plan build reads each
+ * instance's list once for all of its actions; an execution re-reads one at most every few seconds,
+ * and at once after that instance has deleted something (`invalidate`).
+ */
+export interface TorrentListCache {
+  get(client: Pick<QbitClient, 'instanceId' | 'torrents'>): Promise<Torrent[]>
+  invalidate(instanceId: string): void
+}
+
+export function createTorrentListCache(opts: { maxAgeMs: number; now?: () => number }): TorrentListCache {
+  const now = opts.now ?? Date.now
+  const lists = new Map<string, { fetchedAt: number; list: Promise<Torrent[]> }>()
+  return {
+    get(client) {
+      const held = lists.get(client.instanceId)
+      if (held && now() - held.fetchedAt < opts.maxAgeMs) return held.list
+      // Callers that ask while a fetch is in flight share it: one request per instance, not one per
+      // action that happened to ask at the same moment.
+      const fresh = { fetchedAt: now(), list: client.torrents() }
+      lists.set(client.instanceId, fresh)
+      // A rejected fetch is never served again. An outage must be re-tried by the next caller, not
+      // remembered — and remembering it would turn one failed read into a window of blocked deletes.
+      fresh.list.catch(() => {
+        if (lists.get(client.instanceId) === fresh) lists.delete(client.instanceId)
+      })
+      return fresh.list
+    },
+    invalidate(instanceId) {
+      lists.delete(instanceId)
+    },
+  }
+}
+
 export interface ResolveDeps {
   db: Db
   pathMap: PathMap
-  /** Mandatory in real config (see `envConfigSchema`); `null` only as a defensive fallback, and
-   * treated the same as "unreachable" — never as "no torrents exist". `files` is what proves which
-   * files a torrent actually owns; without it every scope decision falls back to path shape. */
-  qbittorrent: (Pick<QbitClient, 'torrents'> & Partial<Pick<QbitClient, 'files'>>) | null
+  /**
+   * Every configured instance's client, keyed by instance id. Only the instances that may own a
+   * path are asked about it (see `instancesToAsk`); an instance that should be asked but has no
+   * client here is reported unavailable, never read as "no torrents exist". `files` is what proves
+   * which files a torrent actually owns; without it every scope decision falls back to path shape.
+   */
+  qbittorrents: ReadonlyMap<string, Pick<QbitClient, 'instanceId' | 'torrents'> & Partial<Pick<QbitClient, 'files'>>>
   /** Legitimately absent for an install that does not run Radarr/Sonarr — unlike qBittorrent,
    * `null` here is NOT reported as unavailable, only a failed or incomplete fetch is. */
   radarr: Pick<ArrClient, 'inventory'> | null
   sonarr: Pick<ArrClient, 'inventory'> | null
+  /** Where torrent lists come from when given; otherwise every resolution asks the client itself. */
+  torrentLists?: TorrentListCache
 }
 
 /** How long one plan run may reuse a single *arr inventory read. See `snapshotInventory`. */
@@ -155,8 +212,9 @@ export const INVENTORY_TTL_MS = 30_000
  * Deliberately NOT applied to `unmonitorByPath`: that call re-reads the record it is about to PUT
  * back, so serving it from a snapshot would write a stale document over whatever the operator (or
  * the *arr itself) changed in between. Nor to the qBittorrent torrent list, whose state is the
- * thing the guards most need fresh. A rejected fetch is never cached — an outage must be re-tried,
- * not remembered for the rest of the window.
+ * thing the guards most need fresh: that has its own cache (`TorrentListCache`), which an execution
+ * keeps to seconds and drops for an instance the moment it deletes something. A rejected fetch is
+ * never cached — an outage must be re-tried, not remembered for the rest of the window.
  */
 export function snapshotInventory<T extends { inventory: () => Promise<ArrInventory> }>(
   client: T | null,
@@ -184,8 +242,11 @@ export function snapshotInventory<T extends { inventory: () => Promise<ArrInvent
  * The single place that turns a path into the whole truth about it. Everything downstream —
  * guards, dry-run totals, the executor — reads this and nothing else, so there is exactly one
  * definition of "what will deleting this actually touch".
+ *
+ * `config` is the caller's one snapshot for its whole build or run; it decides which of a matched
+ * torrent's files are companions of the release (`TorrentMatch.companionCount`).
  */
-export async function resolveTarget(deps: ResolveDeps, containerPath: string): Promise<Resolution> {
+export async function resolveTarget(deps: ResolveDeps, containerPath: string, config: CompanionConfig): Promise<Resolution> {
   const sourcesUnavailable: string[] = []
 
   let dev = 0
@@ -217,57 +278,86 @@ export async function resolveTarget(deps: ResolveDeps, containerPath: string): P
 
   const inodeSet = new Set(hardlinks)
 
-  // The hashes the INDEX says own these exact bytes — by path (including every known hardlink) and
-  // by inode. Two indexed lookups for the whole torrent list, rather than a file-list fetch per
-  // torrent, which on a real client would be thousands of calls per action.
+  // The torrents the INDEX says own these exact bytes — by path (including every known hardlink)
+  // and by inode — keyed by torrentKey, because the same hash on two instances is two torrents and
+  // only one of them may own this file. Two indexed lookups for the whole torrent list, rather than
+  // a file-list fetch per torrent, which on a real client would be thousands of calls per action.
   const ownedHashes = new Set<string>()
+  const indexedOwners = new Set<string>()
   if (exists) {
     const paths = [...inodeSet]
     const placeholders = paths.map(() => '?').join(',')
-    for (const row of deps.db.prepare(
-      `SELECT DISTINCT hash FROM torrent_files WHERE container_path IN (${placeholders})`,
-    ).all(...paths) as Array<{ hash: string }>) ownedHashes.add(row.hash)
+    const rows = deps.db.prepare(
+      `SELECT DISTINCT instance_id, hash FROM torrent_files WHERE container_path IN (${placeholders})`,
+    ).all(...paths) as Array<{ instance_id: string; hash: string }>
     if (inode !== 0) {
-      for (const row of deps.db.prepare(
-        'SELECT DISTINCT hash FROM torrent_files WHERE dev IS NOT NULL AND inode IS NOT NULL AND dev = ? AND inode = ?',
-      ).all(dev, inode) as Array<{ hash: string }>) ownedHashes.add(row.hash)
+      rows.push(...deps.db.prepare(
+        'SELECT DISTINCT instance_id, hash FROM torrent_files WHERE dev IS NOT NULL AND inode IS NOT NULL AND dev = ? AND inode = ?',
+      ).all(dev, inode) as Array<{ instance_id: string; hash: string }>)
+    }
+    for (const row of rows) {
+      ownedHashes.add(torrentKey({ instanceId: row.instance_id, hash: row.hash }))
+      indexedOwners.add(row.instance_id)
     }
   }
 
-  let torrents: TorrentMatch[] = []
-  if (deps.qbittorrent) {
-    try {
-      const all = await deps.qbittorrent.torrents()
-      const liveSets = new Map<string, TorrentFileSet | null>()
-      const liveFileSetFor = async (t: Torrent): Promise<TorrentFileSet | null> => {
-        const cached = liveSets.get(t.hash)
-        if (cached !== undefined) return cached
-        const fresh = await liveFileSet(deps, t)
-        liveSets.set(t.hash, fresh)
-        return fresh
-      }
-      const fileSets = new Map<string, LoadedFileSet>()
-      const fileSetFor = async (t: Torrent): Promise<LoadedFileSet> => {
-        const cached = fileSets.get(t.hash)
-        if (cached !== undefined) return cached
-        const resolved = await loadFileSet(deps, t, liveFileSetFor)
-        fileSets.set(t.hash, resolved)
-        return resolved
-      }
-      torrents = []
-      for (const t of all) {
-        const match = await matchTorrent(
-          t, deps.pathMap, containerPath, inodeSet, dev, inode, ownedHashes, fileSetFor, liveFileSetFor,
-        )
-        if (match) torrents.push(match)
-      }
-    } catch {
-      sourcesUnavailable.push('qbittorrent')
+  const torrentSource = deps.pathMap.torrentSourceFor(containerPath)
+  const { ask, undetermined } = instancesToAsk(deps, torrentSource, {
+    otherNames: hardlinks.filter((p) => p !== containerPath),
+    // A link the index cannot name may lie under any root at all (a directory's link count is not
+    // links to bytes, see guard.hardlink).
+    unplacedLinks: exists && !isDirectory && nlink > hardlinks.length,
+    indexedOwners,
+  })
+  // No instance can be determined for a root that names a qbit prefix and no instance. That is a
+  // hole in the map, and a hole is never "no torrents": it is reported, and guard.protected blocks.
+  if (undetermined) sourcesUnavailable.push('qbittorrent')
+
+  const liveSets = new Map<string, TorrentFileSet | null>()
+  const liveFileSetFor = async (t: Torrent): Promise<TorrentFileSet | null> => {
+    const key = torrentKey(t)
+    const cached = liveSets.get(key)
+    if (cached !== undefined) return cached
+    const fresh = await liveFileSet(deps, t)
+    liveSets.set(key, fresh)
+    return fresh
+  }
+  const fileSets = new Map<string, LoadedFileSet>()
+  const fileSetFor = async (t: Torrent): Promise<LoadedFileSet> => {
+    const key = torrentKey(t)
+    const cached = fileSets.get(key)
+    if (cached !== undefined) return cached
+    const resolved = await loadFileSet(deps, t, liveFileSetFor)
+    fileSets.set(key, resolved)
+    return resolved
+  }
+
+  // Each instance asked answers only for itself: a match is tagged with the instance whose client
+  // REPORTED it — the only client the executor will ever ask to delete it — and its paths are
+  // translated through that instance's own prefix.
+  const torrents: TorrentMatch[] = []
+  for (const instanceId of ask) {
+    const client = deps.qbittorrents.get(instanceId)
+    if (!client) {
+      // A mapping names an instance nothing is configured to reach: its torrents are unknown.
+      sourcesUnavailable.push(`qbittorrent:${instanceId}`)
+      continue
     }
-  } else {
-    // Mandatory in real config; a missing client is a configuration/wiring failure, not proof
-    // there are no torrents. Fails the same way an unreachable client does.
-    sourcesUnavailable.push('qbittorrent')
+    try {
+      const list = deps.torrentLists ? await deps.torrentLists.get(client) : await client.torrents()
+      const reported = list.map((t) => ({ ...t, instanceId }))
+      const matched: TorrentMatch[] = []
+      for (const t of reported) {
+        const match = await matchTorrent(
+          t, deps.pathMap, containerPath, inodeSet, dev, inode, ownedHashes, fileSetFor, liveFileSetFor, config,
+        )
+        if (match) matched.push(match)
+      }
+      // Only a pass that completed contributes; a half-read instance is unavailable, not partial.
+      torrents.push(...matched)
+    } catch {
+      sourcesUnavailable.push(`qbittorrent:${instanceId}`)
+    }
   }
 
   const arr: ArrMatch[] = []
@@ -323,43 +413,90 @@ export async function resolveTarget(deps: ResolveDeps, containerPath: string): P
     arr,
     jellyfin: resolveJellyfinOwnership(deps.db, containerPath),
     root: deps.pathMap.rootFor(containerPath),
+    torrentSource,
     sourcesUnavailable,
     arrUnmappable: { count: unmappableArrCount, samples: unmappableArrPaths },
   }
 }
 
 /**
+ * The instances that may own these bytes, and so the only ones asked about them.
+ *
+ * Not every configured instance. An instance that cannot own a file has nothing to say about it,
+ * and asking it anyway made one box's outage block every delete on the other box. A file lies
+ * under one root, and that root's instance (`torrentSourceFor`) is the one whose torrents save
+ * there. Three things widen the set, each only ever towards asking MORE, because a torrent nobody
+ * asked about is a torrent whose data gets unlinked from under it:
+ *  - the file's other names: a hardlink in another root (the *arr layout keeps the library copy in
+ *    a root no torrent saves into, and the torrent's own file under the download root) belongs to
+ *    that root's instance too;
+ *  - a link the index cannot place (nlink counts more names than any scan has seen): it may lie
+ *    under any root, so every configured instance is asked;
+ *  - the index's own record that an instance's torrent owns these exact bytes (by path or inode),
+ *    which can only be overruled by asking that instance.
+ * Any root with no determinable instance — a qbit prefix and no instance — sets `undetermined`.
+ * Sorted, so a resolution reads the same whatever order the config lists its instances in.
+ */
+function instancesToAsk(
+  deps: ResolveDeps,
+  torrentSource: TorrentSource,
+  evidence: { otherNames: string[]; unplacedLinks: boolean; indexedOwners: Set<string> },
+): { ask: string[]; undetermined: boolean } {
+  const ask = new Set<string>(evidence.indexedOwners)
+  let undetermined = false
+  for (const source of [torrentSource, ...evidence.otherNames.map((p) => deps.pathMap.torrentSourceFor(p))]) {
+    if (source.kind === 'instance') ask.add(source.instanceId)
+    else if (source.kind === 'unknown') undetermined = true
+  }
+  if (evidence.unplacedLinks) for (const instanceId of deps.qbittorrents.keys()) ask.add(instanceId)
+  return { ask: [...ask].sort(), undetermined }
+}
+
+/**
  * A file list may only be used to prove a torrent does NOT own a path when it is complete: every
- * file it counts is a file it can name. `paths` holds only the MAPPABLE subset, so a shorter
- * `paths` than `count` means the list cannot answer the question — and a `count` of zero is
+ * file it counts is a file it can name. An entry with no container path is a file no mapping
+ * covers, so a list holding one cannot answer the question — and a `count` of zero is
  * qBittorrent saying nothing at all, not saying "no files".
  */
 const isCompleteFileSet = (s: TorrentFileSet | null): s is TorrentFileSet =>
-  s !== null && s.count > 0 && s.paths.length === s.count
+  s !== null && s.count > 0 && s.entries.length === s.count && s.entries.every((e) => e.containerPath !== null)
+
+/** Whether a file list names `path` among its files. */
+const names = (s: TorrentFileSet | null, path: string): boolean =>
+  s !== null && s.entries.some((e) => e.containerPath === path)
 
 type FileSetSource = 'index' | 'live' | 'none'
 interface LoadedFileSet { set: TorrentFileSet | null; source: FileSetSource }
 
 /** The torrent's files exactly as the last scan translated them; null when it indexed none. */
-function indexedFileSet(deps: ResolveDeps, hash: string): TorrentFileSet | null {
-  const rows = deps.db.prepare('SELECT container_path FROM torrent_files WHERE hash = ?')
-    .all(hash) as Array<{ container_path: string | null }>
+function indexedFileSet(deps: ResolveDeps, t: Torrent): TorrentFileSet | null {
+  // Scoped to the reporting instance: another box's rows for the same hash describe its own files.
+  const rows = deps.db.prepare(
+    'SELECT rel_path, container_path, size_bytes FROM torrent_files WHERE instance_id = ? AND hash = ? ORDER BY file_index',
+  ).all(t.instanceId, t.hash) as Array<{ rel_path: string; container_path: string | null; size_bytes: number | null }>
   if (rows.length === 0) return null
-  // `count` is rows.length, not the mapped subset: a file whose path no mapping covers is still a
-  // file that "delete with data" would take, and it must not shrink the total.
-  return { count: rows.length, paths: rows.map((r) => r.container_path).filter((p): p is string => p !== null) }
+  // Every row keeps its entry, the unmappable ones with a null container path: a file whose path no
+  // mapping covers is still a file that "delete with data" would take, and it must not shrink the total.
+  return {
+    count: rows.length,
+    entries: rows.map((r) => ({ relPath: r.rel_path, containerPath: r.container_path, sizeBytes: r.size_bytes ?? 0 })),
+  }
 }
 
 /** The torrent's files as qBittorrent reports them right now; null when it could not be asked. */
 async function liveFileSet(deps: ResolveDeps, t: Torrent): Promise<TorrentFileSet | null> {
-  if (!deps.qbittorrent?.files) return null
+  const client = deps.qbittorrents.get(t.instanceId)
+  if (!client?.files) return null
   try {
-    const list = await deps.qbittorrent.files(t.hash)
-    // Same translation the scan phase performs: file names are relative to the torrent's savePath.
-    // An unmappable savePath yields no paths at all, which `isCompleteFileSet` then refuses to
-    // treat as an answer rather than reading it as "owns nothing".
-    const base = t.savePath ? deps.pathMap.qbitToContainer(t.savePath) : null
-    return { count: list.length, paths: base ? list.map((f) => join(base, f.relPath)) : [] }
+    const list = await client.files(t.hash)
+    // Same translation the scan phase performs: file names are relative to the torrent's savePath,
+    // as its own instance spells it. An unmappable savePath leaves every container path null, which
+    // `isCompleteFileSet` then refuses to treat as an answer rather than reading it as "owns nothing".
+    const base = t.savePath ? deps.pathMap.qbitToContainer(t.instanceId, t.savePath) : null
+    return {
+      count: list.length,
+      entries: list.map((f) => ({ relPath: f.relPath, containerPath: base ? join(base, f.relPath) : null, sizeBytes: f.sizeBytes })),
+    }
   } catch {
     return null
   }
@@ -374,7 +511,7 @@ async function liveFileSet(deps: ResolveDeps, t: Torrent): Promise<TorrentFileSe
 async function loadFileSet(
   deps: ResolveDeps, t: Torrent, live: (t: Torrent) => Promise<TorrentFileSet | null>,
 ): Promise<LoadedFileSet> {
-  const indexed = indexedFileSet(deps, t.hash)
+  const indexed = indexedFileSet(deps, t)
   if (isCompleteFileSet(indexed)) return { set: indexed, source: 'index' }
   const fresh = await live(t)
   if (isCompleteFileSet(fresh)) return { set: fresh, source: 'live' }
@@ -429,14 +566,19 @@ async function matchTorrent(
   ownedHashes: Set<string>,
   fileSetFor: (t: Torrent) => Promise<LoadedFileSet>,
   liveFileSetFor: (t: Torrent) => Promise<TorrentFileSet | null>,
+  config: CompanionConfig,
 ): Promise<TorrentMatch | null> {
   const base = {
-    hash: t.hash, name: t.name, category: t.category, tags: t.tags, state: t.state,
+    instanceId: t.instanceId, hash: t.hash, name: t.name, category: t.category, tags: t.tags, state: t.state,
     ratio: t.ratio, seedingTimeSeconds: t.seedingTimeSeconds, isPrivate: t.isPrivate,
-    privacySource: t.privacySource, trackerHost: t.trackerHost,
+    privacySource: t.privacySource, trackerHost: t.trackerHost, sizeBytes: t.sizeBytes,
   }
-  const contentContainer = t.contentPath ? pathMap.qbitToContainer(t.contentPath) : null
-  const saveContainer = t.savePath ? pathMap.qbitToContainer(t.savePath) : null
+  const matched = (matchedBy: TorrentMatch['matchedBy'], files: TorrentFileSet | null): TorrentMatch => ({
+    ...base, matchedBy, files,
+    companionCount: files ? companionFlags(files.entries, config).filter(Boolean).length : null,
+  })
+  const contentContainer = t.contentPath ? pathMap.qbitToContainer(t.instanceId, t.contentPath) : null
+  const saveContainer = t.savePath ? pathMap.qbitToContainer(t.instanceId, t.savePath) : null
 
   // Inode is authoritative: the same bytes under a different path string still match. `inode !==
   // 0` excludes the case where the resolved target itself could not be stat'd (dev/inode both
@@ -444,18 +586,18 @@ async function matchTorrent(
   // like a match on the sentinel value alone.
   for (const candidate of [contentContainer, saveContainer]) {
     if (!candidate) continue
-    if (inodeSet.has(candidate)) return { ...base, matchedBy: 'inode', files: (await fileSetFor(t)).set }
+    if (inodeSet.has(candidate)) return matched('inode', (await fileSetFor(t)).set)
     try {
       const st = statSync(candidate)
       if (Number(st.dev) === dev && Number(st.ino) === inode && inode !== 0) {
-        return { ...base, matchedBy: 'inode', files: (await fileSetFor(t)).set }
+        return matched('inode', (await fileSetFor(t)).set)
       }
     } catch { /* not present on disk right now */ }
   }
 
   // The torrent's own file list, per the index: it names the files this torrent owns, which is the
   // question — not what the paths happen to look like.
-  if (ownedHashes.has(t.hash)) return { ...base, matchedBy: 'file', files: (await fileSetFor(t)).set }
+  if (ownedHashes.has(torrentKey(t))) return matched('file', (await fileSetFor(t)).set)
 
   // Containment is the LAST resort, and only when there is no file list to consult. `contentPath`
   // looks authoritative but is not: qBittorrent reports `content_path === save_path` for a
@@ -472,7 +614,7 @@ async function matchTorrent(
   if (!contained) return null
 
   const loaded = await fileSetFor(t)
-  if (loaded.set?.paths.includes(target)) return { ...base, matchedBy: 'file', files: loaded.set }
+  if (names(loaded.set, target)) return matched('file', loaded.set)
 
   // The list in hand does not name the target — which only means "not this torrent's file" if the
   // list could name every file it counts. An INCOMPLETE list names none of the files whose paths no
@@ -485,9 +627,9 @@ async function matchTorrent(
   let authoritative = loaded.source === 'live' && isCompleteFileSet(loaded.set)
   if (loaded.source === 'index') {
     const fresh = await liveFileSetFor(t)
-    if (fresh?.paths.includes(target)) return { ...base, matchedBy: 'file', files: fresh }
+    if (names(fresh, target)) return matched('file', fresh)
     if (isCompleteFileSet(fresh)) authoritative = true
   }
   if (authoritative) return null
-  return { ...base, matchedBy: 'path', files: loaded.set }
+  return matched('path', loaded.set)
 }

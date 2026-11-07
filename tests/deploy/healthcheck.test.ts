@@ -8,8 +8,7 @@ import Fastify from 'fastify'
 import { buildServer, type ServerDeps } from '../../src/server.js'
 import { openDb } from '../../src/index/db.js'
 import { createLogger } from '../../src/core/logger.js'
-import { fileConfigSchema } from '../../src/config/schema.js'
-import { createPathMap } from '../../src/fs/pathmap.js'
+import { createConfigStore } from '../../src/config/store.js'
 
 const exec = promisify(execCb)
 
@@ -35,18 +34,15 @@ type Pingable = { ping: () => Promise<void> } | null
 function stubDeps(overrides: Partial<{ jellyfin: Pingable; qbittorrent: Pingable }> = {}): ServerDeps {
   const dir = mkdtempSync(join(tmpdir(), 'jm-hc-'))
   return {
-    config: {
-      env: {
-        dataDir: dir, port: 0, trustProxy: 0, sessionSecret: 'x'.repeat(32),
-        jellyfin: { url: 'http://jf', apiKey: 'k' },
-        qbittorrent: { url: 'http://qb', user: 'u', pass: 'p' },
-        radarr: null, sonarr: null,
-      },
-      file: fileConfigSchema.parse({}),
-    },
+    configStore: createConfigStore({
+      dataDir: dir, port: 0, trustProxy: 0, sessionSecret: 'x'.repeat(32),
+      jellyfin: { url: 'http://jf', apiKey: 'k' },
+      qbittorrents: [{ id: 'box-a', url: 'http://qb', user: null, pass: null }],
+      radarr: null, sonarr: null,
+    }),
     db: openDb(join(dir, 'db.sqlite')),
     jellyfin: (overrides.jellyfin ?? { ping: async () => {} }) as never,
-    qbittorrent: (overrides.qbittorrent ?? { ping: async () => {} }) as never,
+    qbittorrents: new Map([['box-a', (overrides.qbittorrent ?? { ping: async () => {} }) as never]]),
     radarr: null,
     sonarr: null,
     logger: createLogger({ level: 'error', sink: () => {} }),
@@ -57,7 +53,6 @@ function stubDeps(overrides: Partial<{ jellyfin: Pingable; qbittorrent: Pingable
     plannerDeps: (() => ({})) as never,
     trashDeps: (() => ({})) as never,
     executor: {} as never,
-    pathMap: createPathMap([]),
   }
 }
 

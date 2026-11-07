@@ -62,12 +62,120 @@ describe('dupeGroupRule.run() + persist()', () => {
     expect(scores.good!.total).toBeGreaterThan(scores.bad!.total)
   })
 
+  it('group with differing editions sets editionsDiffer', () => {
+    const aliens = { name: 'Aliens', year: 1986, provider_ids_json: '{"tmdb":"679"}' }
+    item({ id: 'theatrical', ...aliens, container_path: '/path/to/movies/Aliens.1986.Theatrical.1080p/Aliens.1986.Theatrical.1080p.mkv', size_bytes: 10 })
+    item({ id: 'special', ...aliens, container_path: '/path/to/movies/Aliens.1986.Special.Edition.2160p/Aliens.1986.Special.Edition.2160p.mkv', size_bytes: 20 })
+    item({ id: 'plain-a', provider_ids_json: '{"tmdb":"240"}', container_path: '/path/to/movies/Heat.1995.1080p/Heat.1995.1080p.mkv', size_bytes: 10 })
+    item({ id: 'plain-b', provider_ids_json: '{"tmdb":"240"}', container_path: '/path/to/movies/Heat (1995)/Heat (1995).mkv', size_bytes: 20 })
+
+    const findings = dupeGroupRule.run(ctx())
+    const evidenceOf = (member: string) =>
+      findings.find((f) => f.subjects.some((s) => s.kind === 'item' && s.id === member))!.evidence as {
+        editions: Record<string, string | null>; editionsDiffer: boolean
+      }
+
+    expect(evidenceOf('special').editions).toEqual({ special: 'Special Edition', theatrical: 'Theatrical' })
+    expect(evidenceOf('special').editionsDiffer).toBe(true)
+    expect(evidenceOf('plain-a').editions).toEqual({ 'plain-a': null, 'plain-b': null })
+    expect(evidenceOf('plain-a').editionsDiffer).toBe(false)
+  })
+
+  it('counts a named edition against an unnamed copy as differing', () => {
+    item({ id: 'a', provider_ids_json: '{"tmdb":"1"}', container_path: '/path/to/movies/Movie.1990.Extended.mkv' })
+    item({ id: 'b', provider_ids_json: '{"tmdb":"1"}', container_path: '/path/to/movies/Movie.1990.mkv' })
+    const evidence = dupeGroupRule.run(ctx())[0]!.evidence as { editions: Record<string, string | null>; editionsDiffer: boolean }
+    expect(evidence.editions).toEqual({ a: 'Extended', b: null })
+    expect(evidence.editionsDiffer).toBe(true)
+  })
+
+  // Task 6 minor 4: S01E01E02 sits in S01E01's group, but deleting it also loses E02.
+  it('records multiEpisode when a member holds more than one episode', () => {
+    const show = { type: 'Episode', name: 'Pilot', provider_ids_json: '{"tvdb":"101"}' }
+    item({ id: 'double', ...show, container_path: '/path/to/tv/Show/Season 01/Show.S01E01E02.mkv', size_bytes: 20 })
+    item({ id: 'single', ...show, container_path: '/path/to/tv/Show/Season 01/Show.S01E01.mkv', size_bytes: 10 })
+    const plain = { type: 'Episode', name: 'Second', provider_ids_json: '{"tvdb":"202"}' }
+    item({ id: 'plain-a', ...plain, container_path: '/path/to/tv/Show/Season 01/Show.S01E03.mkv', size_bytes: 10 })
+    item({ id: 'plain-b', ...plain, container_path: '/path/to/tv/Other/Show.S01E03.1080p.mkv', size_bytes: 20 })
+    const findings = dupeGroupRule.run(ctx())
+    const evidenceOf = (memberId: string) =>
+      findings.find((f) => f.subjects.some((s) => s.kind === 'item' && s.id === memberId))!.evidence as { multiEpisode: boolean }
+    expect(evidenceOf('double').multiEpisode).toBe(true)
+    expect(evidenceOf('plain-a').multiEpisode).toBe(false)
+  })
+
+  it('applies the configured keeper policy and records it in the evidence', () => {
+    const big = { id: 'big', provider_ids_json: '{"tmdb":"949"}', container_path: '/path/to/movies/big.mkv', size_bytes: 20_000_000_000, height: 2160 }
+    const small = { id: 'small', provider_ids_json: '{"tmdb":"949"}', container_path: '/path/to/movies/small.mkv', size_bytes: 500_000_000, height: 1080 }
+    item(big); item(small)
+    const withPolicy = (policy: 'best-quality' | 'smallest' | 'none') =>
+      ({ ...ctx(), config: fileConfigSchema.parse({ keeper: { policy } }) })
+
+    const best = dupeGroupRule.run(ctx())[0]!
+    expect(best.evidence).toMatchObject({ keeperId: 'big', keeperPolicy: 'best-quality' })
+
+    const smallest = dupeGroupRule.run(withPolicy('smallest'))[0]!
+    expect(smallest.evidence).toMatchObject({ keeperId: 'small', keeperPolicy: 'smallest' })
+    expect(smallest.reclaimableBytes).toBe(20_000_000_000)
+
+    const none = dupeGroupRule.run(withPolicy('none'))
+    expect(none[0]!.evidence).toMatchObject({ keeperId: null, keeperPolicy: 'none' })
+    // Nothing is pre-selected, so nothing is counted as reclaimable.
+    expect(none[0]!.reclaimableBytes).toBe(0)
+    dupeGroupRule.persist!(withPolicy('none'), none)
+    expect(db.prepare('SELECT keeper_item_id FROM dupe_groups').get()).toEqual({ keeper_item_id: null })
+  })
+
   it('writes nothing to dupe_groups when there are no groups', () => {
     item({ id: 'solo', container_path: '/mnt/m/solo.mkv' })
     const findings = dupeGroupRule.run(ctx())
     expect(findings).toHaveLength(0)
     dupeGroupRule.persist!(ctx(), findings)
     expect(db.prepare('SELECT COUNT(*) c FROM dupe_groups').get()).toEqual({ c: 0 })
+  })
+})
+
+describe('dupe_groups.status mirrors the dupe.group finding', () => {
+  const pass = (scanId: number) =>
+    runRules({ db, config, scanId, availableSources: new Set<SourceName>(['jellyfin']), rules: [dupeGroupRule] })
+  const groups = () => db.prepare('SELECT members_json, status FROM dupe_groups ORDER BY members_json').all() as
+    Array<{ members_json: string; status: string }>
+  const findingStatuses = () => (db.prepare("SELECT status FROM findings WHERE rule_id = 'dupe.group' ORDER BY id").all() as
+    Array<{ status: string }>).map((r) => r.status)
+  const setFinding = (status: string) =>
+    db.prepare("UPDATE findings SET status = ? WHERE rule_id = 'dupe.group'").run(status)
+
+  it('dismissed group stays dismissed across persist() when membership is unchanged', () => {
+    item({ id: 'a', provider_ids_json: '{"tmdb":"1"}', container_path: '/path/to/movies/a.mkv' })
+    item({ id: 'b', provider_ids_json: '{"tmdb":"1"}', container_path: '/path/to/movies/b.mkv' })
+    pass(1)
+    expect(groups()).toEqual([{ members_json: '["a","b"]', status: 'open' }])
+
+    // Dismissed the way the duplicates route does it: the finding and its mirror row together.
+    setFinding('dismissed')
+    db.prepare("UPDATE dupe_groups SET status = 'dismissed'").run()
+    pass(2)
+    expect(groups()).toEqual([{ members_json: '["a","b"]', status: 'dismissed' }])
+    expect(findingStatuses()).toEqual(['dismissed'])
+
+    // A third copy is a new member set, so a new group the operator has not looked at yet.
+    item({ id: 'c', provider_ids_json: '{"tmdb":"1"}', container_path: '/path/to/movies/c.mkv' })
+    pass(3)
+    expect(groups()).toEqual([{ members_json: '["a","b","c"]', status: 'open' }])
+  })
+
+  it('follows a dismissal or a reopen made on the finding alone', () => {
+    item({ id: 'a', provider_ids_json: '{"tmdb":"1"}', container_path: '/path/to/movies/a.mkv' })
+    item({ id: 'b', provider_ids_json: '{"tmdb":"1"}', container_path: '/path/to/movies/b.mkv' })
+    pass(1)
+
+    setFinding('dismissed')                   // POST /api/findings/:id/dismiss touches only the finding
+    pass(2)
+    expect(groups()[0]!.status).toBe('dismissed')
+
+    setFinding('open')                        // ...and so does its reopen
+    pass(3)
+    expect(groups()[0]!.status).toBe('open')
   })
 })
 

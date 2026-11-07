@@ -8,6 +8,7 @@ import { Explorer } from './screens/Explorer.js'
 import { PlanScreen } from './screens/PlanScreen.js'
 import { History } from './screens/History.js'
 import { Settings } from './screens/Settings.js'
+import { QUEUE_STORAGE_KEY, parseStoredQueue, readStored, writeStored } from './storage.js'
 
 const NAV_ITEMS = ['Dashboard', 'Findings', 'Duplicates', 'Explorer', 'Plan', 'History', 'Settings'] as const
 type NavItem = (typeof NAV_ITEMS)[number]
@@ -54,8 +55,15 @@ export function App({ api }: { api: Api }) {
    * same undo, the same duplicate or the same stray file twice from two visits to the same screen —
    * or once each from two different screens naming the same target — must still see it once in the
    * plan, not twice paying for the same bytes or double-submitting the same Jellyfin call.
+   *
+   * It is also mirrored into `localStorage`, read once on mount and written on every change, so a
+   * queue built over hundreds of duplicate groups survives a page reload. Storage is optional:
+   * `readStored`/`writeStored` (storage.ts) swallow every storage failure and the queue then lives
+   * in memory only, and `parseStoredQueue` drops any stored entry this client could not have
+   * queued itself rather than letting it reach a plan build.
    */
-  const [queued, setQueued] = useState<RequestedAction[]>([])
+  const [queued, setQueued] = useState<RequestedAction[]>(() => parseStoredQueue(readStored(QUEUE_STORAGE_KEY)))
+  useEffect(() => { writeStored(QUEUE_STORAGE_KEY, JSON.stringify(queued)) }, [queued])
   const addToQueue = useCallback((actions: RequestedAction[]) => {
     setQueued((prev) => {
       const seen = new Set(prev.map(queuedActionKey))
@@ -145,7 +153,7 @@ export function App({ api }: { api: Api }) {
             these components. */}
         {screen === 'Dashboard' ? <Dashboard api={api} /> : null}
         {screen === 'Findings' ? <Findings api={api} onQueue={addToQueue} /> : null}
-        {screen === 'Duplicates' ? <Duplicates api={api} onQueue={addToQueue} /> : null}
+        {screen === 'Duplicates' ? <Duplicates api={api} onQueue={addToQueue} queued={queued} /> : null}
         {screen === 'Explorer' ? <Explorer api={api} onQueue={addToQueue} /> : null}
         {screen === 'Plan' ? (
           <PlanScreen api={api} queued={queued} onClear={clearQueue} planId={planId} onPlanIdChange={setPlanId} />

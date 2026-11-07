@@ -32,12 +32,13 @@ export const jellyfinPhase: Phase = {
     }
 
     let startIndex = typeof ctx.cursor.startIndex === 'number' ? ctx.cursor.startIndex : 0
-    // The total an earlier, since-cancelled attempt at THIS scan recorded alongside its offset.
-    // If Jellyfin now reports fewer items than that, the library shrank between the cancel and
-    // this resume: items that shifted down into the range the earlier attempt already passed are
-    // observed by neither attempt, so the saved offset can no longer be trusted even if this
-    // attempt's own fetch looks complete against the NEW (smaller) total.
-    const priorTotal = typeof ctx.cursor.total === 'number' ? ctx.cursor.total : null
+    // The total the FIRST page of this scan reported. An earlier, since-cancelled attempt at THIS
+    // scan saved it in the cursor, so a resume compares against what the scan started with, not
+    // against whatever its own first page says after the gap. A cursor saved before `firstTotal`
+    // existed only has `total`, the last page's count — the best record of the start it has.
+    const carriedTotal = typeof ctx.cursor.firstTotal === 'number' ? ctx.cursor.firstTotal
+      : typeof ctx.cursor.total === 'number' ? ctx.cursor.total : null
+    let firstTotal = carriedTotal
     let written = 0
     let unmapped = 0
     let total: number | null = null
@@ -56,6 +57,7 @@ export const jellyfinPhase: Phase = {
         return { status: 'skipped', reason: describeError(err), counts: { items: written, unmapped } }
       }
       total = page.totalRecordCount
+      if (firstTotal === null) firstTotal = total
       if (!page.items.length) break
 
       const rows: unknown[][] = []
@@ -108,16 +110,10 @@ export const jellyfinPhase: Phase = {
       writeBatch(rows, pathRows)
       written += rows.length
       startIndex += page.items.length
-      ctx.saveCursor({ startIndex, total })
+      ctx.saveCursor({ startIndex, total, firstTotal })
       ctx.progress(written, total)
       if (startIndex >= total) break
     }
-
-    // `startIndex`, not `written`: on a resumed scan it already carries the offset the earlier
-    // attempt reached, and that attempt's rows carry THIS scan_id, so they are part of the same
-    // snapshot. Measuring completeness by `written` alone would under-count a resume and refuse
-    // an otherwise legitimate sweep.
-    const fetched = startIndex
 
     // The sweep is a wholesale DELETE of everything this scan did not write, so it may only run
     // on a provably COMPLETE fetch. A short page — what a restarting or mid-library-scan Jellyfin
@@ -127,21 +123,38 @@ export const jellyfinPhase: Phase = {
     // starting look identical from here, and only one of them justifies deleting the snapshot.
     if (ctx.signal.aborted) return { status: 'cancelled', counts: { items: written, unmapped } }
 
-    // A resume whose library shrank underneath it: the cursor offset it trusted no longer maps
-    // to the same rows, so even a fetch that looks complete against the new, smaller total must
-    // not license a sweep.
-    if (priorTotal !== null && total !== null && total < priorTotal) {
+    // Counted in the table, not in this attempt's memory: a resumed attempt's predecessor wrote
+    // its pages under this same scan_id, and they are part of the same pass. The primary key is
+    // the item id, so an item served twice is one row.
+    const unique = (ctx.db.prepare('SELECT COUNT(*) c FROM jellyfin_items WHERE scan_id = ?').get(ctx.scanId) as { c: number }).c
+
+    if (total === null || total <= 0) {
       return {
         status: 'skipped',
-        reason: `jellyfin now reports ${total} items, fewer than the ${priorTotal} it reported before this scan resumed; the saved cursor offset can no longer be trusted, so the sweep was skipped`,
+        reason: `jellyfin returned ${unique} of ${total ?? 'an unknown number of'} items; index left intact`,
         counts: { items: written, unmapped },
       }
     }
 
-    if (total === null || total <= 0 || fetched < total) {
+    // Paging by offset is only a complete read of a library that held still. An item added or
+    // removed mid-pass shifts every item after it by one place, so a page boundary repeats one
+    // item and skips another — and which ones depends on the server's sort order, which this
+    // phase does not get to assume. The offset can still reach the total, so reaching it proves
+    // nothing. Two things must hold instead: the count did not move between the first page and
+    // the last (across a resume too), and the distinct items this scan wrote are exactly that
+    // count.
+    if (firstTotal !== total) {
+      const resumed = carriedTotal !== null ? ' (this scan was resumed in between)' : ''
       return {
         status: 'skipped',
-        reason: `jellyfin returned ${fetched} of ${total ?? 'an unknown number of'} items; index left intact`,
+        reason: `jellyfin's item count changed from ${firstTotal} to ${total} while it was being paged${resumed}; items may have shifted between pages, so the index was left intact`,
+        counts: { items: written, unmapped },
+      }
+    }
+    if (unique !== total) {
+      return {
+        status: 'skipped',
+        reason: `jellyfin returned ${unique} of ${total} items (counted by unique id); index left intact`,
         counts: { items: written, unmapped },
       }
     }
@@ -154,14 +167,24 @@ export const jellyfinPhase: Phase = {
     // already gone — exactly the "path present, item absent" shape that would make an orphaned
     // file's path still resolve via jellyfin_item_paths and suppress a genuine fs.orphan-media
     // finding until the next fully-completed scan swept it too. The gate above already licenses
-    // sweeping both tables together (same completeness/shrink checks, no second licence); this
+    // sweeping both tables together (same completeness checks, no second licence); this
     // just makes the two deletes land together as well, restoring the single-statement atomicity
     // that existed before jellyfin_item_paths was introduced.
-    const stale = ctx.db.transaction(() => {
+    const { stale, deletedPathsCleared } = ctx.db.transaction(() => {
       const changes = ctx.db.prepare('DELETE FROM jellyfin_items WHERE scan_id != ?').run(ctx.scanId).changes
       ctx.db.prepare('DELETE FROM jellyfin_item_paths WHERE scan_id != ?').run(ctx.scanId)
-      return changes
+      // A plan records every path it deletes in deleted_paths, and the Duplicates list hides those
+      // members until Jellyfin itself has forgotten them (it drops an item about a minute after
+      // the path notification). Both tables now hold exactly what Jellyfin lists, so a recorded
+      // path in neither is one Jellyfin has forgotten, and its row has done its job. Licensed by
+      // the same complete pass as the sweep: on a partial pass, "not listed" may only mean "not
+      // reached yet", and clearing the row would bring the deleted copy back into the list.
+      const cleared = ctx.db.prepare(`DELETE FROM deleted_paths
+        WHERE NOT EXISTS (SELECT 1 FROM jellyfin_items i WHERE i.container_path = deleted_paths.container_path)
+          AND NOT EXISTS (SELECT 1 FROM jellyfin_item_paths p WHERE p.container_path = deleted_paths.container_path)`)
+        .run().changes
+      return { stale: changes, deletedPathsCleared: cleared }
     })()
-    return { status: 'completed', counts: { items: written, stale, unmapped } }
+    return { status: 'completed', counts: { items: written, stale, unmapped, deletedPathsCleared } }
   },
 }

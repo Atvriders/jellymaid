@@ -101,7 +101,13 @@ export function restoreFromTrash(deps: TrashDeps, trashId: string): { restored: 
   } catch (err) {
     return { restored: false, reason: (err as Error).message }
   }
-  deps.db.prepare('UPDATE trash SET restored_at = ? WHERE id = ?').run(new Date().toISOString(), trashId)
+  deps.db.transaction(() => {
+    deps.db.prepare('UPDATE trash SET restored_at = ? WHERE id = ?').run(new Date().toISOString(), trashId)
+    // The file is back, so it is no longer a deleted path. Left recorded, the read models would hide
+    // it for good: the row clears only once Jellyfin stops listing the path, and a restored file is
+    // one Jellyfin lists again.
+    deps.db.prepare('DELETE FROM deleted_paths WHERE container_path = ?').run(row.original_path)
+  })()
   return { restored: true }
 }
 

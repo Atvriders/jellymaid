@@ -17,23 +17,26 @@ let dir: string
 function ctx(
   deps: Partial<PhaseContext['deps']>,
   cursor: Record<string, unknown> = {},
-  over: Partial<Pick<PhaseContext, 'signal' | 'saveCursor' | 'progress'>> = {},
+  over: Partial<Pick<PhaseContext, 'signal' | 'saveCursor' | 'progress' | 'scanId'>> = {},
 ): PhaseContext {
   let saved = cursor
   return {
-    db, scanId: 1, cursor: saved, signal: over.signal ?? new AbortController().signal,
+    db, scanId: over.scanId ?? 1, cursor: saved, signal: over.signal ?? new AbortController().signal,
     priorResults: {},
     saveCursor: over.saveCursor ?? ((c) => { saved = c }),
     progress: over.progress ?? (() => {}),
     deps: {
       config: fileConfigSchema.parse({}),
       pathMap: createPathMap([]),
-      jellyfin: null, qbittorrent: null, radarr: null, sonarr: null,
+      jellyfin: null, qbittorrents: new Map(), radarr: null, sonarr: null,
       hasher: null,
       ...deps,
     } as PhaseContext['deps'],
   }
 }
+
+/** One qBittorrent instance, 'box-a', serving the given double. */
+const one = (client: Record<string, unknown>, id = 'box-a') => new Map([[id, { instanceId: id, ...client }]]) as never
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'jm-phase-'))
@@ -67,7 +70,7 @@ describe('jellyfinPhase', () => {
   it('translates jellyfin paths to container paths using the map', async () => {
     const c = ctx({
       jellyfin: pages(1) as never,
-      pathMap: createPathMap([{ role: 'library', jellyfin: '/media/Movies', container: '/mnt/m', qbit: null }]),
+      pathMap: createPathMap([{ role: 'library', jellyfin: '/media/Movies', container: '/mnt/m', qbit: null, qbitInstance: null }]),
     })
     await jellyfinPhase.run(c)
     const row = db.prepare('SELECT container_path FROM jellyfin_items').get() as { container_path: string }
@@ -185,7 +188,7 @@ describe('jellyfinPhase', () => {
     // Plans 3-4 need to tell a degraded index from an empty one.
     const res = await jellyfinPhase.run(ctx({
       jellyfin: pages(2) as never,
-      pathMap: createPathMap([{ role: 'library', jellyfin: '/somewhere-else', container: '/mnt/x', qbit: null }]),
+      pathMap: createPathMap([{ role: 'library', jellyfin: '/somewhere-else', container: '/mnt/x', qbit: null, qbitInstance: null }]),
     }))
     expect(res.counts.unmapped).toBe(2)
     expect(db.prepare('SELECT COUNT(*) c FROM jellyfin_items WHERE container_path IS NULL').get()).toEqual({ c: 2 })
@@ -221,7 +224,7 @@ describe('jellyfinPhase', () => {
     }
     const res = await jellyfinPhase.run(ctx({
       jellyfin: jf as never,
-      pathMap: createPathMap([{ role: 'library', jellyfin: '/media/Movies', container: '/mnt/m', qbit: null }]),
+      pathMap: createPathMap([{ role: 'library', jellyfin: '/media/Movies', container: '/mnt/m', qbit: null, qbitInstance: null }]),
     }))
     expect(res.status).toBe('completed')
     const rows = db.prepare('SELECT jf_path, container_path FROM jellyfin_item_paths WHERE item_id = ? ORDER BY jf_path')
@@ -310,8 +313,10 @@ describe('jellyfinPhase', () => {
     expect(shortRes.status).toBe('skipped')
     expect(db.prepare("SELECT COUNT(*) c FROM jellyfin_item_paths WHERE item_id = 'old'").get()).toEqual({ c: 1 })
 
-    // A complete fetch: now both tables sweep together.
-    const res = await jellyfinPhase.run(ctx({ jellyfin: pages(3) as never }))
+    // A complete fetch by a later scan: now both tables sweep together. (A later scan, because
+    // completeness counts the distinct items written under the scan's own id, and the short pass
+    // above wrote one under scan 1.)
+    const res = await jellyfinPhase.run(ctx({ jellyfin: pages(3) as never }, {}, { scanId: 2 }))
     expect(res.status).toBe('completed')
     expect(db.prepare("SELECT COUNT(*) c FROM jellyfin_item_paths WHERE item_id = 'old'").get()).toEqual({ c: 0 })
   })
@@ -371,6 +376,133 @@ describe('jellyfinPhase', () => {
     // Nothing was swept: the prior snapshot survives untouched.
     expect(db.prepare("SELECT COUNT(*) c FROM jellyfin_items WHERE id = 'old'").get()).toEqual({ c: 1 })
   })
+
+  /** A bare item: only the id matters to the completeness gate. */
+  const bare = (id: string) => ({
+    id, type: 'Movie', name: id, sortName: null, year: null, seriesId: null, seriesName: null,
+    seasonNo: null, episodeNo: null, providerIds: {}, jfPath: null, mediaSourcePaths: [], sizeBytes: null,
+    runtimeTicks: null, container: null, videoCodec: null, audioCodec: null, audioChannels: null, width: null,
+    height: null, bitrate: null, hasPrimaryImage: false, dateCreated: null, mediaSourceId: null,
+  })
+  /** Serves the scripted pages in order, whatever startIndex is asked for. */
+  const scripted = (script: Array<{ total: number; ids: string[] }>) => {
+    let call = 0
+    return {
+      virtualFolders: async () => [],
+      items: async () => {
+        const page = script[Math.min(call, script.length - 1)]!
+        call += 1
+        return { totalRecordCount: page.total, items: page.ids.map(bare) }
+      },
+    }
+  }
+  const range = (from: number, to: number) => Array.from({ length: to - from }, (_v, i) => `i${from + i}`)
+
+  it('jellyfin phase does not sweep when TotalRecordCount changes between first and last page or unique ids < total', async () => {
+    // i500 is a live item an earlier scan indexed. Each pass below reaches startIndex >= total —
+    // the old completeness test — without having seen every item, because the library moved under
+    // the pager. Sweeping on any of them deletes rows for items Jellyfin still has.
+    const cases = [
+      // Grew: an item arrived mid-pass. Whatever sorting the server applies, the newcomer may have
+      // landed in a page already passed, pushing an item this pass never saw into the next one.
+      { name: 'grew', script: [{ total: 600, ids: range(0, 500) }, { total: 601, ids: range(501, 601).concat('new') }] },
+      // Shrank: an item was removed mid-pass, shifting every later item down one place.
+      { name: 'shrank', script: [{ total: 600, ids: range(0, 500) }, { total: 599, ids: range(501, 600) }] },
+      // Same total, but a page boundary repeated i499 and skipped i500.
+      { name: 'repeated', script: [{ total: 600, ids: range(0, 500) }, { total: 600, ids: ['i499', ...range(501, 600)] }] },
+    ]
+    for (const { name, script } of cases) {
+      db.prepare('DELETE FROM jellyfin_items').run()
+      db.prepare(`INSERT INTO jellyfin_items (id, scan_id, type, name) VALUES ('i500', 0, 'Movie', 'live')`).run()
+      const res = await jellyfinPhase.run(ctx({ jellyfin: scripted(script) as never }))
+      expect(res.status, name).toBe('skipped')
+      expect(res.counts.stale ?? 0, name).toBe(0)
+      expect(db.prepare("SELECT scan_id FROM jellyfin_items WHERE id = 'i500'").get(), name).toEqual({ scan_id: 0 })
+    }
+  })
+
+  it('names a changed total and a short unique count in its reason', async () => {
+    const grew = await jellyfinPhase.run(ctx({
+      jellyfin: scripted([{ total: 600, ids: range(0, 500) }, { total: 601, ids: range(500, 601) }]) as never,
+    }))
+    expect(grew.reason).toMatch(/600/)
+    expect(grew.reason).toMatch(/601/)
+    expect(grew.reason).toMatch(/changed/)
+
+    db.prepare('DELETE FROM jellyfin_items').run()
+    const repeated = await jellyfinPhase.run(ctx({
+      jellyfin: scripted([{ total: 600, ids: range(0, 500) }, { total: 600, ids: ['i499', ...range(501, 600)] }]) as never,
+    }))
+    expect(repeated.reason).toMatch(/599 of 600/)
+  })
+
+  it('counts unique ids across a resume, so a resumed pass whose first attempt saw the rest still sweeps', async () => {
+    // The earlier attempt wrote i0..i499 under this scan's id and saved a cursor at 500 of 600.
+    const write = db.prepare("INSERT INTO jellyfin_items (id, scan_id, type, name) VALUES (?, 1, 'Movie', 'x')")
+    for (const id of range(0, 500)) write.run(id)
+    seedPriorItem()
+    const res = await jellyfinPhase.run(ctx(
+      { jellyfin: scripted([{ total: 600, ids: range(500, 600) }]) as never },
+      { startIndex: 500, total: 600, firstTotal: 600 },
+    ))
+    expect(res.status).toBe('completed')
+    expect(res.counts.stale).toBe(1)
+  })
+
+  it('carries the first page\'s total across a resume and compares the last page against it', async () => {
+    const saves: Array<Record<string, unknown>> = []
+    const controller = new AbortController()
+    // First attempt: cancelled after one page.
+    await jellyfinPhase.run(ctx(
+      { jellyfin: scripted([{ total: 600, ids: range(0, 500) }]) as never },
+      {},
+      { signal: controller.signal, saveCursor: (s) => { saves.push(s); controller.abort() } },
+    ))
+    expect(saves.at(-1)).toMatchObject({ startIndex: 500, firstTotal: 600 })
+    // Resume: the library grew by one between the cancel and now. The resumed attempt's own
+    // first page already reports the new total, so only the carried-over first total can tell.
+    seedPriorItem()
+    const res = await jellyfinPhase.run(ctx(
+      { jellyfin: scripted([{ total: 601, ids: range(500, 601) }]) as never },
+      saves.at(-1)!,
+    ))
+    expect(res.status).toBe('skipped')
+    expect(res.reason).toMatch(/resum/)
+    expect(db.prepare("SELECT COUNT(*) c FROM jellyfin_items WHERE id = 'old'").get()).toEqual({ c: 1 })
+  })
+
+  it('jellyfin phase clears deleted_paths rows Jellyfin no longer lists', async () => {
+    const jf = {
+      virtualFolders: async () => [],
+      items: async () => ({
+        totalRecordCount: 1,
+        items: [{
+          ...bare('keep'), jfPath: '/media/Movies/Keep.mkv',
+          mediaSourcePaths: ['/media/Movies/Keep.mkv', '/media/Movies/Keep.2160p.mkv'],
+        }],
+      }),
+    }
+    const pathMap = createPathMap([{ role: 'library', jellyfin: '/media/Movies', container: '/mnt/m', qbit: null, qbitInstance: null }])
+    const record = db.prepare("INSERT INTO deleted_paths (container_path, plan_id, deleted_at) VALUES (?, 'p1', 't')")
+    record.run('/mnt/m/Keep.mkv') // still Jellyfin's primary path for an item
+    record.run('/mnt/m/Keep.2160p.mkv') // still listed, as a merged version's path only
+    record.run('/mnt/m/Gone.mkv') // Jellyfin has forgotten it
+    const remaining = () => (db.prepare('SELECT container_path FROM deleted_paths ORDER BY container_path').all() as
+      Array<{ container_path: string }>).map((r) => r.container_path)
+
+    // A pass that could not see the whole library proves nothing about what Jellyfin forgot.
+    const short = await jellyfinPhase.run(ctx({
+      jellyfin: { virtualFolders: async () => [], items: async () => ({ totalRecordCount: 5, items: [] }) } as never,
+      pathMap,
+    }))
+    expect(short.status).toBe('skipped')
+    expect(remaining()).toEqual(['/mnt/m/Gone.mkv', '/mnt/m/Keep.2160p.mkv', '/mnt/m/Keep.mkv'])
+
+    const res = await jellyfinPhase.run(ctx({ jellyfin: jf as never, pathMap }))
+    expect(res.status).toBe('completed')
+    expect(res.counts.deletedPathsCleared).toBe(1)
+    expect(remaining()).toEqual(['/mnt/m/Keep.2160p.mkv', '/mnt/m/Keep.mkv'])
+  })
 })
 
 describe('filesystemPhase', () => {
@@ -381,7 +513,7 @@ describe('filesystemPhase', () => {
 
   it('writes entries for every walked root', async () => {
     const c = ctx({
-      pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: join(dir, 'lib'), qbit: null }]),
+      pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: join(dir, 'lib'), qbit: null, qbitInstance: null }]),
     })
     const res = await filesystemPhase.run(c)
     expect(res.status).toBe('completed')
@@ -392,7 +524,7 @@ describe('filesystemPhase', () => {
   it('hashes only roots listed in hashedLibraryRoots', async () => {
     const root = join(dir, 'lib')
     const c = ctx({
-      pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }]),
+      pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null, qbitInstance: null }]),
       config: fileConfigSchema.parse({ hashedLibraryRoots: [] }),
     })
     await filesystemPhase.run(c)
@@ -400,7 +532,7 @@ describe('filesystemPhase', () => {
 
     db.prepare('DELETE FROM fs_entries').run()
     const c2 = ctx({
-      pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }]),
+      pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null, qbitInstance: null }]),
       config: fileConfigSchema.parse({ hashedLibraryRoots: [root] }),
       hasher: { quickHash: async () => 'deadbeef' } as never,
     })
@@ -419,7 +551,7 @@ describe('filesystemPhase', () => {
     db.prepare(`INSERT INTO fs_entries (container_path, scan_id, parent_path, name, is_dir, library_root, root_role)
                 VALUES (?,?,?,?,?,?,?)`).run(join(missing, 'Old.mkv'), 0, missing, 'Old.mkv', 0, missing, 'library')
     const c = ctx({
-      pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: missing, qbit: null }]),
+      pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: missing, qbit: null, qbitInstance: null }]),
     })
     const res = await filesystemPhase.run(c)
     // A totally unreachable filesystem is a connector failure, not "nothing found" — the same
@@ -445,7 +577,7 @@ describe('filesystemPhase', () => {
                 VALUES (?,?,?,?,?,?,?)`).run(staleFile, 0, join(root, 'Heat'), 'OldVersion.mkv', 0, root, 'library')
     try {
       const c = ctx({
-        pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }]),
+        pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null, qbitInstance: null }]),
       })
       const res = await filesystemPhase.run(c)
       // The root itself opened fine and Heat.mkv was seen, so this is not a total failure.
@@ -488,7 +620,7 @@ describe('filesystemPhase', () => {
     const controller = new AbortController()
     const saves: Array<Record<string, unknown>> = []
     const c = ctx(
-      { pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }]) },
+      { pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null, qbitInstance: null }]) },
       {},
       {
         signal: controller.signal,
@@ -526,8 +658,8 @@ describe('filesystemPhase', () => {
 
     const res = await filesystemPhase.run(ctx({
       pathMap: createPathMap([
-        { role: 'library', jellyfin: '/media', container: root, qbit: null },
-        { role: 'library', jellyfin: '/other', container: otherRoot, qbit: null },
+        { role: 'library', jellyfin: '/media', container: root, qbit: null, qbitInstance: null },
+        { role: 'library', jellyfin: '/other', container: otherRoot, qbit: null, qbitInstance: null },
       ]),
     }))
 
@@ -550,7 +682,7 @@ describe('filesystemPhase', () => {
                 VALUES (?,?,?,?,?,?,?)`).run(join(removed, 'Old.mkv'), 0, removed, 'Old.mkv', 0, removed, 'library')
 
     const res = await filesystemPhase.run(ctx({
-      pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }]),
+      pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null, qbitInstance: null }]),
     }))
     expect(res.status).toBe('completed')
     expect(res.counts.pruned).toBe(1)
@@ -569,12 +701,72 @@ describe('filesystemPhase', () => {
 
     const res = await filesystemPhase.run(ctx({
       pathMap: createPathMap([
-        { role: 'library', jellyfin: '/media', container: join(dir, 'lib'), qbit: null },
-        { role: 'library', jellyfin: '/down', container: missing, qbit: null },
+        { role: 'library', jellyfin: '/media', container: join(dir, 'lib'), qbit: null, qbitInstance: null },
+        { role: 'library', jellyfin: '/down', container: missing, qbit: null, qbitInstance: null },
       ]),
     }))
     expect(res.counts.pruned).toBe(0)
     expect(db.prepare('SELECT COUNT(*) c FROM fs_entries WHERE library_root = ?').get(removed)).toEqual({ c: 1 })
+  })
+
+  /** Rows an earlier scan wrote for `root` — what the index knows about a share before it drops. */
+  const seedIndexed = (root: string, names: string[]) => {
+    const insert = db.prepare(`INSERT INTO fs_entries (container_path, scan_id, parent_path, name, ext, is_dir, is_media, library_root, root_role)
+                               VALUES (?,?,?,?,?,?,?,?,?)`)
+    for (const n of names) insert.run(join(root, n), 0, root, n, '.mkv', 0, 1, root, 'library')
+  }
+
+  it('filesystem phase does not sweep a root that walks empty while the index holds rows for it', async () => {
+    // An unmounted share leaves its mount point behind as an empty directory, which opens
+    // without complaint. Sweeping on that walk would drop every row for the root and tell every
+    // filesystem rule the whole library vanished.
+    const lib = join(dir, 'lib')
+    const share = join(dir, 'share')
+    mkdirSync(share)
+    seedIndexed(share, ['A.mkv', 'B.mkv'])
+    seedIndexed(lib, ['Gone.mkv']) // a genuinely deleted file under the healthy root
+    const res = await filesystemPhase.run(ctx({
+      pathMap: createPathMap([
+        { role: 'library', jellyfin: '/media', container: lib, qbit: null, qbitInstance: null },
+        { role: 'library', jellyfin: '/share', container: share, qbit: null, qbitInstance: null },
+      ]),
+    }))
+    // The healthy root was observed, so the phase completed — and it says what it did not sweep.
+    expect(res.status).toBe('completed')
+    expect(res.counts.unmounted).toBe(1)
+    expect(res.reason).toContain(share)
+    expect(res.reason).toMatch(/unmounted/)
+    expect((db.prepare('SELECT COUNT(*) c FROM fs_entries WHERE library_root = ? AND scan_id = 0').get(share) as { c: number }).c).toBe(2)
+    // The healthy root was swept as usual.
+    expect(db.prepare('SELECT COUNT(*) c FROM fs_entries WHERE container_path = ?').get(join(lib, 'Gone.mkv'))).toEqual({ c: 0 })
+  })
+
+  it('is skipped, naming the root, when its only root walks empty while the index holds rows for it', async () => {
+    const share = join(dir, 'share')
+    mkdirSync(share)
+    seedIndexed(share, ['A.mkv'])
+    // A row of a mapping since removed: with the only root unobserved, it is not provably stale.
+    const removed = join(dir, 'was-mapped')
+    seedIndexed(removed, ['Old.mkv'])
+    const res = await filesystemPhase.run(ctx({
+      pathMap: createPathMap([{ role: 'library', jellyfin: '/share', container: share, qbit: null, qbitInstance: null }]),
+    }))
+    // Nothing was observed at all, so downstream rules must not read the stale rows as fresh.
+    expect(res.status).toBe('skipped')
+    expect(res.reason).toContain(share)
+    expect(res.counts.pruned).toBe(0)
+    expect(db.prepare('SELECT COUNT(*) c FROM fs_entries').get()).toEqual({ c: 2 })
+  })
+
+  it('treats an empty root the index knows nothing about as empty, not unmounted', async () => {
+    const fresh = join(dir, 'fresh')
+    mkdirSync(fresh)
+    const res = await filesystemPhase.run(ctx({
+      pathMap: createPathMap([{ role: 'library', jellyfin: '/fresh', container: fresh, qbit: null, qbitInstance: null }]),
+    }))
+    expect(res.status).toBe('completed')
+    expect(res.counts.unmounted).toBe(0)
+    expect(res.reason).toBeUndefined()
   })
 
   it('does not prune on a resumed pass that skipped an already-completed root', async () => {
@@ -586,7 +778,7 @@ describe('filesystemPhase', () => {
     // The cursor says this root is already done, so this pass never observes it and cannot
     // vouch for how cleanly the earlier attempt walked it.
     const res = await filesystemPhase.run(ctx(
-      { pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }]) },
+      { pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null, qbitInstance: null }]) },
       { completedRoots: [root] },
     ))
     expect(res.counts.pruned).toBe(0)
@@ -600,15 +792,15 @@ describe('qbittorrentPhase', () => {
     const file = join(dir, 'dl', 'Heat', 'Heat.mkv')
     writeFileSync(file, 'x')
     const c = ctx({
-      pathMap: createPathMap([{ role: 'download', jellyfin: null, container: join(dir, 'dl'), qbit: '/downloads' }]),
-      qbittorrent: {
+      pathMap: createPathMap([{ role: 'download', jellyfin: null, container: join(dir, 'dl'), qbit: '/downloads', qbitInstance: 'box-a' }]),
+      qbittorrents: one({
         torrents: async () => [{
           hash: 'H1', name: 'Heat', savePath: '/downloads', contentPath: '/downloads/Heat',
           category: null, tags: [], state: 'stalledUP', ratio: 1, seedingTimeSeconds: 1,
           isPrivate: false, trackerHost: 'x', sizeBytes: 1, progress: 1,
         }],
         files: async () => [{ index: 0, relPath: 'Heat/Heat.mkv', sizeBytes: 1 }],
-      } as never,
+      }),
     })
     const res = await qbittorrentPhase.run(c)
     expect(res.status).toBe('completed')
@@ -618,7 +810,7 @@ describe('qbittorrentPhase', () => {
   })
 
   it('skips with a reason when qbittorrent is unreachable', async () => {
-    const c = ctx({ qbittorrent: { torrents: async () => { throw Object.assign(new Error('down'), { kind: 'unreachable' }) } } as never })
+    const c = ctx({ qbittorrents: one({ torrents: async () => { throw Object.assign(new Error('down'), { kind: 'unreachable' }) } }) })
     const res = await qbittorrentPhase.run(c)
     expect(res.status).toBe('skipped')
   })
@@ -629,9 +821,10 @@ describe('qbittorrentPhase', () => {
     isPrivate: false, trackerHost: 'x', sizeBytes: 1, progress: 0.5, ...over,
   })
 
-  const seedTorrentRow = (hash: string) => {
-    db.prepare("INSERT INTO torrents (hash, fetched_at, name, state) VALUES (?, 'long-ago', ?, 'stalledUP')").run(hash, hash)
-    db.prepare('INSERT INTO torrent_files (hash, file_index, rel_path) VALUES (?,?,?)').run(hash, 0, 'a.mkv')
+  const seedTorrentRow = (hash: string, instanceId = 'box-a') => {
+    db.prepare("INSERT INTO torrents (instance_id, hash, fetched_at, name, state) VALUES (?, ?, 'long-ago', ?, 'stalledUP')")
+      .run(instanceId, hash, hash)
+    db.prepare('INSERT INTO torrent_files (instance_id, hash, file_index, rel_path) VALUES (?,?,?,?)').run(instanceId, hash, 0, 'a.mkv')
   }
 
   it('does not sweep when cancelled mid-iteration', async () => {
@@ -640,11 +833,11 @@ describe('qbittorrentPhase', () => {
     seedTorrentRow('OLD')
     const controller = new AbortController()
     const c = ctx({
-      pathMap: createPathMap([{ role: 'download', jellyfin: null, container: join(dir, 'dl'), qbit: '/downloads' }]),
-      qbittorrent: {
+      pathMap: createPathMap([{ role: 'download', jellyfin: null, container: join(dir, 'dl'), qbit: '/downloads', qbitInstance: 'box-a' }]),
+      qbittorrents: one({
         torrents: async () => [torrent('H1'), torrent('H2')],
         files: async () => { controller.abort(); return [] },
-      } as never,
+      }),
     }, {}, { signal: controller.signal })
 
     const res = await qbittorrentPhase.run(c)
@@ -657,8 +850,8 @@ describe('qbittorrentPhase', () => {
   it('sweeps torrents that vanished once a full pass completes', async () => {
     seedTorrentRow('OLD')
     const c = ctx({
-      pathMap: createPathMap([{ role: 'download', jellyfin: null, container: join(dir, 'dl'), qbit: '/downloads' }]),
-      qbittorrent: { torrents: async () => [torrent('H1')], files: async () => [] } as never,
+      pathMap: createPathMap([{ role: 'download', jellyfin: null, container: join(dir, 'dl'), qbit: '/downloads', qbitInstance: 'box-a' }]),
+      qbittorrents: one({ torrents: async () => [torrent('H1')], files: async () => [] }),
     })
     const res = await qbittorrentPhase.run(c)
     expect(res.status).toBe('completed')
@@ -672,10 +865,10 @@ describe('qbittorrentPhase', () => {
     // no override. A decorated string ("downloading (files unavailable: …)") fails that
     // membership test, so the guard would open — and only ever when qBittorrent is flaky.
     const c = ctx({
-      qbittorrent: {
+      qbittorrents: one({
         torrents: async () => [torrent('H1', { state: 'downloading' })],
         files: async () => { throw Object.assign(new Error('timeout'), { kind: 'timeout' }) },
-      } as never,
+      }),
     })
     await qbittorrentPhase.run(c)
     const row = db.prepare('SELECT state, files_error FROM torrents WHERE hash = ?').get('H1') as
@@ -688,19 +881,19 @@ describe('qbittorrentPhase', () => {
     // A leftover (hash → dev, inode) row makes a confirmed cross-seed expand a delete onto a
     // torrent that no longer holds the file.
     const c1 = ctx({
-      qbittorrent: {
+      qbittorrents: one({
         torrents: async () => [torrent('H1')],
         files: async () => [{ index: 0, relPath: 'a.mkv', sizeBytes: 1 }, { index: 1, relPath: 'b.mkv', sizeBytes: 1 }],
-      } as never,
+      }),
     })
     await qbittorrentPhase.run(c1)
     expect(db.prepare('SELECT COUNT(*) c FROM torrent_files WHERE hash = ?').get('H1')).toEqual({ c: 2 })
 
     const c2 = ctx({
-      qbittorrent: {
+      qbittorrents: one({
         torrents: async () => [torrent('H1')],
         files: async () => [{ index: 0, relPath: 'a.mkv', sizeBytes: 1 }],
-      } as never,
+      }),
     })
     await qbittorrentPhase.run(c2)
     const rows = db.prepare('SELECT rel_path FROM torrent_files WHERE hash = ?').all('H1') as Array<{ rel_path: string }>
@@ -710,11 +903,228 @@ describe('qbittorrentPhase', () => {
   it('counts paths it could not translate instead of leaving a silent NULL', async () => {
     const c = ctx({
       pathMap: createPathMap([]), // no mapping covers /downloads at all
-      qbittorrent: { torrents: async () => [torrent('H1')], files: async () => [] } as never,
+      qbittorrents: one({ torrents: async () => [torrent('H1')], files: async () => [] }),
     })
     const res = await qbittorrentPhase.run(c)
     // Once for contentPath, once for savePath — both untranslatable.
     expect(res.counts.unmapped).toBe(2)
+  })
+})
+
+describe('qbittorrentPhase — instances', () => {
+  const torrent = (hash: string, over: Record<string, unknown> = {}) => ({
+    hash, name: hash, savePath: '/movies', contentPath: `/movies/${hash}.mkv`, rootPath: '',
+    category: null, tags: [], state: 'stalledUP', ratio: 1, seedingTimeSeconds: 1,
+    isPrivate: false, trackerHost: 'x', sizeBytes: 1, progress: 1, addedOn: 1_700_000_000, ...over,
+  })
+  // Both boxes call their library /movies; only the container namespace tells them apart.
+  const twoBoxes = () => createPathMap([
+    { role: 'library', jellyfin: '/data/a', container: join(dir, 'a'), qbit: '/movies', qbitInstance: 'box-a' },
+    { role: 'library', jellyfin: '/data/b', container: join(dir, 'b'), qbit: '/movies', qbitInstance: 'box-b' },
+  ])
+  const files = (hash: string) => async () => [{ index: 0, relPath: `${hash}.mkv`, sizeBytes: 1 }]
+
+  it('skips with a reason when no instance is configured', async () => {
+    const res = await qbittorrentPhase.run(ctx({ qbittorrents: new Map() }))
+    expect(res.status).toBe('skipped')
+    expect(res.reason).toMatch(/no qbittorrent instance/i)
+  })
+
+  it('writes each instance\'s torrents under its own id, through its own prefix, with root_path and added_on', async () => {
+    const c = ctx({
+      pathMap: twoBoxes(),
+      qbittorrents: new Map([
+        ['box-a', { instanceId: 'box-a', torrents: async () => [torrent('same')], files: files('same') }],
+        ['box-b', { instanceId: 'box-b', torrents: async () => [torrent('same'), torrent('onlyb')], files: async (h: string) => files(h)() }],
+      ]) as never,
+    })
+    const res = await qbittorrentPhase.run(c)
+    expect(res.status).toBe('completed')
+    expect(res.counts.torrents).toBe(3)
+
+    // The same infohash on both boxes is two rows, each pointing at its own box's file.
+    const rows = db.prepare('SELECT instance_id, hash, container_content_path, root_path, added_on FROM torrents ORDER BY instance_id, hash')
+      .all() as Array<Record<string, unknown>>
+    expect(rows).toEqual([
+      { instance_id: 'box-a', hash: 'same', container_content_path: join(dir, 'a', 'same.mkv'), root_path: '', added_on: 1_700_000_000 },
+      { instance_id: 'box-b', hash: 'onlyb', container_content_path: join(dir, 'b', 'onlyb.mkv'), root_path: '', added_on: 1_700_000_000 },
+      { instance_id: 'box-b', hash: 'same', container_content_path: join(dir, 'b', 'same.mkv'), root_path: '', added_on: 1_700_000_000 },
+    ])
+    const fileRows = db.prepare("SELECT instance_id, container_path FROM torrent_files WHERE hash = 'same' ORDER BY instance_id").all()
+    expect(fileRows).toEqual([
+      { instance_id: 'box-a', container_path: join(dir, 'a', 'same.mkv') },
+      { instance_id: 'box-b', container_path: join(dir, 'b', 'same.mkv') },
+    ])
+  })
+
+  it('one failing instance leaves its rows untouched, sweeps the other, and returns skipped with the failing id in reason', async () => {
+    db.prepare("INSERT INTO torrents (instance_id, hash, fetched_at, name) VALUES ('box-a', 'gone', 'long-ago', 'gone')").run()
+    db.prepare("INSERT INTO torrent_files (instance_id, hash, file_index, rel_path) VALUES ('box-a', 'gone', 0, 'g.mkv')").run()
+    db.prepare(`INSERT INTO torrents (instance_id, hash, fetched_at, name, state, ratio)
+                VALUES ('box-b', 'kept', 'long-ago', 'kept', 'stalledUP', 2.5)`).run()
+    db.prepare(`INSERT INTO torrent_files (instance_id, hash, file_index, rel_path, container_path, inode)
+                VALUES ('box-b', 'kept', 0, 'k.mkv', '/path/to/b/k.mkv', 77)`).run()
+    const c = ctx({
+      pathMap: twoBoxes(),
+      qbittorrents: new Map([
+        ['box-a', { instanceId: 'box-a', torrents: async () => [torrent('fresh')], files: files('fresh') }],
+        ['box-b', { instanceId: 'box-b', torrents: async () => { throw Object.assign(new Error('down'), { kind: 'unreachable' }) } }],
+      ]) as never,
+    })
+    const res = await qbittorrentPhase.run(c)
+    // One box unobserved means the torrent picture as a whole was not observed.
+    expect(res.status).toBe('skipped')
+    expect(res.reason).toMatch(/box-b/)
+    expect(res.reason).not.toMatch(/box-a/)
+    expect(res.counts.stale).toBe(1)
+    const torrents = db.prepare('SELECT instance_id, hash FROM torrents ORDER BY instance_id, hash').all()
+    expect(torrents).toEqual([{ instance_id: 'box-a', hash: 'fresh' }, { instance_id: 'box-b', hash: 'kept' }])
+    const fileRows = db.prepare('SELECT instance_id, hash FROM torrent_files ORDER BY instance_id, hash').all()
+    expect(fileRows).toEqual([{ instance_id: 'box-a', hash: 'fresh' }, { instance_id: 'box-b', hash: 'kept' }])
+    // Untouched means untouched: not refreshed, not rewritten — exactly what the last good pass recorded.
+    expect(db.prepare("SELECT fetched_at, state, ratio FROM torrents WHERE instance_id = 'box-b'").get())
+      .toEqual({ fetched_at: 'long-ago', state: 'stalledUP', ratio: 2.5 })
+    expect(db.prepare("SELECT container_path, inode FROM torrent_files WHERE instance_id = 'box-b'").get())
+      .toEqual({ container_path: '/path/to/b/k.mkv', inode: 77 })
+  })
+
+  it('drops the rows of an instance that is no longer configured, even while a configured instance is down', async () => {
+    // Nothing else can ever reach these rows: the per-instance sweep only runs for configured
+    // instances. Left behind, they keep feeding the cross-seed guard torrents that no configured
+    // box holds. They are not "unobserved" the way a down box's rows are — no pass will ever
+    // observe them again — so a configured box being down is no reason to keep them.
+    db.prepare("INSERT INTO torrents (instance_id, hash, fetched_at, name) VALUES ('box-old', 'h', 'long-ago', 'h')").run()
+    db.prepare("INSERT INTO torrent_files (instance_id, hash, file_index, rel_path) VALUES ('box-old', 'h', 0, 'h.mkv')").run()
+    // A file row with no torrent row at all is dropped too.
+    db.prepare("INSERT INTO torrent_files (instance_id, hash, file_index, rel_path) VALUES ('box-old', 'stray', 0, 's.mkv')").run()
+    db.prepare("INSERT INTO torrents (instance_id, hash, fetched_at, name) VALUES ('box-a', 'live', 'long-ago', 'live')").run()
+    db.prepare("INSERT INTO torrent_files (instance_id, hash, file_index, rel_path) VALUES ('box-a', 'live', 0, 'l.mkv')").run()
+    const res = await qbittorrentPhase.run(ctx({
+      pathMap: twoBoxes(),
+      qbittorrents: one({ torrents: async () => { throw Object.assign(new Error('down'), { kind: 'unreachable' }) } }),
+    }))
+    expect(res.status).toBe('skipped')
+    expect(res.counts.unconfigured).toBe(1)
+    expect(db.prepare("SELECT COUNT(*) c FROM torrents WHERE instance_id = 'box-old'").get()).toEqual({ c: 0 })
+    expect(db.prepare("SELECT COUNT(*) c FROM torrent_files WHERE instance_id = 'box-old'").get()).toEqual({ c: 0 })
+    // The configured box that is down keeps everything.
+    expect(db.prepare("SELECT COUNT(*) c FROM torrents WHERE instance_id = 'box-a'").get()).toEqual({ c: 1 })
+    expect(db.prepare("SELECT COUNT(*) c FROM torrent_files WHERE instance_id = 'box-a'").get()).toEqual({ c: 1 })
+  })
+
+  it('qbittorrent phase reports progress across instances', async () => {
+    const calls: Array<[number, number | null]> = []
+    const c = ctx({
+      pathMap: twoBoxes(),
+      qbittorrents: new Map([
+        ['box-a', { instanceId: 'box-a', torrents: async () => [torrent('a1'), torrent('a2')], files: async () => [] }],
+        ['box-b', { instanceId: 'box-b', torrents: async () => [torrent('b1'), torrent('b2'), torrent('b3')], files: async () => [] }],
+      ]) as never,
+    }, {}, { progress: (done, total) => { calls.push([done, total]) } })
+    const res = await qbittorrentPhase.run(c)
+    expect(res.status).toBe('completed')
+    // One running count over every instance, against one total known before the first torrent is
+    // written — not a count that restarts at each box, nor a total that grows as boxes answer.
+    expect(calls).toEqual([[0, 5], [1, 5], [2, 5], [3, 5], [4, 5], [5, 5]])
+  })
+
+  it("qbittorrent phase synthesizes single-file torrents' file lists without calling files()", async () => {
+    mkdirSync(join(dir, 'a'), { recursive: true })
+    writeFileSync(join(dir, 'a', 'Solo.2019.mkv'), 'x'.repeat(10))
+    const asked: string[] = []
+    const res = await qbittorrentPhase.run(ctx({
+      pathMap: twoBoxes(),
+      qbittorrents: one({
+        torrents: async () => [
+          // qBittorrent 5.x: root_path "" and content_path = save_path/<the one file>.
+          torrent('solo', { contentPath: '/movies/Solo.2019.mkv', sizeBytes: 10 }),
+          torrent('pack', { rootPath: '/movies/Pack', contentPath: '/movies/Pack' }),
+        ],
+        files: async (hash: string) => {
+          asked.push(hash)
+          return [{ index: 0, relPath: 'Pack/E01.mkv', sizeBytes: 5 }, { index: 1, relPath: 'Pack/E02.mkv', sizeBytes: 5 }]
+        },
+      }),
+    }))
+    expect(res.status).toBe('completed')
+    expect(asked).toEqual(['pack'])
+    expect(res.counts.synthesized).toBe(1)
+    expect(res.counts.files).toBe(3)
+    expect(db.prepare("SELECT file_index, rel_path, container_path, size_bytes, inode FROM torrent_files WHERE hash = 'solo'").all())
+      .toEqual([{
+        file_index: 0, rel_path: 'Solo.2019.mkv', container_path: join(dir, 'a', 'Solo.2019.mkv'), size_bytes: 10,
+        inode: expect.any(Number),
+      }])
+  })
+
+  it('asks files() whenever an empty root_path does not prove one file sitting directly in the save path', async () => {
+    // qBittorrent reports root_path "" for more than single-file torrents: a multi-file torrent
+    // added without a root folder reports its storage directory as content_path, and a magnet
+    // still fetching metadata reports "". Synthesizing a one-file list for either would index a
+    // directory as the torrent's only file.
+    mkdirSync(join(dir, 'a', 'Loose'), { recursive: true })
+    const asked: string[] = []
+    await qbittorrentPhase.run(ctx({
+      pathMap: twoBoxes(),
+      qbittorrents: one({
+        torrents: async () => [
+          torrent('nosub', { contentPath: '/movies' }), // no root folder, stored in save_path itself
+          torrent('magnet', { contentPath: '' }), // no metadata yet
+          torrent('unreported', { contentPath: null }),
+          torrent('temp', { contentPath: '/movies/incomplete/T.mkv' }), // still in a download dir under save_path
+          torrent('elsewhere', { contentPath: '/downloads/E.mkv' }), // outside save_path entirely
+          torrent('dir', { contentPath: '/movies/Loose' }), // one segment deep, but a directory on disk
+        ],
+        files: async (hash: string) => { asked.push(hash); return [] },
+      }),
+    }))
+    expect(asked.sort()).toEqual(['dir', 'elsewhere', 'magnet', 'nosub', 'temp', 'unreported'])
+  })
+
+  // Ruling 18: the worker's clients are fresh every scan, so their own login backoff starts empty.
+  // An instance whose main-thread client is holding off logging in must not be asked for anything
+  // here either, or every nightly scan spends another failed login towards qBittorrent's ban.
+  it('treats an instance whose login is blocked as failed, without asking it anything, and keeps its rows', async () => {
+    db.prepare(`INSERT INTO torrents (instance_id, hash, fetched_at, name, state, ratio)
+                VALUES ('box-b', 'kept', 'long-ago', 'kept', 'stalledUP', 2.5)`).run()
+    db.prepare(`INSERT INTO torrent_files (instance_id, hash, file_index, rel_path, container_path)
+                VALUES ('box-b', 'kept', 0, 'k.mkv', '/path/to/b/k.mkv')`).run()
+    let asked = 0
+    const refuse = async () => { asked += 1; throw new Error('a blocked instance must not be asked') }
+    const res = await qbittorrentPhase.run(ctx({
+      pathMap: twoBoxes(),
+      qbittorrents: new Map([
+        ['box-a', { instanceId: 'box-a', torrents: async () => [torrent('fresh')], files: files('fresh') }],
+        ['box-b', { instanceId: 'box-b', torrents: refuse, files: refuse, ping: refuse }],
+      ]) as never,
+      qbitLoginBlocked: new Set(['box-b']),
+    }))
+    expect(asked).toBe(0)
+    expect(res.status).toBe('skipped')
+    expect(res.reason).toMatch(/box-b: login blocked/)
+    expect(res.reason).not.toMatch(/box-a/)
+    // Unobserved, not gone: neither swept as stale nor dropped as unconfigured.
+    expect(res.counts.unconfigured).toBe(0)
+    expect(db.prepare('SELECT instance_id, hash FROM torrents ORDER BY instance_id, hash').all())
+      .toEqual([{ instance_id: 'box-a', hash: 'fresh' }, { instance_id: 'box-b', hash: 'kept' }])
+    expect(db.prepare("SELECT hash FROM torrent_files WHERE instance_id = 'box-b'").all()).toEqual([{ hash: 'kept' }])
+  })
+
+  it('records a files failure against the right instance only', async () => {
+    // Multi-file torrents: a single-file torrent's list is synthesized, so it never calls files().
+    const pack = (hash: string) => torrent(hash, { rootPath: `/movies/${hash}`, contentPath: `/movies/${hash}` })
+    const c = ctx({
+      pathMap: twoBoxes(),
+      qbittorrents: new Map([
+        ['box-a', { instanceId: 'box-a', torrents: async () => [pack('same')], files: files('same') }],
+        ['box-b', { instanceId: 'box-b', torrents: async () => [pack('same')], files: async () => { throw Object.assign(new Error('slow'), { kind: 'timeout' }) } }],
+      ]) as never,
+    })
+    await qbittorrentPhase.run(c)
+    expect(db.prepare("SELECT instance_id, files_error FROM torrents WHERE hash = 'same' ORDER BY instance_id").all()).toEqual([
+      { instance_id: 'box-a', files_error: null },
+      { instance_id: 'box-b', files_error: expect.stringMatching(/slow/) },
+    ])
   })
 })
 
@@ -741,7 +1151,7 @@ describe('arrPhase', () => {
     // in it looks authoritative and joins to nothing, so the record silently stops describing
     // the file it names.
     const c = ctx({
-      pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: '/mnt/m', qbit: null }]),
+      pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: '/mnt/m', qbit: null, qbitInstance: null }]),
       radarr: { inventory: async () => ({ records: [{ kind: 'radarr', instance: 'radarr', remoteId: 1, title: 'Heat', arrPath: '/movies/Heat.mkv', monitored: true, seriesId: null, episodeId: null, episodeFileId: null }], complete: true }) } as never,
     })
     const res = await arrPhase.run(c)

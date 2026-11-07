@@ -39,6 +39,23 @@ describe('openDb', () => {
     expect(db.pragma('foreign_keys', { simple: true })).toBe(1)
   })
 
+  it('waits up to 15s for a lock on every connection instead of failing at once with SQLITE_BUSY', () => {
+    // The scan worker holds its own connection; a plan build or an API read on the main thread
+    // must queue behind a write, not fail.
+    const db = openDb(join(dir, 'test.db'))
+    expect(db.pragma('busy_timeout', { simple: true })).toBe(15000)
+    const second = openDb(join(dir, 'test.db'))
+    expect(second.pragma('busy_timeout', { simple: true })).toBe(15000)
+  })
+
+  it('creates the deleted_paths table and the plans.error column', () => {
+    const db = openDb(join(dir, 'test.db'))
+    const deleted = (db.prepare('PRAGMA table_info(deleted_paths)').all() as Array<{ name: string }>).map((c) => c.name)
+    expect(deleted).toEqual(['container_path', 'plan_id', 'deleted_at'])
+    const plans = (db.prepare('PRAGMA table_info(plans)').all() as Array<{ name: string }>).map((c) => c.name)
+    expect(plans).toContain('error')
+  })
+
   it('indexes the (dev, inode) join key on both filesystem and torrent files', () => {
     const db = openDb(join(dir, 'test.db'))
     const idx = db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all()
@@ -150,18 +167,18 @@ describe('migrations', () => {
     const legacy = new Database(path)
     legacy.exec(readFileSync(join(MIGRATIONS_DIR, '001_init.sql'), 'utf8'))
     legacy.pragma('user_version = 1')
-    legacy.prepare("INSERT INTO torrents (hash, fetched_at, name, state) VALUES ('H1', 't', 'n', 'downloading')").run()
+    legacy.prepare("INSERT INTO plans (id, created_at, created_by, status) VALUES ('p1', 't', 'admin', 'completed')").run()
     legacy.close()
 
     const upgraded = openDb(path)
     const highest = Math.max(...files().map((f) => Number(f.slice(0, 3))))
     expect(currentSchemaVersion(upgraded)).toBe(highest)
+    // 002's files_error survives 005's rebuild of the torrents table.
     const cols = (upgraded.prepare('PRAGMA table_info(torrents)').all() as Array<{ name: string }>).map((c) => c.name)
     expect(cols).toContain('files_error')
-    const row = upgraded.prepare("SELECT hash, state, files_error FROM torrents WHERE hash = 'H1'").get() as
-      { hash: string; state: string; files_error: string | null }
-    expect(row.state).toBe('downloading')
-    expect(row.files_error).toBeNull()
+    // A row written before any of the later migrations is still there — and gained 005's column.
+    expect(upgraded.prepare("SELECT status, error FROM plans WHERE id = 'p1'").get())
+      .toEqual({ status: 'completed', error: null })
     // 003 must also have applied on top of a database that started at 001 — proves the chain
     // isn't just "the immediately-next migration", but every one still missing, in order.
     const tables = upgraded.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()
@@ -182,7 +199,53 @@ describe('migrations', () => {
     // would fail outright with "duplicate column name").
     const reopened = openDb(path)
     expect(currentSchemaVersion(reopened)).toBe(highest)
-    expect((reopened.prepare("SELECT COUNT(*) c FROM torrents").get() as { c: number }).c).toBe(1)
+    expect((reopened.prepare('SELECT COUNT(*) c FROM plans').get() as { c: number }).c).toBe(1)
+  })
+
+  it('005 upgrades a v4 database: the torrent cache is rebuilt keyed by (instance_id, hash)', () => {
+    // Built by hand from 001-004, exactly as a pre-multi-instance install left it.
+    const path = join(dir, 'v4.db')
+    const v4 = new Database(path)
+    for (const f of files().filter((name) => Number(name.slice(0, 3)) <= 4).sort()) {
+      v4.exec(readFileSync(join(MIGRATIONS_DIR, f), 'utf8'))
+    }
+    v4.pragma('user_version = 4')
+    v4.prepare("INSERT INTO torrents (hash, fetched_at, name, state) VALUES ('h1', 't', 'n', 'stalledUP')").run()
+    v4.prepare("INSERT INTO torrent_files (hash, file_index, rel_path) VALUES ('h1', 0, 'a.mkv')").run()
+    v4.prepare("INSERT INTO kv (key, value_json) VALUES ('pathmap.lastVerification', '{}')").run()
+    v4.close()
+
+    const db = openDb(path)
+    expect(currentSchemaVersion(db)).toBeGreaterThanOrEqual(5)
+    // A per-scan cache: emptied, not carried across a key change it cannot be translated through.
+    expect(db.prepare('SELECT COUNT(*) c FROM torrents').get()).toEqual({ c: 0 })
+    expect(db.prepare('SELECT COUNT(*) c FROM torrent_files').get()).toEqual({ c: 0 })
+    // Everything that is not a cache survives.
+    expect(db.prepare("SELECT COUNT(*) c FROM kv WHERE key = 'pathmap.lastVerification'").get()).toEqual({ c: 1 })
+
+    const torrentCols = (db.prepare('PRAGMA table_info(torrents)').all() as Array<{ name: string }>).map((c) => c.name)
+    expect(torrentCols).toEqual(expect.arrayContaining(['instance_id', 'hash', 'root_path', 'added_on', 'files_error']))
+
+    // The same infohash on two boxes is two torrents, in both tables.
+    const insertTorrent = db.prepare("INSERT INTO torrents (instance_id, hash, fetched_at, name) VALUES (?, 'h1', 't', 'n')")
+    insertTorrent.run('box-a')
+    insertTorrent.run('box-b')
+    const insertFile = db.prepare("INSERT INTO torrent_files (instance_id, hash, file_index, rel_path) VALUES (?, 'h1', 0, 'a.mkv')")
+    insertFile.run('box-a')
+    insertFile.run('box-b')
+    expect(db.prepare("SELECT COUNT(*) c FROM torrents WHERE hash = 'h1'").get()).toEqual({ c: 2 })
+    expect(db.prepare("SELECT COUNT(*) c FROM torrent_files WHERE hash = 'h1'").get()).toEqual({ c: 2 })
+    // ...but the same (instance, hash) twice is still one torrent.
+    expect(() => insertTorrent.run('box-a')).toThrow(/UNIQUE/)
+
+    // A torrent row must say which instance reported it.
+    expect(() => db.prepare("INSERT INTO torrents (hash, fetched_at, name) VALUES ('h2', 't', 'n')").run()).toThrow(/NOT NULL/)
+
+    const idx = db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all().map((r) => (r as { name: string }).name)
+    expect(idx).toEqual(expect.arrayContaining(['idx_torrent_files_inode', 'idx_torrent_files_path']))
+
+    db.prepare("INSERT INTO deleted_paths (container_path, plan_id, deleted_at) VALUES ('/path/to/x.mkv', 'p1', 't')").run()
+    expect(db.prepare('SELECT plan_id FROM deleted_paths').get()).toEqual({ plan_id: 'p1' })
   })
 
   it('round-trips a finding row', () => {

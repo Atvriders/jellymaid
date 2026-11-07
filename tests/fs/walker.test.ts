@@ -7,7 +7,7 @@ import type { PathMapping } from '../../src/core/types.js'
 
 let dir: string
 const libraryRoot = (container: string): PathMapping =>
-  ({ role: 'library', jellyfin: '/media/Movies', container, qbit: null })
+  ({ role: 'library', jellyfin: '/media/Movies', container, qbit: null, qbitInstance: null })
 
 async function collect(root: PathMapping, over: Partial<Parameters<typeof walkRoot>[0]> = {}) {
   const out: FsEntry[] = []
@@ -136,7 +136,7 @@ describe('walkRoot', () => {
   })
 
   it('tags every entry with its root and role', async () => {
-    const entries = await collect({ role: 'download', jellyfin: null, container: dir, qbit: '/downloads' })
+    const entries = await collect({ role: 'download', jellyfin: null, container: dir, qbit: '/downloads', qbitInstance: 'box-a' })
     expect(entries.every((e) => e.libraryRoot === dir && e.rootRole === 'download')).toBe(true)
   })
 

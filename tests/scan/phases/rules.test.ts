@@ -3,7 +3,9 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { openDb, type Db } from '../../../src/index/db.js'
-import { rulesPhase } from '../../../src/scan/phases/rules.js'
+import { availableSources, rulesPhase } from '../../../src/scan/phases/rules.js'
+import { ALL_RULES } from '../../../src/rules/registry.js'
+import { runRules } from '../../../src/rules/runner.js'
 import { createPathMap } from '../../../src/fs/pathmap.js'
 import { fileConfigSchema } from '../../../src/config/schema.js'
 import type { PhaseContext, PhaseName, PhaseResult } from '../../../src/scan/phases/types.js'
@@ -24,7 +26,7 @@ function ctx(priorResults: Partial<Record<PhaseName, PhaseResult>>, scanId = 2):
     deps: {
       config: fileConfigSchema.parse({}),
       pathMap: createPathMap([]),
-      jellyfin: null, qbittorrent: null, radarr: null, sonarr: null, hasher: null,
+      jellyfin: null, qbittorrents: new Map(), radarr: null, sonarr: null, hasher: null,
     },
   }
 }
@@ -144,5 +146,51 @@ describe('rulesPhase source availability', () => {
     const res = await rulesPhase.run(ctx({}))
     expect(res.counts.notEvaluated).toBeGreaterThan(0)
     expect(res.status).toBe('completed')
+  })
+})
+
+describe('rulesPhase progress', () => {
+  it('rules phase reports per-rule progress', async () => {
+    staleItem('old', '/mnt/m/old.mkv')
+    mediaFile('/mnt/m/old.mkv')
+    const n = ALL_RULES.length
+    const calls: Array<[number, number | null]> = []
+    const landed: string[] = []
+    const c = ctx({ jellyfin: completed({ items: 1 }), filesystem: completed({ entries: 1 }) })
+    c.progress = (done, total) => {
+      calls.push([done, total])
+      if (done === 0) return
+      // Reported after the rule's own work, evaluated or not, is in the index…
+      const rule = ALL_RULES[done - 1]!
+      if (runsFor(rule.id)) landed.push(rule.id)
+      // …and while the pass is still one open transaction, so a failure part-way through rolls
+      // the whole pass back rather than leaving some rules recorded and others not.
+      expect(db.inTransaction).toBe(true)
+    }
+    await rulesPhase.run(c)
+    expect(calls).toEqual(Array.from({ length: n + 1 }, (_v, i) => [i, n]))
+    expect(landed).toEqual(ALL_RULES.map((r) => r.id))
+    // Evaluated and not-evaluated rules alike: both kinds are in this pass.
+    expect(runsFor('fs.orphan-media')?.status).toBe('evaluated')
+    expect(runsFor('dupe.identical-file')?.status).toBe('not-evaluated')
+  })
+
+  it('reports the same counts as one pass over every rule', async () => {
+    staleItem('old', '/mnt/m/old.mkv')
+    mediaFile('/mnt/m/old.mkv')
+    mediaFile('/mnt/m/new.mkv', 5_000_000_000)
+    const priors = { jellyfin: completed({ items: 1 }), filesystem: completed({ entries: 2 }) }
+    const res = await rulesPhase.run(ctx(priors))
+    const availability = availableSources(db, priors)
+
+    // The same scan replayed through one runRules call over the registry: every finding is
+    // re-emitted, so nothing is created that the phase did not, and nothing is resolved.
+    const once = runRules({
+      db, config: fileConfigSchema.parse({}), scanId: 2,
+      availableSources: availability.sources, sourceReasons: availability.reasons,
+    })
+    expect(res.counts).toEqual({
+      created: once.created, resolved: 0, reopened: 0, notEvaluated: once.notEvaluated.length,
+    })
   })
 })

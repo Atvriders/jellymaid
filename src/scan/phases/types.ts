@@ -2,7 +2,7 @@ import type { Db } from '../../index/db.js'
 import type { PathMap } from '../../fs/pathmap.js'
 import type { FileConfig } from '../../config/schema.js'
 import type { JellyfinClient } from '../../connectors/jellyfin.js'
-import type { QbitClient } from '../../connectors/qbittorrent.js'
+import type { QbitClients } from '../../connectors/qbittorrent.js'
 import type { ArrClient } from '../../connectors/arr.js'
 import type { createHasher } from '../../fs/hasher.js'
 
@@ -12,10 +12,19 @@ export interface ScanDeps {
   config: FileConfig
   pathMap: PathMap
   jellyfin: JellyfinClient | null
-  qbittorrent: QbitClient | null
+  qbittorrents: QbitClients          // REPLACES qbittorrent
   radarr: ArrClient | null
   sonarr: ArrClient | null
   hasher: ReturnType<typeof createHasher> | null
+  /**
+   * Instances whose long-lived main-thread client is holding off logging in (QbitClient.loginBlocked,
+   * read by the runner as the scan starts — Ruling 18). The qbittorrent phase treats them as failed
+   * without asking them anything: the clients above are built fresh for this scan and remember no
+   * refusal, so asking would spend another failed login towards qBittorrent's one-hour ban on every
+   * scan. They stay in `qbittorrents` all the same — still configured, so their rows are kept as
+   * unobserved rather than dropped. Absent = none.
+   */
+  qbitLoginBlocked?: ReadonlySet<string>
 }
 
 export interface PhaseContext {

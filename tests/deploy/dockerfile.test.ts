@@ -52,6 +52,12 @@ describe('Dockerfile', () => {
 })
 
 describe('docker-compose.yml', () => {
+  it('describes the qBittorrent login cap as the code has it: two refusals in a row stop logins until a restart (final review m1)', () => {
+    const c = compose().replace(/#/g, '').replace(/\s+/g, ' ')
+    expect(c).toMatch(/two refused logins in a row|refused twice in a row|two refusals in a row/i)
+    expect(c).toMatch(/restart/i)
+  })
+
   it('references the public GHCR image', () => {
     expect(compose()).toContain('ghcr.io/atvriders/jellymaid')
   })
@@ -61,7 +67,9 @@ describe('docker-compose.yml', () => {
   })
 
   it('documents every required environment variable', () => {
-    for (const key of ['JELLYFIN_URL', 'JELLYFIN_API_KEY', 'QBIT_URL', 'QBIT_USER', 'QBIT_PASS']) {
+    // QBIT_INSTANCES replaced QBIT_URL/QBIT_USER/QBIT_PASS as the way to name qBittorrent;
+    // credentials are per instance and optional, so none of them is "required" any more.
+    for (const key of ['JELLYFIN_URL', 'JELLYFIN_API_KEY', 'QBIT_INSTANCES']) {
       expect(compose()).toContain(key)
     }
   })
@@ -69,6 +77,43 @@ describe('docker-compose.yml', () => {
   it('mounts media read-write, since Jellymaid must remove empty folders and leftover links', () => {
     expect(compose()).toMatch(/\/mnt\/media/)
     expect(compose()).not.toMatch(/\/mnt\/media:ro/)
+  })
+
+  it('runs under Docker\'s init (init: true): SIGTERM from `docker stop` must reach Jellymaid, and orphans must be reaped', () => {
+    expect(compose()).toMatch(/^ {4}init: true\s*$/m)
+  })
+
+  it('defaults PUID/PGID to Unraid\'s nobody:users (99:100), not the image\'s own 1000:1000', () => {
+    expect(compose()).toContain('user: "${PUID:-99}:${PGID:-100}"')
+    expect(compose()).not.toMatch(/\$\{P[UG]ID:-1000\}/)
+  })
+
+  it('maps /data to a placeholder appdata directory rather than a relative ./data', () => {
+    expect(compose()).toMatch(/^\s+- \/path\/to\/appdata\/jellymaid:\/data\s*$/m)
+    expect(compose()).not.toMatch(/-\s+\.\/data:\/data/)
+  })
+
+  it('leaves Radarr and Sonarr out of the live environment — they appear only in a commented, optional block', () => {
+    const text = compose()
+    // No uncommented line mentions them at all...
+    const live = text.split('\n').filter((l) => !l.trim().startsWith('#')).join('\n')
+    expect(live).not.toMatch(/RADARR|SONARR/)
+    // ...but an operator who runs them can uncomment a ready pair.
+    for (const key of ['RADARR_URL', 'RADARR_API_KEY', 'SONARR_URL', 'SONARR_API_KEY']) {
+      expect(text, `${key} should be offered in the commented optional block`).toMatch(new RegExp(`^\\s*#\\s+${key}: "`, 'm'))
+    }
+  })
+
+  it('explains the Unraid same-host auth caveat: a bridged container reaches a same-box qBittorrent from the Docker bridge, so the LAN bypass does not apply and that instance needs credentials', () => {
+    const comments = compose().split('\n').filter((l) => l.trim().startsWith('#')).join('\n')
+    expect(comments).toMatch(/same[- ](host|box|machine)/i)
+    expect(comments).toMatch(/bridge/i)
+    expect(comments).toMatch(/bypass/i)
+    expect(comments).toMatch(/credentials/i)
+  })
+
+  it('shows the percent-encoding rule for a comma in an embedded password', () => {
+    expect(compose()).toContain('%2C')
   })
 
   it('ships TRUST_PROXY "0" (CRITICAL 1) — the single service here is `ports: 8099:8099` with no proxy and no TLS in front of it; "1" would make the session cookie `secure` (permanent login loop over plain http://<host>:8099) and let a caller forge X-Forwarded-For to bypass the login lockout', () => {

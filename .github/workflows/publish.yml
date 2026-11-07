@@ -31,6 +31,60 @@ jobs:
           tags: |
             type=raw,value=latest
             type=sha,prefix=sha-,format=short
+
+      # SMOKE GATE. The registry must only ever see an image that has started at least once, and
+      # until now CI built it without ever running it (a broken better-sqlite3 build, a missing
+      # migration or a bad entrypoint would have shipped as `latest`). A multi-platform image
+      # cannot be loaded into the runner's Docker, so the image under test is built for the
+      # runner's own architecture only (no `platforms:` means exactly that), loaded, and started;
+      # its layers are written to the gha cache (`cache-to`), so the multi-architecture build
+      # further down reuses them, and a run whose push fails still saves them for the next run.
+      # Nothing is pushed before the step that polls /healthz has passed.
+      - name: Build the image for this runner's architecture (smoke test only, not pushed)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          push: false
+          tags: jellymaid:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Dummy settings pointing at addresses nothing answers (RFC 5737 TEST-NET-1): /healthz must
+      # come up anyway and report the connectors as degraded, because it answers 200 in either
+      # state. `curl -f` therefore asserts "the process booted, applied its migrations and serves
+      # HTTP", which is exactly what could not be seen before. The probes inside /healthz are cut
+      # off after a couple of seconds each, so a black-holed address does not stall the answer.
+      - name: Smoke test, start the image against no services and wait for /healthz
+        shell: bash
+        run: |
+          docker run -d --name jellymaid-smoke \
+            -e JELLYFIN_URL=http://192.0.2.1:8096 \
+            -e JELLYFIN_API_KEY=x \
+            -e QBIT_INSTANCES=box-a=http://192.0.2.1:8080 \
+            -p 8099:8099 \
+            jellymaid:smoke
+          deadline=$((SECONDS + 60))
+          until curl -fsS --max-time 5 localhost:8099/healthz; do
+            if [ "$(docker inspect -f '{{.State.Running}}' jellymaid-smoke)" != "true" ]; then
+              echo "::error::the container exited before /healthz answered"
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::/healthz did not answer within 60 seconds"
+              exit 1
+            fi
+            sleep 1
+          done
+          echo
+
+      - name: Smoke test, container log and cleanup
+        if: always()
+        shell: bash
+        run: |
+          docker logs jellymaid-smoke || true
+          docker rm -f jellymaid-smoke || true
+
       - uses: docker/build-push-action@v7
         with:
           context: .

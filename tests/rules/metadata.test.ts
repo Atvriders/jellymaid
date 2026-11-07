@@ -87,21 +87,34 @@ describe('meta.mixed-content', () => {
 })
 
 describe('meta.bad-naming', () => {
+  // Off by default (it flagged nearly every scene-named release in a real library), so every
+  // behaviour below is exercised with the rule switched on explicitly.
+  const on = fileConfigSchema.parse({ rules: { 'meta.bad-naming': { enabled: true } } })
+
+  it('bad-naming disabled by default emits no findings', () => {
+    // A scene-named movie folder and an episode with no SxxEyy token: both would be flagged if on.
+    item({ id: 'm', jf_path: '/media/Movies/Heat.1995.1080p.BluRay.x264-GRP/Heat.1995.1080p.BluRay.x264-GRP.mkv' })
+    item({ id: 'e', type: 'Episode', series_id: 's', season_no: 1, episode_no: 1, jf_path: '/media/TV/Show/ep1.mkv' })
+    expect(config.rules['meta.bad-naming'].enabled).toBe(false)
+    expect(rule('meta.bad-naming').run(ctx())).toEqual([])
+    expect(rule('meta.bad-naming').run(ctx(on))).toHaveLength(2)
+  })
+
   it('reports a movie whose folder omits the year', () => {
     item({ jf_path: '/media/Movies/Heat/Heat.mkv' })
-    expect(rule('meta.bad-naming').run(ctx())).toHaveLength(1)
+    expect(rule('meta.bad-naming').run(ctx(on))).toHaveLength(1)
   })
   it('accepts the conventional "Title (Year)" folder', () => {
     item({ jf_path: '/media/Movies/Heat (1995)/Heat (1995).mkv' })
-    expect(rule('meta.bad-naming').run(ctx())).toHaveLength(0)
+    expect(rule('meta.bad-naming').run(ctx(on))).toHaveLength(0)
   })
   it('reports an episode file with no SxxEyy token', () => {
     item({ id: 'e', type: 'Episode', series_id: 's', season_no: 1, episode_no: 1, jf_path: '/media/TV/Show/ep1.mkv' })
-    expect(rule('meta.bad-naming').run(ctx())).toHaveLength(1)
+    expect(rule('meta.bad-naming').run(ctx(on))).toHaveLength(1)
   })
   it('accepts a conventional episode filename', () => {
     item({ id: 'e', type: 'Episode', series_id: 's', season_no: 1, episode_no: 1, jf_path: '/media/TV/Show/Season 01/Show - S01E01.mkv' })
-    expect(rule('meta.bad-naming').run(ctx())).toHaveLength(0)
+    expect(rule('meta.bad-naming').run(ctx(on))).toHaveLength(0)
   })
   it('can be turned off in config', () => {
     item({ jf_path: '/media/Movies/Heat/Heat.mkv' })
@@ -110,17 +123,17 @@ describe('meta.bad-naming', () => {
   })
   it('accepts a house style the built-in movie pattern rejects, once configured', () => {
     item({ jf_path: '/media/Movies/Heat [1995]/Heat.mkv' })
-    expect(rule('meta.bad-naming').run(ctx())).toHaveLength(1)
+    expect(rule('meta.bad-naming').run(ctx(on))).toHaveLength(1)
     const cfg = fileConfigSchema.parse({
-      rules: { 'meta.bad-naming': { moviePattern: '\\[(?:19|20)\\d{2}\\]/[^/]+$' } },
+      rules: { 'meta.bad-naming': { enabled: true, moviePattern: '\\[(?:19|20)\\d{2}\\]/[^/]+$' } },
     })
     expect(rule('meta.bad-naming').run(ctx(cfg))).toHaveLength(0)
   })
   it('applies a configured episode pattern case-insensitively, like the built-in one', () => {
     item({ id: 'e', type: 'Episode', series_id: 's', season_no: 1, episode_no: 1, jf_path: '/media/TV/Show/Show 1x01.mkv' })
-    expect(rule('meta.bad-naming').run(ctx())).toHaveLength(1)
+    expect(rule('meta.bad-naming').run(ctx(on))).toHaveLength(1)
     const cfg = fileConfigSchema.parse({
-      rules: { 'meta.bad-naming': { episodePattern: '\\d{1,2}X\\d{1,3}' } },
+      rules: { 'meta.bad-naming': { enabled: true, episodePattern: '\\d{1,2}X\\d{1,3}' } },
     })
     expect(rule('meta.bad-naming').run(ctx(cfg))).toHaveLength(0)
   })

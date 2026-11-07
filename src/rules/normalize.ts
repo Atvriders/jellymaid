@@ -72,6 +72,74 @@ export function normalizeTitle(raw: string): string {
   return kept.join(' ').trim()
 }
 
+/**
+ * The editions `editionOf` recognises, in the one order a label lists them. Each pattern runs on a
+ * segment flattened to lowercase words (apostrophes dropped, every other separator a space), so
+ * `Directors.Cut`, `Director's Cut` and `DIRECTORS_CUT` read alike, and `\b` keeps "Ultimatum" from
+ * reading as "Ultimate".
+ */
+const EDITIONS: ReadonlyArray<readonly [label: string, pattern: RegExp]> = [
+  ['Extended', /\bextended\b/],
+  ["Director's Cut", /\bdirectors? cut\b/],
+  ['Unrated', /\bunrated\b/],
+  ['Theatrical', /\btheatrical\b/],
+  ['IMAX', /\bimax\b/],
+  ['Final Cut', /\bfinal cut\b/],
+  ['Ultimate', /\bultimate\b/],
+  ['Special Edition', /\bspecial edition\b/],
+  ['Remastered', /\bremaster(?:ed)?\b/],
+  ['Criterion', /\bcriterion\b/],
+]
+
+function editionsIn(segment: string): string | null {
+  const words = segment.toLowerCase().replace(/['’‘`ʼ]/g, '').replace(/[^a-z0-9]+/g, ' ')
+  const found = EDITIONS.filter(([, pattern]) => pattern.test(words)).map(([label]) => label)
+  return found.length ? found.join(', ') : null
+}
+
+/**
+ * The edition a release names — "Extended", "Director's Cut", … — or null when it names none.
+ *
+ * Every edition named is listed, comma-joined in `EDITIONS` order, rather than only the first: a
+ * "Remastered Director's Cut" is not the same release as a plain "Director's Cut", and collapsing it
+ * would make two different cuts compare equal, which is the one mistake `editionsDiffer` exists to
+ * prevent. A path is read by its file name first, then by its release folder (a torrent's video file
+ * is often named `grp-aliens-1080p.mkv` inside `Aliens.1986.Special.Edition.1080p/`); folders above
+ * that are libraries and shows, not releases, and are not read.
+ */
+export function editionOf(nameOrPath: string): string | null {
+  const segments = nameOrPath.split('/').filter(Boolean)
+  for (const segment of segments.slice(-2).reverse()) {
+    const found = editionsIn(segment)
+    if (found) return found
+  }
+  return null
+}
+
+/**
+ * `S01E01E02`, `S01E01-E02`, `S01E01-02` or `S01E01-S01E02`, and the `1x01x02`, `1x01-02` and
+ * `1x01-1x02` spellings: the season/episode token followed by a second, higher episode number. The
+ * end number must not run into another digit or a `p` (so `S01E01-1080p`, `S01E01-720p` and
+ * `S01E01-2019` are a resolution and a year, not episode 1080, 720 or 201), and the token must not
+ * start mid-word (so a `1920x1080` frame size never reads as season 20).
+ */
+const MULTI_EPISODE =
+  /(?<![a-z0-9])(?:s\d{1,4}e(\d{1,3})(?:-?e|-s\d{1,4}e|-)(\d{1,3})|\d{1,2}x(\d{1,3})(?:-\d{1,2}x|x|-)(\d{1,3}))(?![\dp])/gi
+
+/**
+ * Whether a file holds more than one episode, judged from its own file name (the last path
+ * segment) only — a season-pack folder named `Show.S01E01-E10` holds single episodes. Jellyfin
+ * knows the range (`IndexNumberEnd`) but the index does not keep it, so the name is the evidence.
+ */
+export function isMultiEpisodeFile(nameOrPath: string): boolean {
+  const name = nameOrPath.slice(nameOrPath.lastIndexOf('/') + 1)
+  for (const m of name.matchAll(MULTI_EPISODE)) {
+    const [first, last] = m[1] !== undefined ? [m[1], m[2]] : [m[3], m[4]]
+    if (Number(last) > Number(first)) return true
+  }
+  return false
+}
+
 function trigrams(s: string): Set<string> {
   const padded = `  ${s} `
   const out = new Set<string>()

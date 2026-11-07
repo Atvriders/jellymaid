@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { App } from '../src/App.js'
 import { ApiError } from '../src/api.js'
@@ -64,8 +64,9 @@ describe('App', () => {
   // those screens feed must survive being lifted up into App and handed back down to Plan.
 
   const planStub = (over: Partial<PlanView> = {}): PlanView => ({
-    id: 'p1', status: 'draft', createdBy: 'bob', createdAt: 'T', approvedBy: null,
+    id: 'p1', status: 'draft', createdBy: 'bob', createdAt: 'T', approvedBy: null, error: null,
     dryRun: { deleteCount: 1, bytesFreed: 0, torrentsRemoved: 0, blockedCount: 0 },
+    progress: { total: 1, finished: 0 }, droppedOverrides: [],
     actions: [{
       id: 'a1', seq: 0, type: 'delete-media', status: 'pending',
       payload: { type: 'delete-media', targetPath: '/mnt/m/Orphan.mkv' }, guardVerdicts: [], error: null, isAlternateVersion: null,
@@ -73,34 +74,53 @@ describe('App', () => {
     ...over,
   })
 
+  /** What GET /api/plans/:id reports once the background run of `planStub` has finished. */
+  const executedStub = (): PlanView => {
+    const base = planStub()
+    return { ...base, status: 'completed', progress: { total: 1, finished: 1 }, actions: base.actions.map((a) => ({ ...a, status: 'done' })) }
+  }
+
   /** Every method any of the seven screens could call, once, so a test that walks the whole nav
    * bar never hits an undefined function. Individual tests override only what they need.
-   * `approvePlan`/`executePlan` transition status the same way the real routes do (draft ->
-   * approved -> completed), rather than echoing back a fixed 'draft' plan forever — a test that
-   * clicks Approve then Execute needs the mock to actually move for the Execute button to ever
-   * appear, the same as it would need the real server to. */
-  const fullApi = (over: Record<string, unknown> = {}) => api({
+   * The plan routes share one piece of state and move it the way the real routes do — build ->
+   * draft, approve -> approved, execute -> 202 with the run finished by the time the plan is next
+   * read — so a test that clicks Approve then Execute sees what it would see against the server. */
+  const fullApi = (over: Record<string, unknown> = {}) => {
+    let current: PlanView | null = null
+    return api({
     findings: vi.fn(async () => ({ findings: [], total: 0 })),
     dismissFinding: vi.fn(async () => ({ ok: true as const })),
-    duplicates: vi.fn(async () => ({ groups: [] })),
+    duplicates: vi.fn(async () => ({ evaluated: true, reason: null, scanId: null, scanFinishedAt: null, groups: [] })),
     mergeGroup: vi.fn(async () => ({ merged: [] })),
     explorer: vi.fn(async () => ({ path: '', parent: null, entries: [] })),
-    createPlan: vi.fn(async () => planStub()),
-    getPlan: vi.fn(async () => planStub({ status: 'approved' })),
-    approvePlan: vi.fn(async () => planStub({ status: 'approved' })),
-    executePlan: vi.fn(async () => ({ planId: 'p1', status: 'completed' as const, done: 1, failed: 0, skipped: 0, blocked: 0, bytesFreed: 1_048_576 })),
+    createPlan: vi.fn(async () => (current = planStub())),
+    getPlan: vi.fn(async () => current ?? planStub({ status: 'approved' })),
+    approvePlan: vi.fn(async () => (current = planStub({ status: 'approved' }))),
+    executePlan: vi.fn(async () => {
+      current = executedStub()
+      return { planId: 'p1', status: 'running' as const }
+    }),
     resumePlan: vi.fn(async () => ({ planId: 'p1', status: 'completed' as const, done: 1, failed: 0, skipped: 0, blocked: 0, bytesFreed: 0 })),
     plans: vi.fn(async () => ({ plans: [] })),
     audit: vi.fn(async () => ({ entries: [] })),
     restoreTrash: vi.fn(async () => ({ restored: true })),
     trash: vi.fn(async () => ({ entries: [] })),
-    pathmapGet: vi.fn(async () => ({ mappings: [] })),
-    pathmapPut: vi.fn(async (mappings: unknown[]) => ({ mappings })),
-    pathmapVerify: vi.fn(async () => ({ sampled: 0, resolved: 0, failures: [] })),
-    pathmapDetect: vi.fn(async () => ({ proposed: [] })),
+    pathmapGet: vi.fn(async () => ({ mappings: [], problems: [], lastVerification: null })),
+    pathmapPut: vi.fn(async (mappings: unknown[]) => ({ mappings, problems: [], lastVerification: null })),
+    pathmapVerify: vi.fn(async () => ({
+      at: 'T', mappingsHash: 'h', current: true, jellyfin: { sampled: 0, resolved: 0, failures: [] }, qbit: [],
+    })),
+    pathmapDetect: vi.fn(async () => ({ proposals: [] })),
+    qbitInstances: vi.fn(async () => ({ instances: [] })),
+    settings: vi.fn(async () => ({
+      guards: { minRatio: 1, minSeedTimeDays: 14, protectedCategories: [], protectedTags: [], privateTrackerHosts: [] },
+      keeper: { policy: 'best-quality' }, trash: { maxBytes: 1, retentionDays: 30 },
+    })),
+    saveSettings: vi.fn(async () => { throw new Error('not expected in these tests') }),
     me: vi.fn(async () => ({ username: 'bob', userId: 'u1' })),
     ...over,
-  })
+    })
+  }
 
   it('renders the real screen for every nav item, never the placeholder', async () => {
     render(<App api={fullApi()} />)
@@ -327,6 +347,104 @@ describe('App', () => {
       { type: 'delete-media', targetPath: '/mnt/m/Orphan.mkv' },
       { type: 'delete-junk-file', targetPath: '/mnt/m/sample.mkv' },
     ])
+  })
+
+  // --- Plan 7: the queue outlives a page reload, and never depends on storage working ------------
+  // A queue of hundreds of duplicate deletes built over an evening must not evaporate on a reload,
+  // but `localStorage` is a convenience, never a dependency: a private window or blocked site data
+  // makes even touching `window.localStorage` throw, and the app must then simply keep the queue in
+  // memory.
+  const orphanAt = (path: string): Finding => ({
+    id: `f-${path}`, ruleId: 'fs.orphan-media', class: 'filesystem', severity: 'warning', confidence: 'strong',
+    subjects: [{ kind: 'path', path, label: path.split('/').pop() ?? path }],
+    evidence: {}, reclaimableBytes: 1_000, status: 'open', firstSeen: 'T', lastSeen: 'T',
+    dismissedReason: null, dismissedBy: null,
+  })
+
+  async function queueFromFindings() {
+    await screen.findByRole('button', { name: /sign out/i })
+    await userEvent.click(screen.getByRole('button', { name: /^findings$/i }))
+    await userEvent.click(await screen.findByRole('checkbox', { name: /select finding/i }))
+    await userEvent.click(screen.getByRole('button', { name: /add to plan/i }))
+  }
+
+  it('queue survives a reload via localStorage and tolerates storage that throws', async () => {
+    const findings = vi.fn(async () => ({ findings: [orphanAt('/movies/Orphan.mkv')], total: 1 }))
+    const first = render(<App api={fullApi({ findings })} />)
+    await queueFromFindings()
+    first.unmount()
+
+    // A fresh App is what a page reload produces: nothing carried over in memory.
+    const second = render(<App api={fullApi({ findings })} />)
+    await screen.findByRole('button', { name: /sign out/i })
+    await userEvent.click(screen.getByRole('button', { name: /^plan$/i }))
+    expect(await screen.findByText(/1 action queued/i)).toBeInTheDocument()
+    expect(screen.getByText('/movies/Orphan.mkv')).toBeInTheDocument()
+    second.unmount()
+
+    // Now storage that throws the moment anything touches it.
+    const original = Object.getOwnPropertyDescriptor(window, 'localStorage')
+    Object.defineProperty(window, 'localStorage', {
+      configurable: true,
+      get() { throw new DOMException('The operation is insecure.', 'SecurityError') },
+    })
+    try {
+      render(<App api={fullApi({ findings: vi.fn(async () => ({ findings: [orphanAt('/movies/Other.mkv')], total: 1 })) })} />)
+      await queueFromFindings()
+      await userEvent.click(screen.getByRole('button', { name: /^plan$/i }))
+      // Nothing could be read back, so only what this session queued — held in memory — is there.
+      expect(await screen.findByText(/1 action queued/i)).toBeInTheDocument()
+      expect(screen.getByText('/movies/Other.mkv')).toBeInTheDocument()
+    } finally {
+      if (original) Object.defineProperty(window, 'localStorage', original)
+    }
+  })
+
+  it('ignores a stored queue it cannot trust instead of crashing or queueing it', async () => {
+    localStorage.setItem('jellymaid.queue.v1', '{not json')
+    const first = render(<App api={fullApi()} />)
+    await screen.findByRole('button', { name: /sign out/i })
+    await userEvent.click(screen.getByRole('button', { name: /^plan$/i }))
+    expect(await screen.findByText(/nothing queued/i)).toBeInTheDocument()
+    first.unmount()
+
+    // Valid JSON, but only one entry is an action this client could have queued itself.
+    localStorage.setItem('jellymaid.queue.v1', JSON.stringify([
+      { type: 'delete-media', targetPath: '/movies/Keep-me-queued.mkv' },
+      { type: 'format-disk', targetPath: '/movies' },
+      { type: 'delete-media' },
+      { type: 'delete-media', targetPath: 42 },
+      'delete-media',
+    ]))
+    render(<App api={fullApi()} />)
+    await screen.findByRole('button', { name: /sign out/i })
+    await userEvent.click(screen.getByRole('button', { name: /^plan$/i }))
+    expect(await screen.findByText(/1 action queued/i)).toBeInTheDocument()
+    expect(screen.getByText('/movies/Keep-me-queued.mkv')).toBeInTheDocument()
+  })
+
+  it('shows a duplicate copy queued from another screen as already queued on Duplicates', async () => {
+    const copy = (id: string, path: string) => ({
+      id, name: 'Heat', containerPath: path, sizeBytes: 1, width: null, height: 1080, bitrate: null, videoCodec: null,
+      audioChannels: null, container: 'mkv', libraryName: 'Movies', videoRange: null, hasSubtitles: false, edition: null,
+      instanceId: 'box-a', torrent: null, torrentCount: 0,
+    })
+    render(<App api={fullApi({
+      findings: vi.fn(async () => ({ findings: [orphanAt('/movies/Heat-1080.mkv')], total: 1 })),
+      duplicates: vi.fn(async () => ({
+        evaluated: true, reason: null, scanId: 1, scanFinishedAt: 'T',
+        groups: [{
+          id: 'g1', tier: 'exact', matchedBy: ['dupe.identical-file'], keeperItemId: 'b', keeperPolicy: 'best-quality',
+          title: 'Heat', year: 1995, kind: 'movie', seriesName: null, seasonNo: null, episodeNo: null,
+          editionsDiffer: false, multiEpisode: false, crossInstance: false, reclaimableBytes: 1, scores: {},
+          members: [copy('a', '/movies/Heat-1080.mkv'), copy('b', '/movies/Heat-2160.mkv')],
+        }],
+      })),
+    })} />)
+    await queueFromFindings()
+    await userEvent.click(screen.getByRole('button', { name: /^duplicates$/i }))
+    const row = (await screen.findByText('/movies/Heat-1080.mkv')).closest('tr')!
+    expect(within(row).getByText('queued')).toBeInTheDocument()
   })
 
   it('de-duplicates the same queued action even when it is added again after a screen remount reset the local "already queued" receipt', async () => {

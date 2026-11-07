@@ -33,7 +33,7 @@ describe('Explorer', () => {
     })
     render(<Explorer api={api({ explorer })} onQueue={() => {}} />)
     await userEvent.click(await screen.findByRole('button', { name: /mnt\/m/ }))
-    expect(explorer).toHaveBeenCalledWith('/mnt/m')
+    expect(explorer).toHaveBeenCalledWith('/mnt/m', { offset: 0, limit: 500 })
     expect(await screen.findByText('Heat.mkv')).toBeInTheDocument()
   })
 
@@ -56,7 +56,7 @@ describe('Explorer', () => {
     await userEvent.click(await screen.findByRole('button', { name: 'Heat' }))
     const upButton = await screen.findByRole('button', { name: /up/i })
     await userEvent.click(upButton)
-    expect(explorer).toHaveBeenLastCalledWith('/mnt/m')
+    expect(explorer).toHaveBeenLastCalledWith('/mnt/m', { offset: 0, limit: 500 })
   })
 
   it('renders a flag chip for a flagged entry', async () => {
@@ -91,6 +91,68 @@ describe('Explorer', () => {
     })} onQueue={() => {}} />)
     await screen.findByText('Heat.mkv')
     expect(screen.queryByRole('checkbox')).not.toBeInTheDocument()
+  })
+})
+
+describe('Explorer paging', () => {
+  // A flat downloads directory can hold thousands of entries; the server pages it (C12: offset,
+  // limit, total) and the screen must say how much there is and let the operator walk it.
+  const paged = vi.fn(async (path?: string, page: { offset?: number; limit?: number } = {}) => {
+    if (!path) return { path: '', parent: null, entries: [rootEntry({ name: '/downloads', path: '/downloads' })] }
+    const offset = page.offset ?? 0
+    const limit = page.limit ?? 500
+    return {
+      path: '/downloads', parent: null, total: 1_200, offset, limit,
+      entries: [offset, offset + 1].map((n) => fileEntry({ name: `f${n}.mkv`, path: `/downloads/f${n}.mkv` })),
+    }
+  })
+
+  it('explorer pages with offset/limit and shows the total', async () => {
+    render(<Explorer api={api({ explorer: paged })} onQueue={() => {}} />)
+    await userEvent.click(await screen.findByRole('button', { name: '/downloads' }))
+    expect(paged).toHaveBeenLastCalledWith('/downloads', { offset: 0, limit: 500 })
+    expect(await screen.findByText(/1–500 of 1,200 entries/)).toBeInTheDocument()
+    expect(screen.getByText('f0.mkv')).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: /^next$/i }))
+    expect(paged).toHaveBeenLastCalledWith('/downloads', { offset: 500, limit: 500 })
+    expect(await screen.findByText(/501–1,000 of 1,200 entries/)).toBeInTheDocument()
+    expect(screen.getByText('f500.mkv')).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: /^next$/i }))
+    expect(await screen.findByText(/1,001–1,200 of 1,200 entries/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^next$/i })).toBeDisabled()
+  })
+
+  it('starts a newly opened directory from its first page', async () => {
+    render(<Explorer api={api({ explorer: paged })} onQueue={() => {}} />)
+    await userEvent.click(await screen.findByRole('button', { name: '/downloads' }))
+    await userEvent.click(await screen.findByRole('button', { name: /^next$/i }))
+    await screen.findByText(/501–1,000 of 1,200 entries/)
+    await userEvent.click(screen.getByRole('button', { name: /^roots$/i }))
+    await userEvent.click(await screen.findByRole('button', { name: '/downloads' }))
+    expect(paged).toHaveBeenLastCalledWith('/downloads', { offset: 0, limit: 500 })
+    expect(await screen.findByText(/1–500 of 1,200 entries/)).toBeInTheDocument()
+  })
+
+  it('keeps a selection made on one page when the operator pages on', async () => {
+    const onQueue = vi.fn()
+    const flagged = vi.fn(async (_path?: string, page: { offset?: number; limit?: number } = {}) => {
+      const offset = page.offset ?? 0
+      return {
+        path: '/downloads', parent: null, total: 1_000, offset, limit: page.limit ?? 500,
+        entries: [fileEntry({ name: `junk${offset}.nfo`, path: `/downloads/junk${offset}.nfo`, flags: ['junk'] })],
+      }
+    })
+    render(<Explorer api={api({ explorer: flagged })} onQueue={onQueue} />)
+    await userEvent.click(await screen.findByRole('checkbox', { name: /select junk0\.nfo/i }))
+    await userEvent.click(screen.getByRole('button', { name: /^next$/i }))
+    await userEvent.click(await screen.findByRole('checkbox', { name: /select junk500\.nfo/i }))
+    await userEvent.click(screen.getByRole('button', { name: /add to plan/i }))
+    expect(onQueue).toHaveBeenCalledWith([
+      { type: 'delete-junk-file', targetPath: '/downloads/junk0.nfo' },
+      { type: 'delete-junk-file', targetPath: '/downloads/junk500.nfo' },
+    ])
   })
 })
 

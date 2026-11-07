@@ -12,17 +12,40 @@ const absolutePath = z.string().min(1).refine((p) => p.startsWith('/'), {
   message: 'must be an absolute path starting with /',
 })
 
+/**
+ * A qBittorrent instance id. It appears in env var names (`QBIT_<ID>_USER`), in mapping rows and in
+ * index keys, so it is kept to a spelling that is safe in all three: lowercase, digits and `-`.
+ */
+export const QBIT_INSTANCE_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,31}$/
+
+export const qbitInstanceSchema = z.object({
+  id: z.string().regex(QBIT_INSTANCE_ID_PATTERN),
+  url: z.string().url(), // credentials stripped
+  user: z.string().min(1).nullable(),
+  pass: z.string().min(1).nullable(),
+})
+
+export type QbitInstanceConfig = z.infer<typeof qbitInstanceSchema>
+
 export const pathMappingSchema = z.object({
   role: z.enum(['library', 'download']),
   jellyfin: absolutePath.nullable(),
   container: absolutePath,
   qbit: absolutePath.nullable(),
+  // Optional on the way in so a config.json written before multi-instance support still loads;
+  // `normalizeMappings` decides what a missing instance means (src/fs/pathmap.ts).
+  qbitInstance: z.string().regex(QBIT_INSTANCE_ID_PATTERN).nullable().default(null),
 }).superRefine((m, ctx) => {
   if (m.role === 'library' && m.jellyfin === null) {
     ctx.addIssue({ code: 'custom', message: 'library mappings require a jellyfin path' })
   }
   if (m.role === 'download' && m.jellyfin !== null) {
     ctx.addIssue({ code: 'custom', message: 'download mappings must set jellyfin to null' })
+  }
+  // An instance with no prefix of its own cannot translate anything, and reads as "this root is
+  // torrent-backed" while every lookup through it fails — say so at the door instead.
+  if (m.qbitInstance !== null && m.qbit === null) {
+    ctx.addIssue({ code: 'custom', path: ['qbitInstance'], message: 'qbitInstance requires a qbit path prefix' })
   }
   // A merely-textual check against the literal string "/" is not enough: "/..", "//", and
   // "/mnt/../.." all pass `startsWith('/')` and all NORMALIZE to "/" once resolved, so any of
@@ -56,9 +79,13 @@ export const fileConfigSchema = z.object({
     maxBytes: z.number().int().min(0).default(1_073_741_824),
     retentionDays: z.number().int().min(1).default(30),
   }).default({}),
+  // Which copy of a duplicate is pre-selected to KEEP. `none` leaves the choice to the operator.
+  keeper: z.object({
+    policy: z.enum(['best-quality', 'smallest', 'none']).default('best-quality'),
+  }).default({}),
   rateLimits: z.object({
     jellyfin: z.object({ concurrency: z.number().int().min(1).default(4), minDelayMs: z.number().int().min(0).default(50) }).default({}),
-    qbittorrent: z.object({ concurrency: z.number().int().min(1).default(2), minDelayMs: z.number().int().min(0).default(100) }).default({}),
+    qbittorrent: z.object({ concurrency: z.number().int().min(1).default(4), minDelayMs: z.number().int().min(0).default(25) }).default({}),
     arr: z.object({ concurrency: z.number().int().min(1).default(2), minDelayMs: z.number().int().min(0).default(100) }).default({}),
   }).default({}),
   rules: z.object({
@@ -111,9 +138,11 @@ export const fileConfigSchema = z.object({
     // folder and an `S01E01` episode token — and flagged every library organized any other way,
     // every scan, with no way to correct or silence them. `moviePattern` is matched
     // case-sensitively (it only concerns digits and brackets) and `episodePattern`
-    // case-insensitively, preserving each expression's original behaviour exactly.
+    // case-insensitively, preserving each expression's original behaviour exactly. Off by default:
+    // against a real library of scene-named releases it flagged 5,416 of 5,417 items, which is
+    // noise, not a finding.
     'meta.bad-naming': z.object({
-      enabled: z.boolean().default(true),
+      enabled: z.boolean().default(false),
       moviePattern: z.string().default('\\((?:19|20)\\d{2}\\)/[^/]+$'),
       episodePattern: z.string().default('s\\d{1,2}[ ._-]?e\\d{1,3}'),
     }).default({}),
@@ -121,6 +150,7 @@ export const fileConfigSchema = z.object({
 })
 
 export type FileConfig = z.infer<typeof fileConfigSchema>
+export type KeeperPolicy = 'best-quality' | 'smallest' | 'none'
 
 const arrSchema = z.object({ url: z.string().url(), apiKey: z.string().min(1) })
 
@@ -136,7 +166,12 @@ export const envConfigSchema = z.object({
   trustProxy: z.number().int().min(0).default(0),
   sessionSecret: z.string().min(16),
   jellyfin: z.object({ url: z.string().url(), apiKey: z.string().min(1) }),
-  qbittorrent: z.object({ url: z.string().url(), user: z.string().min(1), pass: z.string().min(1) }),
+  // Every instance is addressed by its id from here on — in mappings, index keys and deletes — so
+  // two entries sharing one would make "the instance that owns this torrent" ambiguous.
+  qbittorrents: z.array(qbitInstanceSchema).min(1).refine(
+    (instances) => new Set(instances.map((i) => i.id)).size === instances.length,
+    { message: 'qBittorrent instance ids must be unique' },
+  ),
   radarr: arrSchema.nullable(),
   sonarr: arrSchema.nullable(),
 })

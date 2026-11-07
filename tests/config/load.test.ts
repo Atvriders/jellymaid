@@ -29,14 +29,42 @@ describe('loadConfig', () => {
     expect(cfg.file.pathMappings).toEqual([])
   })
 
-  it('reports every missing required secret in one error', () => {
+  it('reports every missing required setting in one error', () => {
     let caught: unknown
     try { loadConfig({ DATA_DIR: dir }) } catch (e) { caught = e }
     expect(caught).toBeInstanceOf(ConfigError)
     const msg = (caught as ConfigError).message
-    for (const k of ['JELLYFIN_URL', 'JELLYFIN_API_KEY', 'QBIT_URL', 'QBIT_USER', 'QBIT_PASS']) {
+    for (const k of ['JELLYFIN_URL', 'JELLYFIN_API_KEY', 'QBIT_INSTANCES', 'QBIT_URL']) {
       expect(msg).toContain(k)
     }
+    // qBittorrent credentials are optional now: an instance that bypasses auth for this host needs none.
+    expect(msg).not.toContain('QBIT_USER is required')
+    expect(msg).not.toContain('QBIT_PASS is required')
+  })
+
+  it('defaults the keeper policy to best-quality, bad-naming to off, and qBittorrent to 4 concurrent / 25ms', () => {
+    const cfg = loadConfig(baseEnv())
+    expect(cfg.file.keeper).toEqual({ policy: 'best-quality' })
+    expect(cfg.file.rules['meta.bad-naming'].enabled).toBe(false)
+    expect(cfg.file.rateLimits.qbittorrent).toEqual({ concurrency: 4, minDelayMs: 25 })
+  })
+
+  it('reads a mapping without qbitInstance as qbitInstance null', () => {
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({
+      pathMappings: [{ role: 'download', jellyfin: null, container: '/path/to/dl', qbit: '/downloads' }],
+    }))
+    expect(loadConfig(baseEnv()).file.pathMappings[0]!.qbitInstance).toBeNull()
+  })
+
+  it('rejects a qbitInstance without a qbit prefix, and an instance id that breaks the id pattern', () => {
+    const withMapping = (m: unknown) => {
+      writeFileSync(join(dir, 'config.json'), JSON.stringify({ pathMappings: [m] }))
+      return () => loadConfig(baseEnv())
+    }
+    expect(withMapping({ role: 'download', jellyfin: null, container: '/path/to/dl', qbit: null, qbitInstance: 'box-a' }))
+      .toThrow(/qbitInstance/)
+    expect(withMapping({ role: 'download', jellyfin: null, container: '/path/to/dl', qbit: '/downloads', qbitInstance: 'Box_A' }))
+      .toThrow(ConfigError)
   })
 
   it('treats Radarr and Sonarr as optional', () => {
@@ -185,6 +213,38 @@ describe('saveConfig', () => {
     const b = tempConfigPath(dir)
     expect(a).not.toBe(b)
     expect(a).toMatch(/\.tmp$/)
+  })
+
+  it('merges guards one level deep, so patching one threshold keeps its siblings', () => {
+    saveConfig(dir, { guards: { minRatio: 1, minSeedTimeDays: 30, privateTrackerHosts: ['t.example'], protectedCategories: [], protectedTags: [] } })
+    const saved = saveConfig(dir, { guards: { minRatio: 2 } } as never)
+    expect(saved.guards.minRatio).toBe(2)
+    expect(saved.guards.minSeedTimeDays).toBe(30)
+    expect(saved.guards.privateTrackerHosts).toEqual(['t.example'])
+    expect(loadConfig(baseEnv()).file.guards.minSeedTimeDays).toBe(30)
+  })
+
+  it('merges trash, keeper, rateLimits and rules one level deep too, with arrays and nested objects replaced', () => {
+    saveConfig(dir, { rules: { 'fs.junk': { namePatterns: ['x'], extensions: ['.part'], directoryNames: ['proof'], zeroByteIsJunk: false } } } as never)
+    const saved = saveConfig(dir, {
+      trash: { retentionDays: 7 },
+      keeper: { policy: 'smallest' },
+      rateLimits: { qbittorrent: { concurrency: 1, minDelayMs: 500 } },
+      rules: { 'quality.biggest': { enabled: false, topN: 10 } },
+    } as never)
+    expect(saved.trash).toEqual({ maxBytes: 1_073_741_824, retentionDays: 7 })
+    expect(saved.keeper).toEqual({ policy: 'smallest' })
+    expect(saved.rateLimits.qbittorrent).toEqual({ concurrency: 1, minDelayMs: 500 })
+    expect(saved.rateLimits.jellyfin).toEqual({ concurrency: 4, minDelayMs: 50 })
+    // One level deep: the earlier fs.junk edit survives a patch that names only quality.biggest.
+    expect(saved.rules['fs.junk'].zeroByteIsJunk).toBe(false)
+    expect(saved.rules['quality.biggest']).toEqual({ enabled: false, topN: 10 })
+  })
+
+  it('replaces every other key wholesale, pathMappings included', () => {
+    saveConfig(dir, { pathMappings: [{ role: 'library', jellyfin: '/media/A', container: '/path/to/a', qbit: null, qbitInstance: null }] })
+    const saved = saveConfig(dir, { pathMappings: [{ role: 'library', jellyfin: '/media/B', container: '/path/to/b', qbit: null, qbitInstance: null }] })
+    expect(saved.pathMappings.map((m) => m.container)).toEqual(['/path/to/b'])
   })
 
   it('rejects an invalid patch as a ConfigError, not a raw ZodError', () => {

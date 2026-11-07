@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { Api, FindingClass } from '../api.js'
+import type { Api, FindingClass, HealthView } from '../api.js'
 import { ApiError, FINDING_CLASSES } from '../api.js'
 import { useAsync, usePolling } from '../hooks.js'
 import { Bytes, NotEvaluatedNotice, EmptyState } from '../components/index.js'
@@ -13,11 +13,30 @@ const CLASS_LABEL: Record<FindingClass, string> = {
   quality: 'Quality',
 }
 
-/** Same escalating-weight tag vocabulary as everywhere else: 'ok' is a quiet pass, anything else
- * (unreachable, degraded, ...) reads as a block, because a connector that is not reachable is not
- * a matter of degree for an operator about to trust a scan against it. */
+/** Same escalating-weight tag vocabulary as everywhere else: 'ok' is a quiet pass, and anything
+ * else (unreachable, auth, timeout, ...) reads as a block, because a connector that is not
+ * reachable is not a matter of degree for an operator about to trust a scan against it. The one
+ * exception is `not-configured`: an optional connector the operator chose not to set up is a
+ * choice, not a fault — /healthz itself never counts it as degraded — so it reads as quiet. */
 function connectorTagClass(status: string): string {
-  return status === 'ok' ? 'tag tag-ok' : 'tag tag-block'
+  if (status === 'ok') return 'tag tag-ok'
+  if (status === 'not-configured') return 'tag tag-quiet'
+  return 'tag tag-block'
+}
+
+/**
+ * The connector rows /healthz describes. Since Plan 7 `connectors` also carries `qbitInstances`,
+ * one entry per qBittorrent instance, beside the plain status strings; each instance gets its own
+ * row, with its version or its error, and the single worst-of `qbittorrent` entry (kept by the
+ * server for older callers) is left out when they are there — a dead box B must never hide behind
+ * a summary row, nor be listed twice. A server that reports no instances still gets its one row.
+ */
+function connectorRows(connectors: HealthView['connectors']) {
+  const instances = connectors.qbitInstances
+  const plain = Object.entries(connectors).filter(
+    (entry): entry is [string, string] => typeof entry[1] === 'string' && !(instances && entry[0] === 'qbittorrent'),
+  )
+  return { plain, instances: instances ? Object.entries(instances) : [] }
 }
 
 interface ScanRefusal {
@@ -127,16 +146,30 @@ export function Dashboard({ api }: { api: DashboardApi }) {
         {health.error ? (
           <p className="alert" role="alert"><span>{health.error}</span></p>
         ) : health.data ? (
-          <ul className="connector-list">
-            {Object.entries(health.data.connectors).map(([name, connStatus]) => (
-              <li key={name} className="connector">
-                {/* Connector names come from this app's own config, but the status string is
-                    reported by the connector itself — both render as text nodes only. */}
-                <span className="connector-name">{name}</span>
-                <span className={connectorTagClass(connStatus)}>{connStatus}</span>
-              </li>
-            ))}
-          </ul>
+          (() => {
+            const { plain, instances } = connectorRows(health.data.connectors)
+            return (
+              <ul className="connector-list">
+                {plain.map(([name, connStatus]) => (
+                  <li key={name} className="connector">
+                    {/* Connector names come from this app's own config, but the status string is
+                        reported by the connector itself — both render as text nodes only. */}
+                    <span className="connector-name">{name}</span>
+                    <span className={connectorTagClass(connStatus)}>{connStatus}</span>
+                  </li>
+                ))}
+                {instances.map(([id, inst]) => (
+                  <li key={`qbit-${id}`} className="connector">
+                    <span className="connector-name">qBittorrent {id}</span>
+                    <span className={connectorTagClass(inst.status)}>{inst.status}</span>
+                    {/* Version and error text come from the instance itself — text nodes only. */}
+                    {inst.version ? <span className="connector-detail">{inst.version}</span> : null}
+                    {inst.error ? <span className="connector-detail">{inst.error}</span> : null}
+                  </li>
+                ))}
+              </ul>
+            )
+          })()
         ) : (
           <EmptyState>Checking connectors…</EmptyState>
         )}

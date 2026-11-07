@@ -59,4 +59,36 @@ describe('pickKeeper', () => {
     const { scores } = pickKeeper([facts({ itemId: 'a' }), facts({ itemId: 'b' })], DEFAULT_KEEPER_WEIGHTS)
     expect(Object.keys(scores).sort()).toEqual(['a', 'b'])
   })
+
+  it('keeper policy smallest and none', () => {
+    const uhd = facts({ itemId: 'uhd', height: 2160, sizeBytes: 40_000_000_000 })
+    const hd = facts({ itemId: 'hd', height: 1080, sizeBytes: 8_000_000_000 })
+
+    expect(pickKeeper([uhd, hd], DEFAULT_KEEPER_WEIGHTS, 'best-quality').keeperId).toBe('uhd')
+    expect(pickKeeper([uhd, hd], DEFAULT_KEEPER_WEIGHTS, 'smallest').keeperId).toBe('hd')
+
+    const none = pickKeeper([uhd, hd], DEFAULT_KEEPER_WEIGHTS, 'none')
+    expect(none.keeperId).toBeNull()
+    // The operator picks — from the same comparison the other policies show.
+    expect(Object.keys(none.scores).sort()).toEqual(['hd', 'uhd'])
+  })
+
+  it('defaults to best quality', () => {
+    const uhd = facts({ itemId: 'uhd', height: 2160, sizeBytes: 40_000_000_000 })
+    const hd = facts({ itemId: 'hd', height: 1080, sizeBytes: 8_000_000_000 })
+    expect(pickKeeper([uhd, hd], DEFAULT_KEEPER_WEIGHTS).keeperId).toBe('uhd')
+  })
+
+  it('smallest never keeps a copy whose size is unknown or zero, and breaks a size tie by quality', () => {
+    const unknown = facts({ itemId: 'unknown', sizeBytes: null })
+    const empty = facts({ itemId: 'empty', sizeBytes: 0 })
+    const real = facts({ itemId: 'real', sizeBytes: 5_000_000_000 })
+    expect(pickKeeper([unknown, empty, real], DEFAULT_KEEPER_WEIGHTS, 'smallest').keeperId).toBe('real')
+    // No copy with a known size: there is no smallest, so nothing is pre-selected.
+    expect(pickKeeper([unknown, empty], DEFAULT_KEEPER_WEIGHTS, 'smallest').keeperId).toBeNull()
+
+    const sdr = facts({ itemId: 'a-sdr', sizeBytes: 5_000_000_000 })
+    const hdr = facts({ itemId: 'b-hdr', sizeBytes: 5_000_000_000, isHdr: true })
+    expect(pickKeeper([sdr, hdr], DEFAULT_KEEPER_WEIGHTS, 'smallest').keeperId).toBe('b-hdr')
+  })
 })

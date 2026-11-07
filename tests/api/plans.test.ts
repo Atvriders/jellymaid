@@ -10,6 +10,10 @@ import { signSession } from '../../src/auth/session.js'
 import { createPathMap } from '../../src/fs/pathmap.js'
 import { fileConfigSchema } from '../../src/config/schema.js'
 import { moveToTrash } from '../../src/plan/trash.js'
+import { createExecutor } from '../../src/plan/executor.js'
+import { createActivityLock, type ActivityLock } from '../../src/core/activity.js'
+import { writeVerification } from '../../src/scan/verification.js'
+import { configStoreOf, verifyMappings } from '../plan/support.js'
 
 const SECRET = 'p'.repeat(32)
 // isAdministrator: true is required — requireSession (src/api/auth.ts) rejects any session that
@@ -20,34 +24,59 @@ let db: Db
 let dir: string
 let root: string
 let media: string
+/** One lock for the whole app, as index.ts wires it: the planner, the executor and the scan runner share it. */
+let activity: ActivityLock
+/** The library root's Jellyfin prefix as configured right now; a test edits it to change the mapping set. */
+let jellyfinPrefix: string
 
 interface BuildOpts {
   jellyfin?: { mergeVersions(ids: string[]): Promise<void> }
-  isRunning?: () => boolean
+  radarr?: unknown
 }
 
+/** A plain library root, no torrent client writing to it, read live like the real store. */
+const store = () => configStoreOf(
+  () => fileConfigSchema.parse({}),
+  () => createPathMap([{ role: 'library', jellyfin: jellyfinPrefix, container: root, qbit: null, qbitInstance: null }]),
+)
+
+/** The plan routes over a REAL planner and executor, sharing one database and one activity lock. */
 function build(opts: BuildOpts = {}) {
   const app = Fastify()
   app.register(cookie)
+  const configStore = store()
+  verifyMappings(db, configStore)
+  const shared = {
+    db,
+    configStore,
+    qbittorrents: new Map([['box-a', { instanceId: 'box-a', torrents: async () => [] }]]),
+    radarr: opts.radarr ?? null,
+    sonarr: null,
+    activity,
+  }
+  const executor = createExecutor({
+    ...shared,
+    jellyfin: { mergeVersions: async () => {}, splitVersions: async () => {}, notifyPathsDeleted: async () => {} },
+  } as never)
   registerPlanRoutes(app, {
     db,
     sessionSecret: SECRET,
-    plannerDeps: () => ({
-      db,
-      config: fileConfigSchema.parse({}),
-      pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }]),
-      qbittorrent: { torrents: async () => [] },
-      radarr: null,
-      sonarr: null,
-    }),
-    executor: {
-      execute: async (planId: string) => ({ planId, status: 'completed', done: 1, failed: 0, skipped: 0, blocked: 0, bytesFreed: 100 }),
-      isRunning: opts.isRunning ?? (() => false),
-    },
-    trashDeps: () => ({ db, config: fileConfigSchema.parse({}), pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }]) }),
+    plannerDeps: () => shared,
+    executor,
+    trashDeps: () => ({ db, config: fileConfigSchema.parse({}), pathMap: configStore.pathMap() }),
     jellyfin: opts.jellyfin ?? { mergeVersions: async () => {} },
   } as never)
-  return app
+  return Object.assign(app, { executor })
+}
+
+/** Builds and approves a plan deleting `paths`, through the routes. */
+async function approvedPlan(app: ReturnType<typeof build>, ...paths: string[]) {
+  const id = (await app.inject({
+    method: 'POST', url: '/api/plans', headers: auth(),
+    payload: { actions: paths.map((targetPath) => ({ type: 'delete-media', targetPath })) },
+  })).json().id as string
+  expect((await app.inject({ method: 'POST', url: `/api/plans/${id}/approve`, headers: auth() })).statusCode).toBe(200)
+  return id
 }
 
 beforeEach(() => {
@@ -57,6 +86,8 @@ beforeEach(() => {
   mkdirSync(root, { recursive: true })
   media = join(root, 'Heat.mkv')
   writeFileSync(media, 'x')
+  activity = createActivityLock()
+  jellyfinPrefix = '/media'
 })
 
 describe('POST /api/plans', () => {
@@ -90,19 +121,53 @@ describe('POST /api/plans', () => {
     expect(res.statusCode).toBe(400)
   })
 
-  it('rejects an override for a guard that does not block the action it names', async () => {
+  it('stale overrides are dropped into droppedOverrides instead of a 400', async () => {
     // `overrides` accepts any GUARD_IDS member for any action, and nothing here blocks — so this
     // override clears nothing now and would stand ready to clear whatever blocks at EXECUTE time,
-    // against live state the operator never saw. An operator cannot meaningfully pre-authorise a
-    // block the plan never showed them, so the plan is refused rather than minted.
+    // against live state the operator never saw. The screen resubmits every override it holds on a
+    // rebuild, so it is dropped and reported rather than failing the whole build.
     const res = await build().inject({
       method: 'POST', url: '/api/plans', headers: auth(),
       payload: { actions: [{ type: 'delete-media', targetPath: media, overrides: ['guard.torrent-scope'] }] },
     })
-    expect(res.statusCode).toBe(400)
-    expect(res.json().error).toMatch(/guard\.torrent-scope/)
-    // Nothing was persisted: a refused plan leaves no half-built rows to approve later.
+    expect(res.statusCode).toBe(201)
+    expect(res.json().droppedOverrides).toEqual([{ seq: 0, guard: 'guard.torrent-scope' }])
+    expect(res.json().actions[0].payload.overrides).toEqual([])
+  })
+
+  it('plan build refuses 412 on a stale or failing verification and 409 while a scan holds the lock', async () => {
+    const app = build()
+    const post = () => app.inject({
+      method: 'POST', url: '/api/plans', headers: auth(),
+      payload: { actions: [{ type: 'delete-media', targetPath: media }] },
+    })
+
+    // Verified, but for a mapping set that is no longer the one configured.
+    writeVerification(db, { at: 'T', mappingsHash: 'an-older-set', jellyfin: { sampled: 1, resolved: 1, failures: [] }, qbit: [] })
+    const stale = await post()
+    expect(stale.statusCode).toBe(412)
+    expect(stale.json()).toEqual({ error: 'verification', reason: expect.stringMatching(/changed since/) })
+
+    // The configured set, but its last verification failed.
+    writeVerification(db, {
+      at: 'T', mappingsHash: store().mappingsHash(),
+      jellyfin: { sampled: 2, resolved: 1, failures: [{ jellyfinPath: '/media/Ghost.mkv', reason: 'not found on disk' }] },
+      qbit: [{ instanceId: 'box-a', sampled: 0, resolved: 0, failures: [] }],
+    })
+    const failing = await post()
+    expect(failing.statusCode).toBe(412)
+    expect(failing.json()).toEqual({ error: 'verification', reason: expect.stringMatching(/resolved 1 of 2/) })
+
+    verifyMappings(db, store())
+    activity.tryAcquire('scan', 'scan-3')
+    const busy = await post()
+    expect(busy.statusCode).toBe(409)
+    expect(busy.json()).toEqual({ error: 'busy', reason: expect.stringMatching(/scan/) })
+    // Nothing was persisted by any refusal: no half-built rows to approve later.
     expect((db.prepare('SELECT COUNT(*) c FROM plans').get() as { c: number }).c).toBe(0)
+
+    activity.release('scan', 'scan-3')
+    expect((await post()).statusCode).toBe(201)
   })
 })
 
@@ -115,24 +180,103 @@ describe('approve and execute', () => {
     return res.json().id as string
   }
 
-  it('refuses to execute an unapproved plan', async () => {
+  it('refuses to execute an unapproved plan, saying so in the error code', async () => {
     const app = build()
     const id = await draft(app)
     const res = await app.inject({ method: 'POST', url: `/api/plans/${id}/execute`, headers: auth() })
     expect(res.statusCode).toBe(409)
+    expect(res.json()).toEqual({ error: 'not-approved', reason: expect.stringMatching(/not approved/) })
+    expect(existsSync(media)).toBe(true)
   })
 
-  it('approves then executes', async () => {
-    const app = build()
-    const id = await draft(app)
-    expect((await app.inject({ method: 'POST', url: `/api/plans/${id}/approve`, headers: auth() })).statusCode).toBe(200)
+  it('execute route returns 202 and runs in the background; GET shows progress; a crash sets plans.error and status failed', async () => {
+    // The first action's *arr read is held open, so the run can be watched mid-flight.
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let holding = false
+    const app = build({
+      radarr: {
+        inventory: async () => { if (holding) await gate; return { records: [], complete: true } },
+        unmonitorByPath: async () => ({ outcome: 'unmonitored', recordId: 1 }),
+      },
+    })
+    const other = join(root, 'Other.mkv')
+    writeFileSync(other, 'y')
+    const id = await approvedPlan(app, media, other)
+
+    holding = true
     const res = await app.inject({ method: 'POST', url: `/api/plans/${id}/execute`, headers: auth() })
-    expect(res.statusCode).toBe(200)
-    expect(res.json().done).toBe(1)
+    expect(res.statusCode).toBe(202)
+    expect(res.json()).toEqual({ planId: id, status: 'running' })
+    const during = (await app.inject({ method: 'GET', url: `/api/plans/${id}`, headers: auth() })).json()
+    expect(during.status).toBe('running')
+    expect(during.progress).toEqual({ total: 2, finished: 0 })
+
+    release()
+    await app.executor.idle()
+    const after = (await app.inject({ method: 'GET', url: `/api/plans/${id}`, headers: auth() })).json()
+    expect(after).toMatchObject({ status: 'completed', error: null, progress: { total: 2, finished: 2 } })
+    expect(existsSync(media)).toBe(false)
+
+    // A run that crashes after the 202 has nobody to answer: the plan itself must say so.
+    holding = false
+    const third = join(root, 'Third.mkv')
+    writeFileSync(third, 'z')
+    const crashing = await approvedPlan(app, third)
+    db.exec('DROP TABLE audit')
+    expect((await app.inject({ method: 'POST', url: `/api/plans/${crashing}/execute`, headers: auth() })).statusCode).toBe(202)
+    await app.executor.idle()
+    const crashed = (await app.inject({ method: 'GET', url: `/api/plans/${crashing}`, headers: auth() })).json()
+    expect(crashed.status).toBe('failed')
+    expect(crashed.error).toMatch(/audit/)
+  })
+
+  it('execute answers 409 busy while a scan holds the activity lock, and starts nothing', async () => {
+    const app = build()
+    const id = await approvedPlan(app, media)
+    activity.tryAcquire('scan', 'scan-4')
+    const res = await app.inject({ method: 'POST', url: `/api/plans/${id}/execute`, headers: auth() })
+    expect(res.statusCode).toBe(409)
+    expect(res.json()).toEqual({ error: 'busy', reason: expect.stringMatching(/scan-4/) })
+    expect(existsSync(media)).toBe(true)
+    expect((await app.inject({ method: 'GET', url: `/api/plans/${id}`, headers: auth() })).json().status).toBe('approved')
+  })
+
+  it('execute and resume refuse 412 when the mappings changed after approval and were never verified, claiming nothing', async () => {
+    const app = build()
+    const id = await approvedPlan(app, media)
+    const status = async () => (await app.inject({ method: 'GET', url: `/api/plans/${id}`, headers: auth() })).json().status
+
+    jellyfinPrefix = '/library' // edited after approval; nobody ran Verify
+    const res = await app.inject({ method: 'POST', url: `/api/plans/${id}/execute`, headers: auth() })
+    expect(res.statusCode).toBe(412)
+    expect(res.json()).toEqual({ error: 'verification', reason: expect.stringMatching(/changed since/) })
+    await app.executor.idle()
+    expect(existsSync(media)).toBe(true)
+    expect(activity.current()).toBeNull()
+    expect(app.executor.isRunning()).toBe(false)
+    expect(await status()).toBe('approved')
+
+    // A crashed run is not finished under an unverified set either. The resume route hands the
+    // wreckage back as approved before the executor refuses, as it does for a busy refusal, so the
+    // plan is left executable once the mappings are verified.
+    db.prepare("UPDATE plans SET status='running', started_at=? WHERE id=?").run(new Date(Date.now() - 60 * 60_000).toISOString(), id)
+    const resumed = await app.inject({ method: 'POST', url: `/api/plans/${id}/resume`, headers: auth() })
+    expect(resumed.statusCode).toBe(412)
+    expect(resumed.json()).toEqual({ error: 'verification', reason: expect.stringMatching(/changed since/) })
+    expect(existsSync(media)).toBe(true)
+    expect(activity.current()).toBeNull()
+    expect(await status()).toBe('approved')
+
+    verifyMappings(db, store())
+    expect((await app.inject({ method: 'POST', url: `/api/plans/${id}/execute`, headers: auth() })).statusCode).toBe(202)
+    await app.executor.idle()
+    expect(existsSync(media)).toBe(false)
   })
 
   it('404s an unknown plan', async () => {
     expect((await build().inject({ method: 'GET', url: '/api/plans/nope', headers: auth() })).statusCode).toBe(404)
+    expect((await build().inject({ method: 'POST', url: '/api/plans/nope/execute', headers: auth() })).statusCode).toBe(404)
   })
 })
 
@@ -280,7 +424,7 @@ describe('POST /api/duplicates/:groupId/merge', () => {
 
 describe('POST /api/trash/:id/restore', () => {
   it('restores a trashed file back to its original path', async () => {
-    const pathMap = createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }])
+    const pathMap = createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null, qbitInstance: null }])
     const trashed = moveToTrash({ db, config: fileConfigSchema.parse({}), pathMap }, { path: media, planId: 'p1', sizeBytes: 1 })
     if (!trashed.trashed) throw new Error(`test setup failed: ${JSON.stringify(trashed)}`)
     expect(existsSync(media)).toBe(false)
@@ -305,7 +449,7 @@ describe('GET /api/trash', () => {
   })
 
   it('lists trash entries newest first, including ones already restored', async () => {
-    const pathMap = createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }])
+    const pathMap = createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null, qbitInstance: null }])
     const trashed = moveToTrash({ db, config: fileConfigSchema.parse({}), pathMap }, { path: media, planId: 'p1', sizeBytes: 1 })
     if (!trashed.trashed) throw new Error(`test setup failed: ${JSON.stringify(trashed)}`)
     const id = (db.prepare('SELECT id FROM trash').get() as { id: string }).id
@@ -345,7 +489,7 @@ describe('GET /api/trash', () => {
   }
 
   it('paginates with limit/offset and reports the total across the whole table, not just the page', async () => {
-    const pathMap = createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }])
+    const pathMap = createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null, qbitInstance: null }])
     seedTrash(pathMap, 'a', 'T1')
     seedTrash(pathMap, 'b', 'T2')
     seedTrash(pathMap, 'c', 'T3')
@@ -366,7 +510,7 @@ describe('GET /api/trash', () => {
   })
 
   it('excludes already-restored entries when includeRestored=false, with a total reflecting the same filter', async () => {
-    const pathMap = createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }])
+    const pathMap = createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null, qbitInstance: null }])
     seedTrash(pathMap, 'a', 'T1', true)
     seedTrash(pathMap, 'b', 'T2', false)
 
@@ -379,7 +523,7 @@ describe('GET /api/trash', () => {
   })
 
   it('still includes restored entries by default, unchanged from before pagination existed', async () => {
-    const pathMap = createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }])
+    const pathMap = createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null, qbitInstance: null }])
     seedTrash(pathMap, 'a', 'T1', true)
     seedTrash(pathMap, 'b', 'T2', false)
 
@@ -391,52 +535,8 @@ describe('GET /api/trash', () => {
 })
 
 describe('GET /api/config/thresholds', () => {
-  it('requires a session', async () => {
-    expect((await build().inject({ method: 'GET', url: '/api/config/thresholds' })).statusCode).toBe(401)
-  })
-
-  it('reports the guard and trash thresholds actually in force, never a value that could edit them', async () => {
+  it('is not a plan route any more — the settings routes serve it, and one app cannot register it twice', async () => {
     const res = await build().inject({ method: 'GET', url: '/api/config/thresholds', headers: auth() })
-    expect(res.statusCode).toBe(200)
-    const body = res.json()
-    const parsed = fileConfigSchema.parse({})
-    expect(body).toEqual({
-      minRatio: parsed.guards.minRatio,
-      minSeedTimeDays: parsed.guards.minSeedTimeDays,
-      protectedCategories: parsed.guards.protectedCategories,
-      protectedTags: parsed.guards.protectedTags,
-      trashMaxBytes: parsed.trash.maxBytes,
-      trashRetentionDays: parsed.trash.retentionDays,
-    })
-  })
-
-  // Finding 5: `guards.privateTrackerHosts` is the operator's private-tracker list, and this
-  // read-only settings display has no business publishing it. Configured non-empty here (unlike
-  // the test above, which uses an all-defaults config where an accidental leak would be invisible
-  // — an empty array leaking looks identical to no leak at all) so a regression actually shows up.
-  it('never publishes the private tracker host list', async () => {
-    const app = Fastify()
-    app.register(cookie)
-    registerPlanRoutes(app, {
-      db,
-      sessionSecret: SECRET,
-      plannerDeps: () => ({
-        db,
-        config: fileConfigSchema.parse({ guards: { privateTrackerHosts: ['tracker.example', 'secret.example'] } }),
-        pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }]),
-        qbittorrent: { torrents: async () => [] },
-        radarr: null,
-        sonarr: null,
-      }),
-      executor: { execute: async () => ({ planId: 'p', status: 'completed', done: 0, failed: 0, skipped: 0, blocked: 0, bytesFreed: 0 }), isRunning: () => false },
-      trashDeps: () => ({ db, config: fileConfigSchema.parse({}), pathMap: createPathMap([{ role: 'library', jellyfin: '/media', container: root, qbit: null }]) }),
-      jellyfin: { mergeVersions: async () => {} },
-    } as never)
-
-    const res = await app.inject({ method: 'GET', url: '/api/config/thresholds', headers: auth() })
-    expect(res.statusCode).toBe(200)
-    const body = res.json()
-    expect(body).not.toHaveProperty('privateTrackerHosts')
-    expect(JSON.stringify(body)).not.toContain('tracker.example')
+    expect(res.statusCode).toBe(404)
   })
 })

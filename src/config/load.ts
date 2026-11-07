@@ -2,7 +2,10 @@
 import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomBytes, randomUUID } from 'node:crypto'
-import { envConfigSchema, fileConfigSchema, type AppConfig, type FileConfig } from './schema.js'
+import {
+  envConfigSchema, fileConfigSchema, QBIT_INSTANCE_ID_PATTERN,
+  type AppConfig, type FileConfig, type QbitInstanceConfig,
+} from './schema.js'
 
 export class ConfigError extends Error {
   constructor(public readonly problems: string[]) {
@@ -49,9 +52,33 @@ export function readFileConfig(dataDir: string): FileConfig {
   return parsed.data
 }
 
+/**
+ * The subtrees a settings screen edits one field at a time. Replacing them wholesale would make
+ * `{ guards: { minRatio: 2 } }` silently reset every OTHER guard threshold to its default — on the
+ * one object whose fields decide whether a private torrent may be deleted.
+ */
+const MERGED_SUBTREES = new Set(['guards', 'trash', 'keeper', 'rateLimits', 'rules'])
+
+const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v)
+
+/**
+ * Applies `patch` over the current config.json and writes the result atomically. The subtrees
+ * `guards`, `trash`, `keeper`, `rateLimits` and `rules` are merged ONE level deep (patch keys
+ * replace, siblings are kept; arrays and nested objects replace); every other key replaces
+ * wholesale. A key whose value is `undefined` is ignored rather than reset.
+ */
 export function saveConfig(dataDir: string, patch: Partial<FileConfig>): FileConfig {
   mkdirSync(dataDir, { recursive: true })
-  const parsed = fileConfigSchema.safeParse({ ...readFileConfig(dataDir), ...patch })
+  const current: Record<string, unknown> = { ...readFileConfig(dataDir) }
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === undefined) continue
+    const prior = current[key]
+    current[key] = MERGED_SUBTREES.has(key) && isPlainObject(value) && isPlainObject(prior)
+      ? { ...prior, ...value }
+      : value
+  }
+  const parsed = fileConfigSchema.safeParse(current)
   if (!parsed.success) {
     throw new ConfigError(parsed.error.issues.map((i) => `config patch ${i.path.join('.') || '(root)'}: ${i.message}`))
   }
@@ -68,9 +95,10 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   const dataDir = env.DATA_DIR ?? '/data'
   mkdirSync(dataDir, { recursive: true })
 
-  for (const key of ['JELLYFIN_URL', 'JELLYFIN_API_KEY', 'QBIT_URL', 'QBIT_USER', 'QBIT_PASS']) {
+  for (const key of ['JELLYFIN_URL', 'JELLYFIN_API_KEY']) {
     if (!env[key]) problems.push(`${key} is required`)
   }
+  const qbittorrents = parseQbitInstances(env, problems)
   const radarr = requireArr(env, 'RADARR', problems)
   const sonarr = requireArr(env, 'SONARR', problems)
   const trustProxy = parseHopCount(env.TRUST_PROXY, problems)
@@ -83,7 +111,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     trustProxy,
     sessionSecret: env.SESSION_SECRET ?? persistentSecret(dataDir),
     jellyfin: { url: env.JELLYFIN_URL, apiKey: env.JELLYFIN_API_KEY },
-    qbittorrent: { url: env.QBIT_URL, user: env.QBIT_USER, pass: env.QBIT_PASS },
+    qbittorrents,
     radarr,
     sonarr,
   })
@@ -91,6 +119,127 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     throw new ConfigError(parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`))
   }
   return { env: parsed.data, file: readFileConfig(dataDir) }
+}
+
+/**
+ * QBIT_INSTANCES="id=url, id=url" (URL may embed user:pass@, percent-decoded; per-instance
+ * QBIT_<ID>_USER / QBIT_<ID>_PASS override, <ID> = id uppercased, '-' -> '_'). Without it,
+ * QBIT_URL (+ optional QBIT_USER/QBIT_PASS) defines id 'default'. Pushes a problem (and returns [])
+ * when neither is set, an id is invalid or duplicated, a URL does not parse, or exactly one of
+ * user/pass is set for an instance.
+ *
+ * Credentials are optional: an instance that bypasses authentication for this host needs none.
+ * Half a credential is never optional, though — a username with no password can only ever produce
+ * a failed login, and five of those get this host's address banned for an hour.
+ *
+ * All or nothing: one bad entry returns no instances at all, so a typo can never quietly shrink
+ * the set of boxes Jellymaid believes exist.
+ */
+export function parseQbitInstances(env: NodeJS.ProcessEnv, problems: string[]): QbitInstanceConfig[] {
+  const list = env.QBIT_INSTANCES?.trim()
+  if (list) {
+    const instances: QbitInstanceConfig[] = []
+    const seen = new Set<string>()
+    let failed = false
+    // These problems become the ConfigError printed at boot, so none may carry a credential, and
+    // an entry's text can hold one even where the parser expects an id. Until an entry has proved
+    // to be an id=url pair (an id matching QBIT_INSTANCE_ID_PATTERN and a URL that parses as
+    // http/https), a problem names it by its POSITION and quotes none of its text:
+    //  - an entry that omits its "id=" is cut at the first "=" INSIDE its URL (base64 padding in a
+    //    password, a query string), so its "id" is the front of the URL, user:pass@ included;
+    //  - an unencoded "," inside a URL splits one entry in two. The second piece's "id" is the
+    //    password text before its first "=", which can match the id pattern; its "URL" is the rest
+    //    of the password plus the host, which does not parse as http(s) unless that password text
+    //    itself happens to continue with "http:" or "https:".
+    for (const [position, raw] of list.split(',').entries()) {
+      const entry = raw.trim()
+      if (!entry) continue
+      const where = `QBIT_INSTANCES entry ${position + 1}`
+      const eq = entry.indexOf('=')
+      if (eq <= 0) {
+        problems.push(`${where} must be id=url`)
+        failed = true
+        continue
+      }
+      const id = entry.slice(0, eq).trim()
+      if (!QBIT_INSTANCE_ID_PATTERN.test(id)) {
+        problems.push(`${where} has an invalid id: an id is 1-32 lowercase letters, digits or "-", starting with a letter or digit`)
+        failed = true
+        continue
+      }
+      // Recorded before the URL is checked but reported only once it has parsed: a repeat of an
+      // id whose first entry was malformed still surfaces in the same restart, and a second piece
+      // of the same split password is never quoted as "the id listed more than once".
+      const repeated = seen.has(id)
+      seen.add(id)
+      const envKey = `QBIT_${id.toUpperCase().replaceAll('-', '_')}`
+      const instance = qbitInstance(id, where, entry.slice(eq + 1).trim(), env[`${envKey}_USER`], env[`${envKey}_PASS`], problems)
+      if (!instance) {
+        failed = true
+        continue
+      }
+      if (repeated) {
+        problems.push(`QBIT_INSTANCES lists the instance id "${id}" more than once`)
+        failed = true
+        continue
+      }
+      instances.push(instance)
+    }
+    if (failed) return []
+    if (instances.length === 0) {
+      problems.push('QBIT_INSTANCES is set but names no instance')
+      return []
+    }
+    return instances
+  }
+
+  if (env.QBIT_URL) {
+    const instance = qbitInstance('default', 'qBittorrent instance "default"', env.QBIT_URL, env.QBIT_USER, env.QBIT_PASS, problems)
+    return instance ? [instance] : []
+  }
+  problems.push('QBIT_INSTANCES (id=url, comma-separated) or QBIT_URL (a single instance) is required')
+  return []
+}
+
+/**
+ * One instance: credentials pulled out of the URL (env values win), the URL kept without them.
+ * `where` names the instance in a problem about the URL itself. Until the URL has parsed as
+ * http(s), `id` is not yet known to be an id at all (see parseQbitInstances), so it is not quoted.
+ */
+function qbitInstance(
+  id: string, where: string, urlText: string, envUser: string | undefined, envPass: string | undefined,
+  problems: string[],
+): QbitInstanceConfig | null {
+  let url: URL
+  try {
+    url = new URL(urlText)
+  } catch {
+    problems.push(`${where}: its URL is not a valid URL`)
+    return null
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    problems.push(`${where}: the URL must be http:// or https://`)
+    return null
+  }
+  let urlUser: string
+  let urlPass: string
+  try {
+    urlUser = decodeURIComponent(url.username)
+    urlPass = decodeURIComponent(url.password)
+  } catch {
+    problems.push(`qBittorrent instance "${id}": the credentials in its URL are not valid percent-encoding`)
+    return null
+  }
+  const user = envUser || urlUser || null
+  const pass = envPass || urlPass || null
+  if ((user === null) !== (pass === null)) {
+    problems.push(`qBittorrent instance "${id}" has a ${user === null ? 'password' : 'username'} but no ${user === null ? 'username' : 'password'} — set both or neither`)
+    return null
+  }
+  // Rebuilt from its parts rather than by blanking username/password, which would leave the
+  // trailing "/" URL serialisation adds to a bare origin. `origin` never carries credentials.
+  const path = url.pathname === '/' ? '' : url.pathname
+  return { id, url: `${url.origin}${path}${url.search}`, user, pass }
 }
 
 /**

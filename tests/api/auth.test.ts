@@ -1,28 +1,46 @@
 // tests/api/auth.test.ts
-import { describe, it, expect } from 'vitest'
-import Fastify from 'fastify'
+import { describe, it, expect, vi } from 'vitest'
+import Fastify, { type FastifyInstance } from 'fastify'
 import cookie from '@fastify/cookie'
 import { registerAuthRoutes, requireSession } from '../../src/api/auth.js'
-import { createLockout } from '../../src/auth/lockout.js'
+import { createLockout, type Lockout } from '../../src/auth/lockout.js'
 import { SESSION_COOKIE, signSession } from '../../src/auth/session.js'
 
+type Risk = { allowed: boolean; reason: string | null }
+type Authenticate = (u: string, p: string) => Promise<{ userId: string; isAdministrator: boolean }>
+interface Warning { msg: string; fields: Record<string, unknown> | undefined }
+
+const ALLOWED: Risk = { allowed: true, reason: null }
+const allow = async (): Promise<Risk> => ALLOWED
+const authError = () => Object.assign(new Error('bad'), { kind: 'auth', name: 'ConnectorError' })
+
 function build(
-  authenticate: (u: string, p: string) => Promise<{ userId: string; token: string; isAdministrator: boolean }>,
-  opts?: { userLockout?: import('../../src/auth/lockout.js').Lockout; ipLockout?: import('../../src/auth/lockout.js').Lockout },
+  authenticate: Authenticate,
+  opts?: {
+    userLockout?: Lockout
+    ipLockout?: Lockout
+    loginRisk?: (username: string) => Promise<Risk>
+    /** Receives every warning the route logs; without it they are dropped. */
+    warnings?: Warning[]
+  },
 ) {
   const app = Fastify()
   app.register(cookie)
   registerAuthRoutes(app, {
-    jellyfin: { authenticateByName: authenticate } as never,
+    jellyfin: { authenticateByName: authenticate, loginRisk: opts?.loginRisk ?? allow },
     sessionSecret: 'a-very-long-test-secret',
     userLockout: opts?.userLockout ?? createLockout({ maxFailures: 3, windowMs: 300_000, lockMs: 3_600_000 }),
     ipLockout: opts?.ipLockout ?? createLockout({ maxFailures: 3, windowMs: 300_000, lockMs: 900_000 }),
     secureCookie: false,
+    logger: { warn: (msg, fields) => { opts?.warnings?.push({ msg, fields }) } },
   })
   return app
 }
 
-const admin = async () => ({ userId: 'u1', token: 'T', isAdministrator: true })
+const login = (app: FastifyInstance, username: string, password = 'x') =>
+  app.inject({ method: 'POST', url: '/api/auth/login', payload: { username, password } })
+
+const admin: Authenticate = async () => ({ userId: 'u1', isAdministrator: true })
 
 describe('POST /api/auth/login', () => {
   it('sets an httpOnly session cookie for an admin', async () => {
@@ -36,7 +54,7 @@ describe('POST /api/auth/login', () => {
   })
 
   it('rejects a valid non-admin with 403 and no cookie', async () => {
-    const app = build(async () => ({ userId: 'u2', token: 'T', isAdministrator: false }))
+    const app = build(async () => ({ userId: 'u2', isAdministrator: false }))
     const res = await app.inject({ method: 'POST', url: '/api/auth/login', payload: { username: 'eve', password: 'pw' } })
     expect(res.statusCode).toBe(403)
     expect(res.headers['set-cookie']).toBeUndefined()
@@ -158,7 +176,7 @@ describe('POST /api/auth/login', () => {
     const app = Fastify()
     app.register(cookie)
     registerAuthRoutes(app, {
-      jellyfin: { authenticateByName: async () => { throw Object.assign(new Error('bad'), { kind: 'auth', name: 'ConnectorError' }) } } as never,
+      jellyfin: { authenticateByName: async () => { throw Object.assign(new Error('bad'), { kind: 'auth', name: 'ConnectorError' }) }, loginRisk: allow },
       sessionSecret: 'a-very-long-test-secret',
       userLockout: createLockout({ maxFailures: 3, windowMs: 5 * 60_000, lockMs: 60 * 60_000, now }),
       ipLockout: createLockout({ maxFailures: 3, windowMs: 5 * 60_000, lockMs: 15 * 60_000, now }),
@@ -196,7 +214,7 @@ describe('POST /api/auth/login', () => {
     // counters rather than only the username one.
     let admitted = false
     const app = build(async () => {
-      if (admitted) return { userId: 'u1', token: 'T', isAdministrator: true }
+      if (admitted) return { userId: 'u1', isAdministrator: true }
       throw Object.assign(new Error('bad'), { kind: 'auth', name: 'ConnectorError' })
     })
     for (let i = 0; i < 2; i += 1) {
@@ -218,6 +236,213 @@ describe('POST /api/auth/login', () => {
     const app = build(async () => { throw Object.assign(new Error('nope'), { kind: 'auth', name: 'ConnectorError' }) })
     const res = await app.inject({ method: 'POST', url: '/api/auth/login', payload: { username: 'bob', password: 'hunter2' } })
     expect(res.body).not.toContain('hunter2')
+  })
+})
+
+describe('POST /api/auth/login — refusing an attempt that could disable the Jellyfin account', () => {
+  const REFUSED: Risk = { allowed: false, reason: '2 failed login(s) recorded against a limit of 3; one more would disable the account' }
+  const refuse = async (): Promise<Risk> => REFUSED
+  const unavailable = (kind?: string) => async (): Promise<Risk> => {
+    throw Object.assign(new Error('boom'), kind ? { kind, name: 'ConnectorError' } : {})
+  }
+  /** Everything a caller can observe of a response, minus the volatile Date header. */
+  const observable = (res: Awaited<ReturnType<typeof login>>) => {
+    const { date: _date, ...headers } = res.headers
+    return { statusCode: res.statusCode, body: res.body, headers }
+  }
+
+  it('asks Jellyfin about the account BEFORE the password is forwarded, passing it the username only', async () => {
+    const order: string[] = []
+    const app = build(
+      async (u) => { order.push(`authenticate:${u}`); return { userId: 'u1', isAdministrator: true } },
+      { loginRisk: async (...args) => { order.push(`risk:${args.join(',')}`); return ALLOWED } },
+    )
+    expect((await login(app, 'bob', 'hunter2')).statusCode).toBe(200)
+    expect(order).toEqual(['risk:bob', 'authenticate:bob'])
+  })
+
+  it('answers a refused attempt exactly like a wrong password, and Jellyfin never sees the password', async () => {
+    let forwarded = 0
+    const warnings: Warning[] = []
+    const wrong = build(async () => { throw authError() })
+    const refused = build(async () => { forwarded += 1; return { userId: 'u1', isAdministrator: true } }, { loginRisk: refuse, warnings })
+
+    const a = await login(wrong, 'bob', 'hunter2')
+    const b = await login(refused, 'bob', 'hunter2')
+
+    expect(a.statusCode).toBe(401)
+    // Same status, same body, same headers: nothing in the response tells the caller the account is one failure from lockout.
+    expect(observable(b)).toEqual(observable(a))
+    expect(b.headers['set-cookie']).toBeUndefined()
+    expect(b.body).not.toContain('failed login')
+    expect(forwarded).toBe(0)
+
+    // The operator is told why, on the server side only, and the password is nowhere in it.
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]!.msg).toMatch(/refused/i)
+    expect(warnings[0]!.fields).toMatchObject({ username: 'bob', reason: REFUSED.reason })
+    expect(JSON.stringify(warnings)).not.toContain('hunter2')
+  })
+
+  it('counts a refused attempt against the caller exactly like a wrong password', async () => {
+    // Three wrong passwords, then the lockout. A refusal that did not count would let a caller probe without limit;
+    // one that counted differently would tell them which kind of "no" they got.
+    const wrong = build(async () => { throw authError() })
+    let riskChecks = 0
+    const refused = build(admin, { loginRisk: async () => { riskChecks += 1; return REFUSED } })
+
+    const statuses = async (app: FastifyInstance) => {
+      const out: number[] = []
+      for (let i = 0; i < 5; i += 1) out.push((await login(app, 'bob')).statusCode)
+      return out
+    }
+    expect(await statuses(wrong)).toEqual([401, 401, 401, 429, 429])
+    expect(await statuses(refused)).toEqual([401, 401, 401, 429, 429])
+    // Once locked, Jellyfin is not even asked.
+    expect(riskChecks).toBe(3)
+  })
+
+  it('neither asks Jellyfin about nor forwards a request the lockout has already turned away', async () => {
+    let riskChecks = 0
+    let authentications = 0
+    const app = build(async () => { authentications += 1; throw authError() }, { loginRisk: async () => { riskChecks += 1; return ALLOWED } })
+    for (let i = 0; i < 6; i += 1) await login(app, 'bob')
+    expect(riskChecks).toBe(3)
+    expect(authentications).toBe(3)
+  })
+
+  it.each([['unreachable'], ['timeout'], ['bad-response'], ['auth'], ['cancelled'], [undefined]])(
+    'treats a loginRisk failure (kind %s) as Jellyfin being unavailable: 503, no password forwarded, no attempt consumed',
+    async (kind) => {
+      // `auth` here is Jellyfin refusing the SERVICE key, not the caller's credentials: not a wrong password.
+      let forwarded = 0
+      let risk: (username: string) => Promise<Risk> = unavailable(kind)
+      const warnings: Warning[] = []
+      const app = build(
+        async () => { forwarded += 1; return { userId: 'u1', isAdministrator: true } },
+        { loginRisk: (u) => risk(u), warnings },
+      )
+      for (let i = 0; i < 5; i += 1) {
+        const r = await login(app, 'bob', 'hunter2')
+        expect(r.statusCode).toBe(503)
+        expect(r.json()).toEqual({ error: 'Jellyfin is unreachable' })
+      }
+      expect(forwarded).toBe(0)
+      expect(warnings).toHaveLength(5)
+      expect(JSON.stringify(warnings)).not.toContain('hunter2')
+
+      // Five unavailable attempts used up nothing: once Jellyfin answers, the same caller gets in.
+      risk = allow
+      expect((await login(app, 'bob', 'hunter2')).statusCode).toBe(200)
+      expect(forwarded).toBe(1)
+    },
+  )
+
+  it('never forwards the password when the verdict is not an unambiguous yes', async () => {
+    for (const verdict of [{ allowed: false, reason: null }, { reason: null }, { allowed: 'yes', reason: null }]) {
+      let forwarded = 0
+      const app = build(async () => { forwarded += 1; return { userId: 'u1', isAdministrator: true } }, { loginRisk: async () => verdict as never })
+      expect((await login(app, 'bob')).statusCode).toBe(401)
+      expect(forwarded).toBe(0)
+    }
+  })
+
+  it('shares one lockout bucket between spellings of a username that differ only in case', async () => {
+    // Jellyfin treats Admin and admin as one account, so each spelling must not get its own three guesses.
+    const app = build(async () => { throw authError() })
+    for (const name of ['Admin', 'admin', 'ADMIN']) expect((await login(app, name)).statusCode).toBe(401)
+    for (const name of ['admin', 'Admin', 'aDMIN']) expect((await login(app, name)).statusCode).toBe(429)
+  })
+
+  it('shares the bucket for names that only differ in case beyond ASCII', async () => {
+    const app = build(async () => { throw authError() })
+    for (const name of ['Zoë', 'zoë', 'ZOË']) expect((await login(app, name)).statusCode).toBe(401)
+    expect((await login(app, 'zoË')).statusCode).toBe(429)
+  })
+
+  it('keeps different usernames in different buckets', async () => {
+    const app = build(async () => { throw authError() })
+    for (const name of ['Admin', 'admin', 'ADMIN']) await login(app, name)
+    expect((await login(app, 'adm1n')).statusCode).toBe(401)
+    expect((await login(app, 'administrator')).statusCode).toBe(401)
+  })
+
+  it('a successful login under one spelling clears the failures recorded under another', async () => {
+    let admitted = false
+    const app = build(async () => {
+      if (admitted) return { userId: 'u1', isAdministrator: true }
+      throw authError()
+    })
+    await login(app, 'Admin'); await login(app, 'admin')
+    admitted = true
+    expect((await login(app, 'ADMIN', 'pw')).statusCode).toBe(200)
+    admitted = false
+    // Two more failures are again within the allowance (the third would lock), in whichever case.
+    expect((await login(app, 'Admin')).statusCode).toBe(401)
+    expect((await login(app, 'aDmIn')).statusCode).toBe(401)
+  })
+
+  it('keeps the name as typed in the session it issues', async () => {
+    const app = build(admin)
+    const res = await login(app, 'Admin', 'pw')
+    expect(res.json()).toMatchObject({ username: 'Admin' })
+  })
+
+  it('cannot be walked past Jellyfin\'s own lockout by a burst, whatever the spelling of the name', async () => {
+    // A stand-in for Jellyfin: a counter that disables the account when a failure brings it to the limit.
+    // The risk read and the attempt must run as one serialised step per account, or every request of the
+    // burst reads the same low count, passes, and together they push the counter over.
+    const LIMIT = 3
+    const pause = (ms: number) => new Promise((r) => setTimeout(r, ms))
+    let jellyfinCount = 0
+    let disabled = false
+    const app = build(
+      async () => {
+        await pause(10)
+        jellyfinCount += 1
+        if (jellyfinCount >= LIMIT) disabled = true
+        throw authError()
+      },
+      {
+        loginRisk: async () => {
+          await pause(5)
+          return jellyfinCount >= LIMIT - 1 ? REFUSED : ALLOWED
+        },
+      },
+    )
+    const spellings = ['Admin', 'admin', 'ADMIN', 'aDmIn']
+    const results = await Promise.all(Array.from({ length: 20 }, (_, i) => login(app, spellings[i % spellings.length]!)))
+    expect(disabled).toBe(false)
+    expect(jellyfinCount).toBeLessThan(LIMIT)
+    expect(results.every((r) => r.statusCode === 401 || r.statusCode === 429)).toBe(true)
+  })
+
+  it('records the refusal on stdout, as a JSON warn line, when no logger is wired in', async () => {
+    // src/server.ts predates the logger dependency: a refusal must not vanish just because nobody passed one.
+    vi.stubEnv('LOG_LEVEL', 'warn')
+    const written: string[] = []
+    const spy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk: unknown) => { written.push(String(chunk)); return true })
+    try {
+      const app = Fastify()
+      app.register(cookie)
+      registerAuthRoutes(app, {
+        jellyfin: { authenticateByName: admin, loginRisk: refuse },
+        sessionSecret: 'a-very-long-test-secret',
+        userLockout: createLockout({ maxFailures: 3, windowMs: 300_000, lockMs: 3_600_000 }),
+        ipLockout: createLockout({ maxFailures: 3, windowMs: 300_000, lockMs: 900_000 }),
+        secureCookie: false,
+      })
+      expect((await login(app, 'bob', 'hunter2')).statusCode).toBe(401)
+    } finally {
+      spy.mockRestore()
+      vi.unstubAllEnvs()
+    }
+    const lines = written.flatMap((w) => w.split('\n')).filter((l) => l.startsWith('{')).flatMap((l) => {
+      try { return [JSON.parse(l) as { level?: string; msg?: string; username?: string; reason?: string }] } catch { return [] }
+    })
+    const refusal = lines.find((l) => /refused/i.test(l.msg ?? ''))
+    expect(refusal).toMatchObject({ level: 'warn', username: 'bob', reason: REFUSED.reason })
+    expect(written.join('')).not.toContain('hunter2')
   })
 })
 

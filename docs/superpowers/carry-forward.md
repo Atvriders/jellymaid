@@ -1,8 +1,11 @@
-# Carry-forward from Plans 1–2
+# Carry-forward
 
-Findings that were deliberately deferred during Plan 1's task loop and its whole-branch review,
-kept here because the scratch workspace that recorded them is gone. Each says which slice should
-close it. Nothing here is a known-broken behaviour today; they are traps set for later slices.
+Findings that were deliberately deferred along the way (Plan 1's task loop and whole-branch review
+first, then each later plan), kept here because the scratch workspaces that recorded them are
+gone. Each says which slice should close it. Nothing here is a known-broken behaviour today; they
+are traps set for later slices. A struck-through item is closed, with the plan that closed it;
+what Plan 7 (the real-stack upgrade) deliberately leaves open is under "Open after Plan 7" near
+the end.
 
 ## Must be closed by a specific slice
 
@@ -13,8 +16,8 @@ close it. Nothing here is a known-broken behaviour today; they are traps set for
 | `HttpClient` silently discards a caller-supplied `init.signal`, so external cancellation is a structural no-op. The scan worker owns an `AbortController`, and with retries a single request can run ~2 minutes — cooperative between-chunk cancellation cannot bound that on its own. | `src/connectors/http.ts` | Plan 2 |
 | ~~Land the multi-migration ordering test **with** `002_*.sql`, not after. Only one migration exists, so the "apply newer, skip applied" branch is exercised trivially.~~ **Closed in Plan 2**: `002_torrent_files_error.sql` ships with tests that upgrade a 001-era database in place and that pin the `NNN_` naming, so lexicographic order is numeric order. | `tests/index/db.test.ts` | Closed |
 | `deleteItem` must not reach the delete executor untested — it is the call that removes the Jellyfin entry. Also untested: `virtualFolders`, `splitVersions`, `ping`. | `tests/connectors/jellyfin.test.ts` | Plan 4 |
-| `saveConfig` shallow-merges, so a nested patch must resend the whole subtree. The Settings screen patches `guards`/`trash`/`rules` subtrees and would silently reset siblings. | `src/config/load.ts` | Plan 5 |
-| `/api/pathmap/detect` accepts any `mountRoots`, including `/` — one blocking `readdirSync` walk of the whole filesystem to depth 4. Admin-only, so a foot-gun rather than an attack path. | `src/api/pathmap.ts` | Plan 2 (when that route is next touched) |
+| ~~`saveConfig` shallow-merges, so a nested patch must resend the whole subtree. The Settings screen patches `guards`/`trash`/`rules` subtrees and would silently reset siblings.~~ **Closed in Plan 7**: `saveConfig` merges `guards`, `trash`, `keeper`, `rateLimits` and `rules` one level deep, so patching one threshold keeps its siblings. | `src/config/load.ts` | Closed |
+| `/api/pathmap/detect` accepts any `mountRoots`, including `/` — ~~one blocking `readdirSync` walk~~ of the whole filesystem to depth 4. Admin-only, so a foot-gun rather than an attack path. **Half closed in Plan 7**: the walk is asynchronous and yields to the event loop, so a huge root can no longer stall the server (the test schedules a timer and checks it fires during detect). `/` is still accepted as a root. | `src/api/pathmap.ts` | Half closed |
 | There is no operator unlock for the login lockout — no endpoint, no file, no env escape. The username dimension holds for 60 minutes. | `src/auth/lockout.ts` | Plan 5 or 6 |
 | Sessions cannot be revoked: a captured cookie is a valid 7-day bearer token, and a demoted admin keeps authority until it expires. The signed payload now carries `isAdministrator`, which is what later routes assert, but there is no server-side kill switch. | `src/auth/session.ts` | Plan 6 |
 
@@ -34,7 +37,7 @@ close it. Nothing here is a known-broken behaviour today; they are traps set for
 
 | Item | Where | Close in |
 |---|---|---|
-| **Merge Versions changes what a delete means.** After a merge, Jellyfin returns ONE item and the alternate file's path lives only in `jellyfin_item_paths`. Deleting a non-keeper of a MERGED item removes a file the surviving item still references, so the executor must trigger a Jellyfin refresh for that item rather than a `DELETE /Items/{id}` — deleting the item would remove the version the operator kept. | `src/plan/executor.ts` | **Plan 4** |
+| **Merge Versions changes what a delete means.** After a merge, Jellyfin returns ONE item and the alternate file's path lives only in `jellyfin_item_paths`. Deleting a non-keeper of a MERGED item removes a file the surviving item still references, so the executor must trigger a Jellyfin refresh for that item rather than a `DELETE /Items/{id}` — deleting the item would remove the version the operator kept. **Superseded in Plan 7**: the executor no longer deletes Jellyfin items or refreshes the library at all; every deleted path, a merged item's alternate file included, is reported once with `POST /Library/Media/Updated`. Whether Jellyfin then drops just that alternate version and keeps the one that survives has not been exercised (see "Open after Plan 7"). | `src/plan/executor.ts` | Superseded |
 | **`unmonitorByPath` returns three states now** (`unmonitored` / `not-managed` / `lookup-failed`) and the plan document still shows the old two-field shape. `lookup-failed` must be treated as fail-closed: skip the delete. A fourth path exists — the unmonitor `PUT` itself throwing — which is only fail-closed if the executor wraps the call. | `docs/…-4-actions.md`, `src/plan/executor.ts` | **Plan 4, first task** |
 | The dupe-matcher memoization is keyed by `scanId` alone, so a reused id in one process would let `subRuns()` read a stale outcome map. Not reachable in production (ids autoincrement, one worker at a time) but the test suite already depends on incidental ordering to avoid it. Key it on something call-scoped before the pattern is reused. | `src/rules/dupes/adapter.ts` | Plan 4 or 5 |
 | If the two retained scans both fail before reaching the rules phase, the last successful scan's row is pruned and the summary's `evaluated` flips false while `findings` still holds real open rows. Narrow, currently unreachable. | `src/scan/orchestrator.ts`, `src/api/findings.ts` | Plan 6 |
@@ -44,8 +47,8 @@ close it. Nothing here is a known-broken behaviour today; they are traps set for
 
 | Item | Where | Close in |
 |---|---|---|
-| **`dryRun.directoriesSwept` is typed required but old rows read `undefined`.** `getPlan` and `GET /api/plans` parse `dry_run_json` with no schema, so a plan persisted before that field existed yields `undefined` behind a `number` type. It does not throw — it surfaces in the UI as "undefined directories will be removed". Make it optional or default it at parse time. | `src/plan/planner.ts`, `src/api/plans.ts` | **Plan 5, before the Plan screen** |
-| **A rejected override fails the whole plan build with 400.** A UI that resubmits a previously built action list with its overrides attached gets a hard 400 for every action if live state moved (the torrent crossed its ratio, so `guard.private-ratio` no longer blocks) rather than dropping the now-pointless override. Correct per the ruling, but the UI must handle it — either strip overrides on resubmit or surface which one was unearned. | `src/api/plans.ts` | **Plan 5** |
+| ~~**`dryRun.directoriesSwept` is typed required but old rows read `undefined`.** `getPlan` and `GET /api/plans` parse `dry_run_json` with no schema, so a plan persisted before that field existed yields `undefined` behind a `number` type. It does not throw — it surfaces in the UI as "undefined directories will be removed". Make it optional or default it at parse time.~~ **Closed in Plan 7**: the plan contract types it `directoriesSwept?: number`, which is what an older row actually holds. | `src/plan/planner.ts`, `src/api/plans.ts` | Closed |
+| ~~**A rejected override fails the whole plan build with 400.** A UI that resubmits a previously built action list with its overrides attached gets a hard 400 for every action if live state moved (the torrent crossed its ratio, so `guard.private-ratio` no longer blocks) rather than dropping the now-pointless override. Correct per the ruling, but the UI must handle it — either strip overrides on resubmit or surface which one was unearned.~~ **Closed in Plan 7**: an override for a guard that no longer blocks is dropped and listed in `droppedOverrides` on the plan, never a 400; the Plan screen shows what was dropped. | `src/api/plans.ts` | Closed |
 | **The `arrUnmappable` block is invisible until an operator builds a plan.** It blocks every delete, non-overridably, and Radarr reports the movie *folder* for a filmless movie — so one decommissioned root folder wedges the whole install with a message only reachable by trying. Surface the unmapped count on the health page. | `src/api/health.ts` | **Plan 6, before ship** |
 | Siblings are unmonitored before it is known the delete will happen. If a later sibling fails to confirm, the earlier ones are already `monitored: false` with their files intact — the conservative state, but an unrequested \*arr mutation, and `detail` names only the FAILING sibling so the audit cannot tell an operator which titles to re-monitor. Carry the confirmed list in `detail`. | `src/plan/executor.ts` | Plan 6 |
 | `/resume`'s staleness window only covers the first five minutes: `started_at` is written once and never refreshed, so a legitimately long run elsewhere is resumable and would double-execute its tail. A heartbeat would close it. | `src/api/plans.ts` | Plan 6 |
@@ -57,10 +60,10 @@ close it. Nothing here is a known-broken behaviour today; they are traps set for
 - **Hop-count over-counting reinstates the vulnerability it closes.** `TRUST_PROXY` set higher than the real number of proxies makes Fastify trust a caller-supplied `X-Forwarded-For` token again. Documented in `parseHopCount` and the compose file; unguardable in code, since only the operator knows the topology.
 - **The IP lockout dimension is skipped for private and loopback addresses.** Such an address is either a LAN client (the username dimension still applies) or a reverse proxy collapsing every client into one address, where an IP lock would be a self-inflicted denial of service. Deliberate.
 - **`/healthz` can report `ok` for up to 5 seconds after Jellyfin dies** — the ping is cached so unauthenticated probes cannot spend the scanner's rate-limit budget.
-- **`resolveRootReal` memoizes a failed root resolution** for the life of a `PathMap`. Fail-closed, and PathMaps are short-lived today; revisit if the delete executor holds one across a long plan.
+- **`resolveRootReal` memoizes a failed root resolution** for the life of a `PathMap`. Fail-closed, and PathMaps are short-lived today; revisit if the delete executor holds one across a long plan. **That condition is now met (Plan 7)** — see "Open after Plan 7".
 - **`autoDetectMappings`'s test double re-implements `walkDirs`** and will drift silently if the production skip rules change.
 - **A single-flight on the username key only** means a burst of *different* usernames from one IP can overshoot the IP counter before it locks.
-- Cosmetic: `/api/pathmap/detect`'s 400 returns a static string where `PUT` returns parsed issues; the `try` around `readFileSync`+`JSON.parse` reports an EACCES as "not valid JSON"; `src/fs/pathmap.ts` boundary-checks with `'/'` in one place and `path.sep` in another; a migration named `01_x.sql` would collide with `001_init.sql`; `src/index.ts` has no SIGTERM handler and never closes the database.
+- Cosmetic: `/api/pathmap/detect`'s 400 returns a static string where `PUT` returns parsed issues; the `try` around `readFileSync`+`JSON.parse` reports an EACCES as "not valid JSON"; `src/fs/pathmap.ts` boundary-checks with `'/'` in one place and `path.sep` in another; a migration named `01_x.sql` would collide with `001_init.sql`; ~~`src/index.ts` has no SIGTERM handler and never closes the database~~ (**closed in Plan 7**: SIGTERM and SIGINT stop taking work, cancel a running scan, let a running plan finish its current action, then close the database).
 - **No login is logged.** Successful logins, failures and lockout trips leave no record anywhere — Fastify's own logger is off so request bodies never reach stdout, but that also means no audit trail on the security boundary.
 
 ## Added by the Plan 5 UI review fix wave — known limits, accepted
@@ -110,27 +113,105 @@ why the obvious simplification is wrong:
   deliberately without paths, because `/healthz` is unauthenticated. The operator still learns
   *which* root folder is unmappable only by building a plan and reading the failure. Surfacing the
   offending root behind the authenticated API is the follow-up.
-- **Config is boot-time only.** `loadConfig` runs once at `src/index.ts`, and `config.file` is
+- ~~**Config is boot-time only.** `loadConfig` runs once at `src/index.ts`, and `config.file` is
   captured by `pathMap`, the executor, `plannerDeps`, `trashDeps`, both schedulers, and
   qBittorrent's `privateTrackerHosts`. Hand-editing `/data/config.json` needs a container restart —
   and until that restart, an added private-tracker host **fails open**. A saved `pathMappings`
-  change reaches the scan worker (which reloads) but not the executor's live sweep boundary.
+  change reaches the scan worker (which reloads) but not the executor's live sweep boundary.~~
+  **Closed in Plan 7**: a `ConfigStore` re-reads `config.json` whenever it changes, and the
+  planner, executor, Explorer, health, duplicates and settings routes ask it instead of holding a
+  copy; one plan run uses one snapshot; a broken edit throws until fixed rather than reverting to
+  the last good copy. Still read only at start: the environment, `scanCron`, and the `rateLimits`
+  of the connectors that plan builds and runs use (a scan re-reads its own).
 - **`%2e%2e/`-style traversal returns 500, not 404.** `@fastify/static` throws `Forbidden` and the
   generic error handler widens it. Pre-existing on both the 8.x and 10.x versions; no content leaks,
   it is the status code that is wrong.
-- **No SIGTERM handler.** Shipping a container makes SIGTERM the normal stop path for a process that
-  deletes files mid-plan. The recovery path exists (History → Resume) but the Plan screen does not
-  mention it, and a plan stuck in `running` shows no controls there.
+- ~~**No SIGTERM handler.** Shipping a container makes SIGTERM the normal stop path for a process that
+  deletes files mid-plan.~~ **Closed in Plan 7**: SIGTERM and SIGINT now stop taking work, cancel a
+  running scan, let a running plan finish its current action, and close the database (compose runs
+  Jellymaid under `init: true` so the signal arrives). **Still open from this item:** the recovery
+  path (History → Resume) exists, but the Plan screen does not mention it, and a plan stuck in
+  `running` shows no controls there.
 - **No session revocation**, and the `/resume` staleness check is still the 5-minute age heuristic
   documented at `src/api/plans.ts` rather than a real heartbeat.
 - **The hash-evaluated flag is global, not per-root.** With one library root hashed and another not,
   the unhashed root contributes a silent zero to duplicate counts. Documented in the README.
 
-## Never verified against a live stack
+## Open after Plan 7 — nothing here blocks the dupe flow
 
-No real Jellyfin, qBittorrent, Radarr or Sonarr instance has ever been contacted; no real scan has
-run; no real delete has been executed. Docker was unavailable in the build sandbox, so the image has
-never been built and `docker compose up` has never run. Every connector behaviour is verified against
-fakes and fixtures only. The README's first-run checklist exists for exactly this reason and starts
-with a deliberate throwaway file — that checklist is the real acceptance test and the owner has to
-run it.
+Plan 7 made the dupe flow work end to end on the real software (the README's "Verified against"
+says exactly what was checked). It deliberately did **not** do the following; each is written down
+here rather than built.
+
+### Production dependency advisories left open on purpose
+
+`npm audit --omit=dev` on 2026-10-31: server 7 findings (4 high, 3 moderate), client 0. The
+non-breaking fixes are applied (`brace-expansion` 5.0.8 → 5.0.12; `fast-uri` 3.1.4 → 3.1.9 and
+4.1.1 → 4.2.3, both copies in the tree), which leaves 5 (2 high, 3 moderate). Each of those needs a
+breaking change, for these reasons — all checked, not assumed:
+
+| Package | Advisory | Why it is not upgraded | Reachable here? | Closes when |
+|---|---|---|---|---|
+| `fastify` 5.10.0 (high) | Seven advisories, fixed in 5.12.1 through 5.12.5. The one that bears on this app is GHSA-3m5p-2c4r-xxw2: `X-Forwarded-*` spoofing under a numeric `trustProxy`. | **Every fixed release removes the numeric `trustProxy` form at runtime** (and from its types), and `TRUST_PROXY` is exactly that hop count, handed straight to Fastify in `src/server.ts`. Checked by installing 5.12.7: `tests/server/trust-proxy.test.ts` fails 2 of 3, and `req.ip` becomes the proxy's own address — behind a proxy every client would share one lockout bucket. | The `trustProxy` one only with `TRUST_PROXY` of 1 or more and port 8099 reachable around the proxy (the default is 0). The other six need route schemas (there are none), HTTP/2 (not used) or a plugin-scoped not-found handler serving protected data (the only not-found handler is the root-level SPA fallback). | `TRUST_PROXY` stops being a hop count and becomes the proxies' own addresses (an IP or CIDR list, a form Fastify still honours), `secureCookie` and the lockout tests are rewritten around real addresses, and Fastify moves to 5.12.5 or later. |
+| `zod` 3.25.76 (high) | GHSA-mrhx-c7xc-m3w5: memory exhaustion validating a very large array. Fixed only in 4.6.6 and later. | **Zod 4 changes `.default({})`**: the default is returned as written instead of being parsed through the inner schema. Checked on 4.6.7: a config with no `guards` block parses to `{}`, so `minRatio` and `minSeedTimeDays` are `undefined`, `ratio < undefined` is false, and **`guard.private-ratio` would never block**. A mechanical bump fails open on exactly the setting that protects private-tracker accounts. | Arrays are validated only in authenticated administrator requests (Fastify's default 1 MiB body limit) and in `config.json`. | Every nested `.default({})` in `src/config/schema.ts` becomes `.prefault({})`, then the bump. `tests/config/load.test.ts` already pins the defaults of an empty config (three of its tests fail on 4.6.7), so a mechanical bump cannot slip through CI. |
+| `@fastify/static` 10.1.2, through `glob` 13.0.6 and `minimatch` 10.2.6 (moderate) | GHSA-3g3m-2fjr-6pw4 (glob: post-timeout traversal) and a minimatch pattern-amplification denial of service. | **No fix inside range.** The latest `@fastify/static` (10.1.8) still depends on `glob ^13`, and the "fix" `npm audit` offers is a downgrade to `@fastify/static` 6.12.0, a different major with different options. | No. `glob()` is only called in `@fastify/static`'s `wildcard: false` branch, with the fixed pattern `**/**`; Jellymaid registers it with the default `wildcard: true`. | `@fastify/static` ships on a `glob` release past 14.0.1. |
+
+### Other open items
+
+- **The real-stack read-only scan is pending.** This build has not yet scanned the owner's Jellyfin
+  and qBittorrent instances, and the first-run checklist (one disposable item) has not been run.
+  Everything in the README's "Verified against" comes from the local harness.
+- **The harness cannot exercise some of what the design promises.** It runs identity path mappings
+  on local disks, so per-instance translation (two boxes both saying `/movies`) rests on tests over
+  real temporary directories; it runs no Radarr or Sonarr, no merged Jellyfin versions, and no NFS,
+  where a deletion may be seen late (the executor's 30-second wait for a file to disappear is a
+  design figure, not a measurement from the real mounts).
+- **Merged versions and the path notification.** Merge and split are unchanged, but with no item
+  delete and no library refresh left, removing one version of a merged item relies on
+  `POST /Library/Media/Updated` dropping just that version and keeping the other. Not exercised.
+- **A `PathMap` now lives as long as its mapping set.** `ConfigStore` hands out one `PathMap` per
+  mapping set for the life of the process, and `createPathMap` caches a root's resolution
+  (`rootRealCache`) for the life of that map. Fixed in the final fix wave (final review m4): only a
+  root that resolved is cached. A failed resolution (an unmounted share, ESTALE, EACCES) fails that
+  one call closed and is tried again on the next, so a share that comes back is seen without a
+  restart. A cached success is still kept: a root repointed behind Jellymaid's back (its symlink
+  retargeted) is not noticed until the mappings are edited or the container restarts.
+- **`docker stop` grace period.** The compose file sets `stop_grace_period: 2m` (Docker's default
+  is 10 s): one action may wait up to 60 s for qBittorrent to let a torrent go and up to 30 s more
+  for its asynchronous delete to show on disk. A plan whose current action outlasts even that is
+  killed and left `running` (resumable from History). Revisit once the worst action time is
+  measured on real mounts.
+- **The CI smoke gate has not run on GitHub yet.** It starts the image on the runner's own
+  architecture (amd64) only: the arm64 image is built and never started. The step's script was
+  checked against a stub `docker` and the real server booted with the same dummy environment, not
+  inside Docker (none was available).
+- **`engines.node` is wrong.** `package.json` declares `>=20.11`, but the production tree needs
+  Node 22: `@fastify/cookie` depends on `cookie@2`, which declares `node >= 22` (npm prints
+  `EBADENGINE` on Node 20). CI and the image run Node 22 and local runs on 20 work, so nothing
+  breaks; the declared floor is simply untrue.
+- **The keeper policy applies from the next scan.** Changing it in Settings does not re-pick the
+  keepers of groups that already exist (recomputing on read was rejected to avoid a signature
+  shared across lanes).
+- **An oversized "sample" counts as media in `guard.torrent-scope`.** A companion that is itself a
+  media file only counts as a companion while it is under a tenth of the torrent's largest media
+  file, so a real film named "Sample City" is never swept away as a sidecar; the price is that a
+  genuinely large sample needs an override.
+- **The suites leave their temp directories behind.** Test files create `mkdtemp` directories and
+  never remove them: about 180 MB per full server run (roughly 16,800 directories, 5 GB, had piled
+  up in `/tmp` on the build machine, which filled a shared disk and made unrelated tests fail with
+  `ENOSPC`). Point `TMPDIR` somewhere disposable, or add cleanup.
+- **Non-goals, unchanged:** hardlink layouts and Radarr/Sonarr improvements (the owner uses
+  neither), renaming, transcoding or moving files, session revocation and a login audit trail,
+  and Explorer and Findings polish beyond the fixes Plan 7 made.
+
+## Verification status
+
+Verified on a local harness of real binaries on 2026-10-31: Jellyfin 12.1.0 with qBittorrent 5.2.2
+and 5.1.2 as two instances. **Not yet verified against a real stack:** the read-only scan of the
+owner's deployment is pending, and the README's first-run checklist — which starts with one
+deliberately disposable item — is the real acceptance test the owner has to run. No real Radarr or
+Sonarr instance has ever been contacted; their paths are verified against fakes and fixtures only.
+The Docker image has still never been built or started in the build sandbox (no Docker there); the
+publish workflow now builds it and starts it (amd64) before pushing anything, and confirming that
+workflow's first green run is part of shipping. See the README's "Verified against" section for
+exactly what the harness settled.

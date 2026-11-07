@@ -16,7 +16,9 @@ function fastifyFetch(app: FastifyInstance): typeof fetch {
       headers: init?.headers as Record<string, string> | undefined,
       payload: init?.body as string | undefined,
     })
-    return new Response(res.body, { status: res.statusCode })
+    // A 204 must reach `createApi` exactly as a browser delivers it — with a null body. undici's
+    // Response constructor refuses ANY body (even '') on a null-body status, so pass null there.
+    return new Response(res.statusCode === 204 ? null : res.body, { status: res.statusCode })
   }) as unknown as typeof fetch
 }
 
@@ -150,21 +152,129 @@ describe('api', () => {
   })
 
   describe('duplicates', () => {
-    // Finding 6: the server now joins matchedBy onto each group and video_range/has_subtitles onto
-    // each member. This is a pure passthrough (createApi does not reshape response bodies), so the
-    // point of this test is to pin the wire shape the client contract now promises, not to exercise
-    // any transformation logic.
-    it('passes matchedBy and the per-member quality facts through untouched', async () => {
+    // C12's DuplicatesResponse. createApi does not reshape response bodies, so the point of this
+    // test is to pin the wire shape the client contract promises (camelCase members, per-member
+    // torrent facts, the evaluated/scan provenance), not to exercise any transformation logic.
+    it('passes the C12 duplicates shape through untouched', async () => {
       const f = (async () => new Response(JSON.stringify({
+        evaluated: true, reason: null, scanId: 7, scanFinishedAt: 'T',
         groups: [{
-          id: 'g1', tier: 'exact', keeperItemId: 'b', scores: {}, matchedBy: ['dupe.provider-id'],
-          members: [{ id: 'a', name: 'Heat', video_range: 'SDR', has_subtitles: 0 }],
+          id: 'g1', tier: 'exact', keeperItemId: 'b', keeperPolicy: 'best-quality', scores: {}, matchedBy: ['dupe.provider-id'],
+          title: 'Heat', year: 1995, kind: 'movie', seriesName: null, seasonNo: null, episodeNo: null,
+          editionsDiffer: false, multiEpisode: false, crossInstance: true, reclaimableBytes: 10,
+          members: [{
+            id: 'a', name: 'Heat', videoRange: 'SDR', hasSubtitles: false, instanceId: 'box-a', torrentCount: 1,
+            torrent: { instanceId: 'box-a', hash: 'h', name: 'Heat.1995', state: 'uploading', ratio: 2, seedingDays: 30, isPrivate: true, trackerHost: null, sizeBytes: 10, fileCount: 3, mediaFileCount: 1, hnrMet: true },
+          }],
         }],
       }), { status: 200 })) as unknown as typeof fetch
-      const { groups } = await api(f).duplicates()
-      expect(groups[0]!.matchedBy).toEqual(['dupe.provider-id'])
-      expect(groups[0]!.members[0]!.video_range).toBe('SDR')
-      expect(groups[0]!.members[0]!.has_subtitles).toBe(0)
+      const res = await api(f).duplicates()
+      expect(res.scanId).toBe(7)
+      expect(res.groups[0]!.matchedBy).toEqual(['dupe.provider-id'])
+      expect(res.groups[0]!.crossInstance).toBe(true)
+      expect(res.groups[0]!.members[0]!.videoRange).toBe('SDR')
+      expect(res.groups[0]!.members[0]!.torrent?.hnrMet).toBe(true)
+    })
+  })
+
+  // --- Plan 7 / C12 routes --------------------------------------------------------------------
+  describe('real-stack routes', () => {
+    it('dismisses a duplicate group with its reason and accepts the 204 empty body', async () => {
+      let received: unknown
+      const app = Fastify()
+      app.post('/api/duplicates/:groupId/dismiss', async (req, reply) => {
+        received = { params: req.params, body: req.body }
+        return reply.code(204).send()
+      })
+      await expect(api(fastifyFetch(app)).dismissDuplicate('g1', 'same release twice')).resolves.toBeUndefined()
+      expect(received).toEqual({ params: { groupId: 'g1' }, body: { reason: 'same release twice' } })
+    })
+
+    it('dismisses without a reason as an empty JSON object, never a literal "undefined"', async () => {
+      let received: unknown
+      const app = Fastify()
+      app.post('/api/duplicates/:groupId/dismiss', async (req, reply) => {
+        received = req.body
+        return reply.code(204).send()
+      })
+      await api(fastifyFetch(app)).dismissDuplicate('g1')
+      expect(received).toEqual({})
+    })
+
+    it('reopens a duplicate group with a bodyless POST that survives the empty-json-body guard', async () => {
+      const app = Fastify()
+      app.post('/api/duplicates/:groupId/reopen', async (_req, reply) => reply.code(204).send())
+      await expect(api(fastifyFetch(app)).reopenDuplicate('g1')).resolves.toBeUndefined()
+    })
+
+    it('reads the 202 body of an execute that now runs in the background', async () => {
+      let url = ''
+      const f = (async (u: string) => {
+        url = String(u)
+        return new Response(JSON.stringify({ planId: 'p1', status: 'running' }), { status: 202 })
+      }) as unknown as typeof fetch
+      expect(await api(f).executePlan('p1')).toEqual({ planId: 'p1', status: 'running' })
+      expect(url).toBe('/api/plans/p1/execute')
+    })
+
+    it('lists the qBittorrent instances', async () => {
+      let url = ''
+      const body = { instances: [{ id: 'box-a', url: 'http://198.51.100.10:8080/', reachable: true, version: 'v5.2.2', error: null, torrentCount: 12 }] }
+      const f = (async (u: string) => { url = String(u); return new Response(JSON.stringify(body), { status: 200 }) }) as unknown as typeof fetch
+      expect(await api(f).qbitInstances()).toEqual(body)
+      expect(url).toBe('/api/qbit/instances')
+    })
+
+    it('reads settings and saves a partial patch with a PUT the real server parses', async () => {
+      let received: unknown
+      const view = {
+        guards: { minRatio: 1.5, minSeedTimeDays: 14, protectedCategories: [], protectedTags: [], privateTrackerHosts: [] },
+        keeper: { policy: 'smallest' }, trash: { maxBytes: 1, retentionDays: 30 },
+      }
+      const app = Fastify()
+      app.get('/api/config/settings', async (_req, reply) => reply.send(view))
+      app.put('/api/config/settings', async (req, reply) => { received = req.body; return reply.send(view) })
+      const client = api(fastifyFetch(app))
+      expect(await client.settings()).toEqual(view)
+      expect(await client.saveSettings({ guards: { minRatio: 1.5 }, keeper: { policy: 'smallest' } })).toEqual(view)
+      expect(received).toEqual({ guards: { minRatio: 1.5 }, keeper: { policy: 'smallest' } })
+    })
+
+    it('pages the explorer with offset and limit in the query string', async () => {
+      let url = ''
+      const f = (async (u: string) => {
+        url = String(u)
+        return new Response('{"path":"/movies","parent":null,"entries":[],"total":0,"offset":500,"limit":500}', { status: 200 })
+      }) as unknown as typeof fetch
+      await api(f).explorer('/movies', { offset: 500, limit: 500 })
+      const query = new URLSearchParams(url.split('?')[1])
+      expect(query.get('path')).toBe('/movies')
+      expect(query.get('offset')).toBe('500')
+      expect(query.get('limit')).toBe('500')
+    })
+
+    it('reads auto-detect proposals under the C12 key', async () => {
+      const proposals = [{ role: 'library', jellyfin: '/media/movies', container: '/movies', qbit: '/movies', qbitInstance: 'box-b' }]
+      const f = (async () => new Response(JSON.stringify({ proposals }), { status: 200 })) as unknown as typeof fetch
+      expect((await api(f).pathmapDetect(['/movies'])).proposals).toEqual(proposals)
+    })
+
+    it('uses the server reason as the error message when one is given, and keeps the body', async () => {
+      const f = (async () => new Response(JSON.stringify({ error: 'busy', reason: 'scan 12 is running' }), { status: 409 })) as unknown as typeof fetch
+      const err = await api(f).createPlan([{ type: 'delete-media', targetPath: '/movies/x.mkv' }]).catch((e) => e)
+      expect(err).toBeInstanceOf(ApiError)
+      expect(err.status).toBe(409)
+      expect(err.message).toBe('scan 12 is running')
+      expect(err.body).toEqual({ error: 'busy', reason: 'scan 12 is running' })
+    })
+
+    it('shows why a scan start was refused as busy — the holder, not the bare word (Ruling 14)', async () => {
+      const reason = 'plan p1 is running; scans and plan runs never overlap, so start the scan once it has finished'
+      const f = (async () => new Response(JSON.stringify({ error: 'busy', reason }), { status: 409 })) as unknown as typeof fetch
+      const err = await api(f).scanStart().catch((e) => e)
+      expect(err).toBeInstanceOf(ApiError)
+      expect(err.status).toBe(409)
+      expect(err.message).toBe(reason)
     })
   })
 

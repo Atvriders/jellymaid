@@ -26,6 +26,7 @@ function fakeRunner(): ScanRunner {
     cancel: () => true,
     isRunning: () => false,
     status: () => ({ running: false, scanId: null, phase: null, done: 0, total: null, lastScan: null }),
+    shutdown: async () => {},
   }
 }
 
@@ -44,7 +45,20 @@ describe('/api/scan', () => {
     const app = build({ start: () => ({ error: 'a scan is already running', reason: 'busy' }) })
     const res = await app.inject({ method: 'POST', url: '/api/scan/start', headers: auth() })
     expect(res.statusCode).toBe(409)
-    expect(res.json().error).toMatch(/already running/)
+    expect(res.json().reason).toMatch(/already running/)
+  })
+
+  // Ruling 14: the runner says `{ error: <prose>, reason: 'busy' }` (its ScanStartResult), but every
+  // HTTP refusal is C12's `{ error: <machine word>, reason: <prose> }` — the plans route's 409 too —
+  // and the client shows `reason` whenever there is one. Forwarded as the runner says it, the
+  // operator would read "busy" and nothing else; the prose is the only place that says WHAT holds
+  // the lock (a plan, with its id).
+  it('answers busy in the C12 shape, with the runner\'s prose as the reason', async () => {
+    const prose = 'plan p1 is running; scans and plan runs never overlap, so start the scan once it has finished'
+    const app = build({ start: () => ({ error: prose, reason: 'busy' }) })
+    const res = await app.inject({ method: 'POST', url: '/api/scan/start', headers: auth() })
+    expect(res.statusCode).toBe(409)
+    expect(res.json()).toEqual({ error: 'busy', reason: prose })
   })
 
   it('reports status without a session — the UI polls it on the login screen', async () => {
@@ -74,6 +88,14 @@ describe('/api/scan/start — path-map verification gate', () => {
     const res = await app.inject({ method: 'POST', url: '/api/scan/start', headers: auth() })
     expect(res.statusCode).toBe(412)
     expect(res.json()).toMatchObject({ error: expect.stringMatching(/verif/i), forcible: true })
+  })
+
+  // The Dashboard reads exactly these two fields off a 412 (`error` as the message, `forcible` for
+  // the force button); the machine code the runner uses internally is not part of that body.
+  it('keeps the 412 body to the message and the forcible flag', async () => {
+    const app = build({ start: () => ({ error: 'path mappings have never been verified', reason: 'unverified' }) })
+    const res = await app.inject({ method: 'POST', url: '/api/scan/start', headers: auth() })
+    expect(res.json()).toEqual({ error: 'path mappings have never been verified', forcible: true })
   })
 
   it('passes force straight through to the runner', async () => {

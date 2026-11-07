@@ -43,6 +43,48 @@ describe('Dashboard', () => {
     expect(await screen.findByText(/unreachable/i)).toBeInTheDocument()
   })
 
+  it('dashboard shows each qBittorrent instance', async () => {
+    render(<Dashboard api={api({
+      health: async () => ({
+        status: 'degraded', schemaVersion: 5,
+        connectors: {
+          jellyfin: 'ok', qbittorrent: 'unreachable', radarr: 'not-configured', sonarr: 'not-configured',
+          qbitInstances: {
+            'box-a': { status: 'ok', version: 'v5.2.2' },
+            'box-b': { status: 'unreachable', error: 'connect ECONNREFUSED 198.51.100.11:8080' },
+          },
+        },
+      }),
+    })} />)
+    const rowA = (await screen.findByText('qBittorrent box-a')).closest('li')!
+    expect(within(rowA).getByText('ok')).toBeInTheDocument()
+    expect(within(rowA).getByText('v5.2.2')).toBeInTheDocument()
+    const rowB = screen.getByText('qBittorrent box-b').closest('li')!
+    expect(within(rowB).getByText('unreachable').className).toContain('tag-block')
+    expect(within(rowB).getByText(/ECONNREFUSED/)).toBeInTheDocument()
+    // The per-instance rows replace the single worst-of row rather than sitting beside it.
+    expect(screen.queryByText('qbittorrent')).not.toBeInTheDocument()
+    expect(screen.getByText('jellyfin')).toBeInTheDocument()
+  })
+
+  it('shows the single qbittorrent connector from a server that reports no instances', async () => {
+    render(<Dashboard api={api({
+      health: async () => ({ status: 'degraded', schemaVersion: 4, connectors: { jellyfin: 'ok', qbittorrent: 'auth' } }),
+    })} />)
+    const row = (await screen.findByText('qbittorrent')).closest('li')!
+    expect(within(row).getByText('auth')).toBeInTheDocument()
+  })
+
+  it('reads a connector the operator chose not to configure as quiet, not as a failure', async () => {
+    render(<Dashboard api={api({
+      health: async () => ({ status: 'ok', schemaVersion: 5, connectors: { jellyfin: 'ok', radarr: 'not-configured' } }),
+    })} />)
+    const row = (await screen.findByText('radarr')).closest('li')!
+    const tag = within(row).getByText('not-configured')
+    expect(tag.className).toContain('tag-quiet')
+    expect(tag.className).not.toContain('tag-block')
+  })
+
   it('surfaces rules that were not evaluated above the tiles, and degrades only the affected tile instead of printing a confident zero', async () => {
     const { container } = render(<Dashboard api={api({
       findingsSummary: async () => ({

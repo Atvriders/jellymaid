@@ -3,7 +3,7 @@ import cookie from '@fastify/cookie'
 import fastifyStatic from '@fastify/static'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
-import type { AppConfig } from './config/schema.js'
+import type { ConfigStore } from './config/store.js'
 import type { Db } from './index/db.js'
 import type { JellyfinClient } from './connectors/jellyfin.js'
 import type { QbitClient } from './connectors/qbittorrent.js'
@@ -13,7 +13,6 @@ import type { ScanRunner } from './scan/runner.js'
 import type { PlannerDeps } from './plan/planner.js'
 import type { TrashDeps } from './plan/trash.js'
 import type { createExecutor } from './plan/executor.js'
-import type { PathMap } from './fs/pathmap.js'
 import { createLockout } from './auth/lockout.js'
 import { registerAuthRoutes } from './api/auth.js'
 import { registerHealthRoutes } from './api/health.js'
@@ -22,22 +21,30 @@ import { registerScanRoutes } from './api/scan.js'
 import { registerFindingsRoutes } from './api/findings.js'
 import { registerPlanRoutes } from './api/plans.js'
 import { registerExplorerRoutes } from './api/explorer.js'
+import { registerSettingsRoutes } from './api/settings.js'
 
 export interface ServerDeps {
-  config: AppConfig
+  /**
+   * The environment (secrets, port, proxy hops) and the LIVE config.json behind it. There is
+   * deliberately no boot-time copy of the file config here: path mappings and thresholds change at
+   * runtime, and every route that needs them asks the store when it runs.
+   */
+  configStore: ConfigStore
   db: Db
   jellyfin: JellyfinClient
   /**
-   * Only `/healthz` reads these three directly today — the planner and executor reach the same
-   * underlying instances through `plannerDeps`/`executor` instead, since they need narrower
-   * (`Pick`-restricted) views. Radarr/Sonarr are `null` exactly when the operator never
-   * configured that optional instance (src/index.ts); qBittorrent is mandatory config, so it is
-   * never null in production, but the type stays as permissive as Radarr/Sonarr's so tests do not
-   * need a real client. Radarr/Sonarr also carry `inventory` (beyond plain `ping`) so `/healthz`
-   * can surface the `arrUnmappable` count (carry-forward.md:49) from the same read `resolveTarget`
-   * uses — see src/api/health.ts.
+   * `/healthz` reads these three directly, and the path-map routes read the qBittorrent clients
+   * too (Verify and Detect sample their torrent lists; /api/qbit/instances pings them) — the
+   * planner and executor reach the same underlying instances through `plannerDeps`/`executor`
+   * instead, since they need narrower (`Pick`-restricted) views. They are the SAME long-lived
+   * clients everywhere, so a login backoff one of them is serving holds for every caller.
+   * Radarr/Sonarr are `null` exactly when the operator never configured that optional instance
+   * (src/index.ts); at least one qBittorrent instance is mandatory config, so the map is never
+   * empty in production. Radarr/Sonarr also carry `inventory` (beyond plain `ping`) so `/healthz`
+   * can surface the `arrUnmappable` count (carry-forward.md:49) from the same read
+   * `resolveTarget` uses — see src/api/health.ts.
    */
-  qbittorrent: Pick<QbitClient, 'ping'>
+  qbittorrents: ReadonlyMap<string, Pick<QbitClient, 'ping' | 'torrents'>>
   radarr: Pick<ArrClient, 'ping' | 'inventory'> | null
   sonarr: Pick<ArrClient, 'ping' | 'inventory'> | null
   logger: Logger
@@ -47,10 +54,6 @@ export interface ServerDeps {
   plannerDeps: () => PlannerDeps
   trashDeps: () => TrashDeps
   executor: ReturnType<typeof createExecutor>
-  /** Same long-lived instance the planner and executor use (src/index.ts) — the Explorer's
-   * containment check must be the identical `isWithinRoot` every destructive path already trusts,
-   * not a second instance built from a possibly-stale copy of the config. */
-  pathMap: PathMap
   /**
    * Where the built SPA (`client/dist`) lives. Optional so every existing route test keeps
    * building a server without ever having a client build on disk; defaults to the real build
@@ -63,11 +66,12 @@ export interface ServerDeps {
 }
 
 export function buildServer(deps: ServerDeps): FastifyInstance {
+  const env = deps.configStore.env
   const app = Fastify({
     // A NUMBER, not a boolean: Fastify trusts that many hops from the right, so req.ip is the
     // rightmost-but-N X-Forwarded-For token. `true` would take the leftmost — caller-supplied —
     // token, which would hand the login lockout's key to the attacker.
-    trustProxy: deps.config.env.trustProxy,
+    trustProxy: env.trustProxy,
     bodyLimit: 2 * 1024 * 1024,
     logger: false,
   })
@@ -76,14 +80,14 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   registerHealthRoutes(app, {
     db: deps.db,
     jellyfin: deps.jellyfin,
-    qbittorrent: deps.qbittorrent,
+    qbittorrents: deps.qbittorrents,
     radarr: deps.radarr,
     sonarr: deps.sonarr,
-    pathMap: deps.pathMap,
+    configStore: deps.configStore,
   })
   registerAuthRoutes(app, {
     jellyfin: deps.jellyfin,
-    sessionSecret: deps.config.env.sessionSecret,
+    sessionSecret: env.sessionSecret,
     // Two independent lockout instances with different durations, not one shared duration
     // parameterised per key: the username dimension protects a single credential and can afford
     // a long lock (60 minutes); the IP dimension can catch shared infrastructure rather than
@@ -93,25 +97,35 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     userLockout: createLockout({ maxFailures: 3, windowMs: 5 * 60_000, lockMs: 60 * 60_000 }),
     ipLockout: createLockout({ maxFailures: 3, windowMs: 5 * 60_000, lockMs: 15 * 60_000 }),
     // Behind any proxy at all, the public edge is assumed to be TLS-terminating.
-    secureCookie: deps.config.env.trustProxy > 0,
+    secureCookie: env.trustProxy > 0,
+    // The process logger, so a refused login lands where every other diagnostic does.
+    logger: deps.logger,
   })
   registerPathMapRoutes(app, {
-    dataDir: deps.config.env.dataDir,
-    sessionSecret: deps.config.env.sessionSecret,
-    jellyfin: deps.jellyfin,
+    configStore: deps.configStore,
     db: deps.db,
+    jellyfin: deps.jellyfin,
+    qbittorrents: deps.qbittorrents,
+    sessionSecret: env.sessionSecret,
   })
   // No `db` here: the path-map verification gate lives in the runner (src/scan/verification.ts),
   // so the scheduled scan is covered by it too. This route only maps its refusal to a 412.
   registerScanRoutes(app, {
     runner: deps.scanRunner,
-    sessionSecret: deps.config.env.sessionSecret,
+    sessionSecret: env.sessionSecret,
   })
-  registerFindingsRoutes(app, { db: deps.db, sessionSecret: deps.config.env.sessionSecret })
-  registerExplorerRoutes(app, { db: deps.db, sessionSecret: deps.config.env.sessionSecret, pathMap: deps.pathMap })
+  // The live store: which box a duplicate sits on, and whether its torrent has met the current
+  // thresholds, are read with the config in force when the page loads.
+  registerFindingsRoutes(app, { db: deps.db, sessionSecret: env.sessionSecret, configStore: deps.configStore })
+  // The same live path map the planner and executor read, so the Explorer's containment check is
+  // the identical `isWithinRoot` every destructive path trusts.
+  registerExplorerRoutes(app, { db: deps.db, sessionSecret: env.sessionSecret, configStore: deps.configStore })
+  // Thresholds, the keeper policy and the private-tracker list, edited through the same store every
+  // reader asks — so a saved change reaches the next plan build and torrent read without a restart.
+  registerSettingsRoutes(app, { configStore: deps.configStore, sessionSecret: env.sessionSecret })
   registerPlanRoutes(app, {
     db: deps.db,
-    sessionSecret: deps.config.env.sessionSecret,
+    sessionSecret: env.sessionSecret,
     plannerDeps: deps.plannerDeps,
     trashDeps: deps.trashDeps,
     executor: deps.executor,

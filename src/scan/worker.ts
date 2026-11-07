@@ -2,16 +2,22 @@ import { parentPort, workerData } from 'node:worker_threads'
 import { openDb, type Db } from '../index/db.js'
 import { loadConfig } from '../config/load.js'
 import type { AppConfig } from '../config/schema.js'
-import { createPathMap } from '../fs/pathmap.js'
+import { createPathMap, normalizeMappings } from '../fs/pathmap.js'
 import { createHasher } from '../fs/hasher.js'
 import { createJellyfinClient } from '../connectors/jellyfin.js'
-import { createQbitClient } from '../connectors/qbittorrent.js'
+import { createQbitClients } from '../connectors/qbittorrent.js'
 import { createRadarrClient, createSonarrClient } from '../connectors/arr.js'
 import { runScan, pruneOldScans, failRunningScan } from './orchestrator.js'
 import { createLogger, parseLogLevel, type Logger } from '../core/logger.js'
 import type { Phase, ScanDeps } from './phases/types.js'
 
-export interface WorkerInput { dbPath: string; scanId: number; env: NodeJS.ProcessEnv }
+export interface WorkerInput {
+  dbPath: string
+  scanId: number
+  env: NodeJS.ProcessEnv
+  /** Instance ids whose main-thread client is holding off logging in (see ScanDeps.qbitLoginBlocked). */
+  qbitLoginBlocked?: string[]
+}
 
 export type WorkerMessage =
   | { type: 'progress'; payload: { phase: string; done: number; total: number | null } }
@@ -34,6 +40,7 @@ export function buildWorkerDeps(
   signal: AbortSignal,
   logger: Logger,
   fetchImpl?: typeof fetch,
+  qbitLoginBlocked: readonly string[] = [],
 ): ScanDeps {
   // A Sonarr series whose per-series fetch failed is skipped rather than aborting the whole
   // walk (see src/connectors/arr.ts) — but a silently incomplete *arr inventory means a file can
@@ -41,9 +48,13 @@ export function buildWorkerDeps(
   // through the worker's own logger so it surfaces wherever the rest of the scan's diagnostics do.
   const onProblem = (message: string): void => logger.warn('arr inventory incomplete', { message })
 
+  // The same normalization the main thread's ConfigStore applies, against the same instance ids:
+  // the scan must translate qBittorrent paths exactly as the planner and the verify gate will, or
+  // a legacy single-instance mapping would map here and not there (or the reverse).
+  const instanceIds = config.env.qbittorrents.map((i) => i.id)
   return {
     config: config.file,
-    pathMap: createPathMap(config.file.pathMappings),
+    pathMap: createPathMap(normalizeMappings(config.file.pathMappings, instanceIds).mappings),
     hasher: createHasher(db),
     jellyfin: createJellyfinClient({
       url: config.env.jellyfin.url, apiKey: config.env.jellyfin.apiKey,
@@ -51,8 +62,7 @@ export function buildWorkerDeps(
       minDelayMs: config.file.rateLimits.jellyfin.minDelayMs,
       signal, fetchImpl,
     }),
-    qbittorrent: createQbitClient({
-      url: config.env.qbittorrent.url, user: config.env.qbittorrent.user, pass: config.env.qbittorrent.pass,
+    qbittorrents: createQbitClients(config.env.qbittorrents, {
       concurrency: config.file.rateLimits.qbittorrent.concurrency,
       minDelayMs: config.file.rateLimits.qbittorrent.minDelayMs,
       privateTrackerHosts: config.file.guards.privateTrackerHosts,
@@ -70,6 +80,7 @@ export function buildWorkerDeps(
           minDelayMs: config.file.rateLimits.arr.minDelayMs, signal, fetchImpl, onProblem,
         })
       : null,
+    qbitLoginBlocked: new Set(qbitLoginBlocked),
   }
 }
 
@@ -141,7 +152,12 @@ if (isWorkerInput(workerData)) {
   const logger = createLogger({ level: parseLogLevel(input.env.LOG_LEVEL) })
   void runWorkerScan({
     db, scanId: input.scanId, signal: controller.signal,
-    buildDeps: () => buildWorkerDeps(db, loadConfig(input.env), controller.signal, logger),
+    buildDeps: () => buildWorkerDeps(
+      db, loadConfig(input.env), controller.signal, logger, undefined,
+      // Our own runner sends a string array; anything else is read as "none blocked", which is what
+      // a scan started without this information always assumed.
+      Array.isArray(input.qbitLoginBlocked) ? input.qbitLoginBlocked.filter((id) => typeof id === 'string') : [],
+    ),
     post: (msg) => parentPort?.postMessage(msg),
   })
 }

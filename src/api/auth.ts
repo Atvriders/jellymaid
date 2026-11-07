@@ -1,14 +1,15 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import { z } from 'zod'
-import type { JellyfinClient } from '../connectors/jellyfin.js'
+import { usernameKey, type JellyfinClient } from '../connectors/jellyfin.js'
 import type { Lockout } from '../auth/lockout.js'
+import { createLogger, parseLogLevel, type Logger } from '../core/logger.js'
 import { isPrivateAddress } from '../auth/address.js'
 import { SESSION_COOKIE, SESSION_MAX_AGE_SECONDS, signSession, verifySession } from '../auth/session.js'
 
 const loginSchema = z.object({ username: z.string().min(1), password: z.string() })
 
 export interface AuthDeps {
-  jellyfin: Pick<JellyfinClient, 'authenticateByName'>
+  jellyfin: Pick<JellyfinClient, 'authenticateByName' | 'loginRisk'>
   sessionSecret: string
   /** Locks a USERNAME after repeated failures: 3 in 5 minutes → 60 minutes. */
   userLockout: Lockout
@@ -21,6 +22,12 @@ export interface AuthDeps {
    */
   ipLockout: Lockout
   secureCookie: boolean
+  /**
+   * Where a refused login, and a login that could not be assessed at all, are recorded. Optional only
+   * so wiring that predates it keeps compiling; when absent it is a stdout logger at LOG_LEVEL, so a
+   * refusal is never unrecorded merely because nobody passed one in.
+   */
+  logger?: Pick<Logger, 'warn'>
 }
 
 /**
@@ -30,10 +37,15 @@ export interface AuthDeps {
  * spraying many usernames never locks the IP. Either dimension being locked refuses the request;
  * a failure counts against both; a success clears both.
  */
-const userKey = (username: string) => `user:${username}`
+// Case-insensitive, as Jellyfin is: `Admin` and `admin` are one account there, so they must be one
+// bucket here. Keyed on the raw spelling, each capitalisation would get its own guesses, and a burst
+// alternating them would run unserialised (beginAttempt queues per key).
+const userKey = (username: string) => `user:${usernameKey(username)}`
 const ipKey = (req: FastifyRequest) => `ip:${req.ip}`
 
 export function registerAuthRoutes(app: FastifyInstance, deps: AuthDeps): void {
+  const logger = deps.logger ?? createLogger({ level: parseLogLevel(process.env.LOG_LEVEL) })
+
   app.post('/api/auth/login', async (req, reply) => {
     const parsed = loginSchema.safeParse(req.body)
     if (!parsed.success) return reply.code(400).send({ error: 'username and password are required' })
@@ -58,7 +70,42 @@ export function registerAuthRoutes(app: FastifyInstance, deps: AuthDeps): void {
         return reply.code(429).send({ error: 'too many failed attempts', retryAfterMs })
       }
 
-      let result: { userId: string; token: string; isAdministrator: boolean }
+      // One definition of "that was a wrong password", used wherever one is detected, so a refusal
+      // below cannot drift from the real thing: same bookkeeping, same status, same body.
+      const rejectCredentials = () => {
+        for (const d of dims) d.lockout.recordFailure(d.key)
+        return reply.code(401).send({ error: 'invalid credentials' })
+      }
+
+      // Jellyfin disables an account after a number of wrong passwords, and only a successful login
+      // (or an administrator) resets the count — so every wrong guess forwarded here is one step
+      // towards locking the owner out of their own server. Read the account's counter BEFORE the
+      // password goes anywhere near Jellyfin, inside the serialised step, so a burst cannot all read
+      // the same low count and pass together.
+      let risk: { allowed: boolean; reason: string | null }
+      try {
+        risk = await deps.jellyfin.loginRisk(username)
+      } catch (err) {
+        // Whatever stopped us reading the counter — Jellyfin unreachable or 5xx, a service key it no
+        // longer accepts, a reply we cannot read — is "Jellyfin unavailable", NEVER "allowed": without
+        // the counter there is no telling whether this attempt is the one that disables the account.
+        // It is not a wrong password either, so (like the 503 below) it consumes no attempt.
+        logger.warn('login not attempted: could not read the account lockout state from Jellyfin', {
+          kind: (err as { kind?: string }).kind ?? 'unknown', error: (err as Error).message,
+        })
+        return reply.code(503).send({ error: 'Jellyfin is unreachable' })
+      }
+      // Only an unambiguous yes lets the password through.
+      if (risk.allowed !== true) {
+        // Deliberately the response of a wrong password and nothing more: the reason is for the
+        // operator's log, not the caller, who must not learn which accounts are one failure from lockout.
+        logger.warn('login refused: one more failed attempt would disable the Jellyfin account', {
+          username, reason: risk.reason, ip: req.ip,
+        })
+        return rejectCredentials()
+      }
+
+      let result: { userId: string; isAdministrator: boolean }
       try {
         result = await deps.jellyfin.authenticateByName(username, password)
       } catch (err) {
@@ -69,8 +116,7 @@ export function registerAuthRoutes(app: FastifyInstance, deps: AuthDeps): void {
         if ((err as { kind?: string }).kind !== 'auth') {
           return reply.code(503).send({ error: 'Jellyfin is unreachable' })
         }
-        for (const d of dims) d.lockout.recordFailure(d.key)
-        return reply.code(401).send({ error: 'invalid credentials' })
+        return rejectCredentials()
       }
 
       if (!result.isAdministrator) {

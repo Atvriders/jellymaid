@@ -8,3 +8,9 @@ import { cleanup } from '@testing-library/react'
 // Task 1's fetch-only tests, but this task adds the client's first render() calls, so it must be
 // wired up now for every screen test from here on.
 afterEach(() => cleanup())
+
+// App mirrors its queue into localStorage, and one jsdom document serves every test in a file —
+// without this, a queue built in one test would greet the next test's freshly mounted App.
+afterEach(() => {
+  try { localStorage.clear() } catch { /* a test replaced storage with one that throws */ }
+})

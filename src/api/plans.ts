@@ -4,9 +4,9 @@ import type { Db } from '../index/db.js'
 import { requireSession } from './auth.js'
 import type { SessionPayload } from '../auth/session.js'
 import { ACTION_TYPES, GUARD_IDS } from '../core/types.js'
-import { buildPlan, getPlan, approvePlan, type PlannerDeps } from '../plan/planner.js'
+import { buildPlan, getPlan, approvePlan, parseDryRun, PlanRefusal, type PlannerDeps } from '../plan/planner.js'
 import { restoreFromTrash, type TrashDeps } from '../plan/trash.js'
-import type { createExecutor } from '../plan/executor.js'
+import { ExecutionRefused, type createExecutor } from '../plan/executor.js'
 import { writeAudit } from '../plan/audit.js'
 
 const actionSchema = z.object({
@@ -81,6 +81,11 @@ export function registerPlanRoutes(app: FastifyInstance, deps: PlanRoutesDeps): 
       })
       return reply.code(201).send(plan)
     } catch (err) {
+      // Not the request's fault: the path map has not been verified as it stands (412 — Verify
+      // first), or a scan or a plan run holds the activity lock (409 — try again when it is done).
+      if (err instanceof PlanRefusal) {
+        return reply.code(err.code === 'verification' ? 412 : 409).send({ error: err.code, reason: err.message })
+      }
       // A refusal to plan (outside a root, too few merge ids) is the caller's fault, not a server fault.
       return reply.code(400).send({ error: (err as Error).message })
     }
@@ -93,7 +98,7 @@ export function registerPlanRoutes(app: FastifyInstance, deps: PlanRoutesDeps): 
     return reply.send({
       plans: rows.map((r) => ({
         id: r.id, createdAt: r.created_at, createdBy: r.created_by, status: r.status,
-        dryRun: JSON.parse(r.dry_run_json),
+        dryRun: parseDryRun(r.dry_run_json),
       })),
     })
   })
@@ -112,6 +117,13 @@ export function registerPlanRoutes(app: FastifyInstance, deps: PlanRoutesDeps): 
     }
   })
 
+  /**
+   * Starts the run and answers at once: a plan can take far longer than any HTTP request should be
+   * held open, so the screen polls GET /api/plans/:id for `progress`, `status` and `error` instead.
+   * A 202 means the plan is already `running` — the executor claims it before `start` returns — and
+   * whatever happens to it after that is recorded on the plan itself. A mapping set not verified as
+   * it stands answers 412, as a build does; the plan stays approved.
+   */
   app.post('/api/plans/:id/execute', guard, async (req, reply) => {
     const { id } = req.params as { id: string }
     // Checked HERE, against the database, rather than left entirely to whatever executor is
@@ -121,14 +133,16 @@ export function registerPlanRoutes(app: FastifyInstance, deps: PlanRoutesDeps): 
     const plan = getPlan(deps.db, id)
     if (!plan) return reply.code(404).send({ error: 'no such plan' })
     if (plan.status !== 'approved') {
-      return reply.code(409).send({ error: `plan ${id} is not approved (status: ${plan.status})` })
+      return reply.code(409).send({ error: 'not-approved', reason: `plan ${id} is not approved (status: ${plan.status})` })
     }
-    try {
-      return reply.send(await deps.executor.execute(id, sessionOf(req).username))
-    } catch (err) {
-      const message = (err as Error).message
-      return reply.code(message.includes('does not exist') ? 404 : 409).send({ error: message })
+    const started = deps.executor.start(id, sessionOf(req).username)
+    if (!started.ok) {
+      const code = started.error === 'not-found' ? 404
+        : started.error === 'verification' ? 412
+        : started.error === 'error' ? 500 : 409
+      return reply.code(code).send({ error: started.error, reason: started.reason })
     }
+    return reply.code(202).send({ planId: id, status: 'running' })
   })
 
   /**
@@ -175,11 +189,18 @@ export function registerPlanRoutes(app: FastifyInstance, deps: PlanRoutesDeps): 
     try {
       return reply.send(await deps.executor.execute(id, sessionOf(req).username))
     } catch (err) {
-      // Symmetric with /execute above: a throw here can only come from the same `execute`
-      // function (the cross-process DB claim, since the in-process mutex was just checked), so it
-      // gets the same caller-facing mapping rather than falling through to a generic 500.
+      // A refusal to start (the cross-process DB claim, the activity lock held by a scan) maps by
+      // its code, as /execute does; a run that started and then failed or was stopped keeps the
+      // conflict answer it always had, with the reason also recorded on the plan. An unverified
+      // mapping set answers exactly as /execute does — the unfinished tail of a crashed run is no
+      // more entitled to an unverified set than a fresh run — and leaves the plan approved (this
+      // route has already handed it back as such), to run once Verify passes.
       const message = (err as Error).message
-      return reply.code(message.includes('does not exist') ? 404 : 409).send({ error: message })
+      if (err instanceof ExecutionRefused) {
+        if (err.code === 'verification') return reply.code(412).send({ error: 'verification', reason: message })
+        return reply.code(err.code === 'not-found' ? 404 : err.code === 'error' ? 500 : 409).send({ error: message })
+      }
+      return reply.code(409).send({ error: message })
     }
   })
 
@@ -291,31 +312,6 @@ export function registerPlanRoutes(app: FastifyInstance, deps: PlanRoutesDeps): 
     return reply.send({ entries, total })
   })
 
-  /**
-   * Read-only, and deliberately narrow: only the numbers Settings needs to explain WHY a guard
-   * fired (min ratio / seed days, the protected category and tag lists) or why a delete went to
-   * the trash instead of being unlinked outright (the trash size ceiling and retention window).
-   * Nothing here can be written back through this route — editing these values is a config-file
-   * change, not a Jellymaid API call — so there is no risk of this becoming a second, competing
-   * way to set what `evaluateGuards`/`moveToTrash` actually enforce.
-   *
-   * `config.guards` also carries `privateTrackerHosts` — the operator's private-tracker list, and
-   * not something this read-only settings display has any business publishing. Deliberately NOT
-   * destructured into a local `guards`/`trash` object the way this route used to: a `const {
-   * guards, trash } = ...config` sitting in scope is an invitation for some future edit to shortcut
-   * a new field with `...guards`, silently republishing the whole object, host list included.
-   * Reading each field off `deps.plannerDeps().config` directly leaves no such object lying around
-   * to spread.
-   */
-  app.get('/api/config/thresholds', guard, async (_req, reply) => {
-    const config = deps.plannerDeps().config
-    return reply.send({
-      minRatio: config.guards.minRatio,
-      minSeedTimeDays: config.guards.minSeedTimeDays,
-      protectedCategories: config.guards.protectedCategories,
-      protectedTags: config.guards.protectedTags,
-      trashMaxBytes: config.trash.maxBytes,
-      trashRetentionDays: config.trash.retentionDays,
-    })
-  })
+  // GET /api/config/thresholds is served by the settings routes (src/api/settings.ts), beside the
+  // PUT that now edits the same values. One app cannot register a path twice.
 }

@@ -1,9 +1,12 @@
 import { useState } from 'react'
 import type { Api, ExplorerEntry, RequestedAction } from '../api.js'
 import { useAsync } from '../hooks.js'
-import { Bytes, EmptyState } from '../components/index.js'
+import { Bytes, EmptyState, Pager } from '../components/index.js'
 
 type ExplorerApi = Pick<Api, 'explorer'>
+
+/** Entries per page. The server answers at most 1,000 (C12); 500 is also its own default. */
+const EXPLORER_PAGE_SIZE = 500
 
 /**
  * The read-only ground-truth screen: it browses the INDEX (fast at 100k+ entries — see
@@ -50,7 +53,15 @@ function breadcrumbSegments(path: string): Array<{ label: string; path: string }
 
 export function Explorer({ api, onQueue }: { api: ExplorerApi; onQueue: (actions: RequestedAction[]) => void }) {
   const [path, setPath] = useState<string | undefined>(undefined)
-  const list = useAsync(() => api.explorer(path), [path])
+  // A directory can hold thousands of entries (a flat downloads folder), so it is read a page at a
+  // time; opening any directory starts again at its first page.
+  const [offset, setOffset] = useState(0)
+  const list = useAsync(() => api.explorer(path, { offset, limit: EXPLORER_PAGE_SIZE }), [path, offset])
+
+  function open(next: string | undefined) {
+    setPath(next)
+    setOffset(0)
+  }
 
   // Keyed by path and populated at SELECTION time (not looked up again at queue time): navigating
   // to a different directory replaces `list.data.entries` entirely, so a plain set of selected ids
@@ -80,7 +91,7 @@ export function Explorer({ api, onQueue }: { api: ExplorerApi; onQueue: (actions
   return (
     <div className="explorer">
       <nav className="explorer-breadcrumb" aria-label="Path">
-        <button type="button" className="btn btn-quiet" onClick={() => setPath(undefined)}>
+        <button type="button" className="btn btn-quiet" onClick={() => open(undefined)}>
           Roots
         </button>
         {list.data
@@ -92,7 +103,7 @@ export function Explorer({ api, onQueue }: { api: ExplorerApi; onQueue: (actions
                   // torrent-named directory in practice — rendered as a text node only.
                   <span className="explorer-crumb-current">{seg.label}</span>
                 ) : (
-                  <button type="button" className="btn btn-quiet" onClick={() => setPath(seg.path)}>
+                  <button type="button" className="btn btn-quiet" onClick={() => open(seg.path)}>
                     {seg.label}
                   </button>
                 )}
@@ -101,11 +112,22 @@ export function Explorer({ api, onQueue }: { api: ExplorerApi; onQueue: (actions
           : null}
       </nav>
 
+      {/* `total` comes with every listing below a root; the roots listing is complete as sent. */}
+      {list.data && !list.error && list.data.total !== undefined ? (
+        <Pager
+          offset={list.data.offset ?? offset}
+          limit={list.data.limit ?? EXPLORER_PAGE_SIZE}
+          total={list.data.total}
+          noun={['entry', 'entries']}
+          onOffset={setOffset}
+        />
+      ) : null}
+
       {list.error ? (
         <p className="alert" role="alert"><span>{list.error}</span></p>
       ) : !list.data ? (
         <EmptyState>Loading…</EmptyState>
-      ) : list.data.entries.length === 0 && parent === null ? (
+      ) : list.data.entries.length === 0 && parent === null && !list.data.total ? (
         <EmptyState>Nothing here.</EmptyState>
       ) : (
         <table className="table explorer-table">
@@ -123,7 +145,7 @@ export function Explorer({ api, onQueue }: { api: ExplorerApi; onQueue: (actions
               <tr className="explorer-up-row">
                 <td />
                 <td>
-                  <button type="button" className="btn btn-quiet" onClick={() => setPath(parent)}>
+                  <button type="button" className="btn btn-quiet" onClick={() => open(parent)}>
                     Up one level
                   </button>
                 </td>
@@ -153,7 +175,7 @@ export function Explorer({ api, onQueue }: { api: ExplorerApi; onQueue: (actions
                       // A directory or file name comes straight off the scanned filesystem — a
                       // torrent-named directory is attacker-influenced text in practice — rendered
                       // as a text node only, here as a plain button label, never as markup.
-                      <button type="button" className="btn btn-quiet explorer-dir" onClick={() => setPath(entry.path)}>
+                      <button type="button" className="btn btn-quiet explorer-dir" onClick={() => open(entry.path)}>
                         {entry.name}
                       </button>
                     ) : (

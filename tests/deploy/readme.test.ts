@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { ACTION_TYPES } from '../../src/core/types.js'
+import { parseQbitInstances } from '../../src/config/load.js'
 
 const readme = () => readFileSync(new URL('../../README.md', import.meta.url), 'utf8')
 const executorSource = () => readFileSync(new URL('../../src/plan/executor.ts', import.meta.url), 'utf8')
@@ -36,7 +37,9 @@ describe('README', () => {
   })
 
   it('lists every required environment variable', () => {
-    for (const key of ['JELLYFIN_URL', 'JELLYFIN_API_KEY', 'QBIT_URL', 'QBIT_USER', 'QBIT_PASS']) {
+    // QBIT_INSTANCES names the qBittorrent instances (QBIT_URL is only the older single-instance
+    // form, and credentials are optional and per instance), so only these are "required".
+    for (const key of ['JELLYFIN_URL', 'JELLYFIN_API_KEY', 'QBIT_INSTANCES']) {
       expect(readme()).toContain(key)
     }
   })
@@ -77,9 +80,9 @@ describe('README delete pipeline matches executor.ts', () => {
 
   it('the "How a delete actually runs" section names the same five steps in the same order', () => {
     const start = readme().indexOf('## How a delete actually runs')
-    const end = readme().indexOf('## The five guards')
+    const end = readme().indexOf('## The guards')
     expect(start, 'expected a "## How a delete actually runs" heading').toBeGreaterThan(-1)
-    expect(end, 'expected a "## The five guards" heading after it').toBeGreaterThan(start)
+    expect(end, 'expected a "## The guards" heading after it').toBeGreaterThan(start)
     const section = readme().slice(start, end)
     const order = orderOf(section, 'README "How a delete actually runs" section')
     expect(order).toEqual([...order].sort((a, b) => a - b))
@@ -108,6 +111,29 @@ describe('README environment variables match src/config/load.ts', () => {
     QBIT_URL: 'QBIT_URL', QBIT_USER: 'QBIT_USER', QBIT_PASS: 'QBIT_PASS',
     RADARR_URL: "requireArr(env, 'RADARR'", RADARR_API_KEY: "requireArr(env, 'RADARR'",
     SONARR_URL: "requireArr(env, 'SONARR'", SONARR_API_KEY: "requireArr(env, 'SONARR'",
+    QBIT_INSTANCES: 'QBIT_INSTANCES',
+  }
+
+  /**
+   * `QBIT_<ID>_USER` / `QBIT_<ID>_PASS` are built at runtime from each instance's id (the same
+   * template trick as the *arr pairs), so a literal example such as `QBIT_BOX_A_USER` never appears
+   * in load.ts. Proving one is real means asking the loader: give the instance the id the name
+   * implies, set the variable, and see whether it arrives.
+   */
+  const perInstanceCredential = /^QBIT_([A-Z0-9]+(?:_[A-Z0-9]+)*)_(USER|PASS)$/
+
+  function loaderReadsPerInstanceVariable(name: string): boolean {
+    const m = name.match(perInstanceCredential)
+    if (!m || m[1] === undefined) return false
+    const id = m[1].toLowerCase().replaceAll('_', '-')
+    const partner = name.endsWith('_USER') ? name.replace(/_USER$/, '_PASS') : name.replace(/_PASS$/, '_USER')
+    const problems: string[] = []
+    const [instance] = parseQbitInstances(
+      { QBIT_INSTANCES: `${id}=http://198.51.100.10:8080`, [name]: 'documented', [partner]: 'partner' } as NodeJS.ProcessEnv,
+      problems,
+    )
+    const arrived = name.endsWith('_USER') ? instance?.user : instance?.pass
+    return problems.length === 0 && arrived === 'documented'
   }
 
   it('every real env var the README documents is actually read by loadConfig', () => {
@@ -137,6 +163,9 @@ describe('README environment variables match src/config/load.ts', () => {
       if (claimedAbsent) {
         expect(load, `README says \`${name}\` does not exist, but src/config/load.ts reads it anyway`)
           .not.toContain(name)
+      } else if (perInstanceCredential.test(name) && !(name in REAL_ENV_VARS)) {
+        expect(loaderReadsPerInstanceVariable(name), `\`${name}\` is documented as a per-instance credential variable, but the loader does not read it for the instance id it implies`)
+          .toBe(true)
       } else {
         expect(Object.keys(REAL_ENV_VARS), `\`${name}\` is documented without a "there is no" disclaimer, so it must be a real, documented variable — add it to REAL_ENV_VARS here once verified against src/config/load.ts`)
           .toContain(name)

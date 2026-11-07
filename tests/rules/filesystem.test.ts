@@ -114,6 +114,54 @@ describe('fs.orphan-media', () => {
   })
 })
 
+describe('fs.orphan-media ignores what Jellyfin never lists as items', () => {
+  const media = (path: string, root = '/mnt/m') => entry({
+    container_path: path, parent_path: path.slice(0, path.lastIndexOf('/')), name: path.slice(path.lastIndexOf('/') + 1),
+    ext: path.slice(path.lastIndexOf('.')).toLowerCase(), is_media: 1, size_bytes: 100, library_root: root,
+  })
+
+  it('orphan-media ignores BDMV, VIDEO_TS and extras folders', () => {
+    // A disc structure is one Jellyfin item (the folder), and an extras folder's videos are attached
+    // to their movie, never listed as items — so none of these is an orphan.
+    const ignored = [
+      '/mnt/m/Movie (2000)/BDMV/STREAM/00001.m2ts',
+      '/mnt/m/Movie (2000)/VIDEO_TS/VTS_01_1.VOB',
+      '/mnt/m/Movie (2000)/Extras/Interview.mkv',
+      '/mnt/m/Movie (2000)/Featurettes/Making Of.mkv',
+      '/mnt/m/Movie (2000)/Behind The Scenes/On Set.mkv',
+      '/mnt/m/Movie (2000)/deleted scenes/Alt Ending.mkv',
+      '/mnt/m/Movie (2000)/Interviews/Director.mkv',
+      '/mnt/m/Movie (2000)/Scenes/Opening.mkv',
+      '/mnt/m/Movie (2000)/Shorts/Short.mkv',
+      '/mnt/m/Movie (2000)/Trailers/Trailer.mkv',
+      '/mnt/m/Movie (2000)/Other/Gag Reel.mkv',
+      '/mnt/m/Movie.2000.1080p.BluRay.x264-GRP/Sample/sample-grp.mkv',
+      '/mnt/m/Movie (2000)/Samples/clip.mkv',
+      '/mnt/m/Movie (2000)/Clips/clip.mkv',
+    ]
+    for (const p of ignored) media(p)
+    media('/mnt/m/Orphan (2001)/Orphan.mkv')
+
+    const f = rule('fs.orphan-media').run(ctx())
+    expect(f.map((x) => x.subjects[0]!.path)).toEqual(['/mnt/m/Orphan (2001)/Orphan.mkv'])
+  })
+
+  it('judges only the folders below the library root, never the root\'s own path', () => {
+    // A root that happens to be called "other" or "extras" must not silence every file under it.
+    media('/mnt/other/Orphan (2001)/Orphan.mkv', '/mnt/other')
+    media('/mnt/extras/movies/Lost (2002)/Lost.mkv', '/mnt/extras/movies')
+    const f = rule('fs.orphan-media').run(ctx())
+    expect(f.map((x) => x.subjects[0]!.path).sort()).toEqual([
+      '/mnt/extras/movies/Lost (2002)/Lost.mkv', '/mnt/other/Orphan (2001)/Orphan.mkv',
+    ])
+  })
+
+  it('still reports a video whose own file name merely looks like a folder it ignores', () => {
+    media('/mnt/m/Trailers (2015)/Trailers (2015).mkv')
+    expect(rule('fs.orphan-media').run(ctx())).toHaveLength(1)
+  })
+})
+
 describe('fs.missing-file', () => {
   it('reports a Jellyfin item whose path is absent from the index', () => {
     jfItem('i1', '/mnt/m/Gone.mkv')

@@ -5,20 +5,27 @@ import type { Resolution } from '../../src/plan/resolve.js'
 
 const config = (over = {}) => fileConfigSchema.parse({ guards: { minRatio: 1.0, minSeedTimeDays: 14, ...over } })
 
+/** One file of a torrent's list. Sizes default to a film-sized file so nothing is "small" by accident. */
+const file = (relPath: string, containerPath: string | null, sizeBytes = 1_000_000) => ({ relPath, containerPath, sizeBytes })
+
+/** A torrent's whole file list, in the shape the resolver reports it. */
+const filesOf = (...entries: Array<ReturnType<typeof file>>) => ({ count: entries.length, entries })
+
 const torrent = (over = {}) => ({
-  hash: 'H1', name: 'Heat', category: null, tags: [] as string[], state: 'stalledUP',
+  instanceId: 'box-a', hash: 'H1', name: 'Heat', category: null, tags: [] as string[], state: 'stalledUP',
   ratio: 2, seedingTimeSeconds: 30 * 86_400, isPrivate: false, trackerHost: 't.example',
-  privacySource: 'flag' as const, matchedBy: 'inode' as const,
+  privacySource: 'flag' as const, matchedBy: 'inode' as const, sizeBytes: 1_000_000, companionCount: 0,
   // A single-file torrent owning exactly the resolution's own path: the shape that makes
   // "remove the torrent with its data" mean what the operator thinks it means.
-  files: { count: 1, paths: ['/mnt/m/Heat.mkv'] }, ...over,
+  files: filesOf(file('Heat.mkv', '/mnt/m/Heat.mkv')), ...over,
 })
 
+/** Defaults to a root no torrent saves into, so guard.untracked has nothing to say unless a test asks it. */
 const resolution = (over: Partial<Resolution> = {}): Resolution => ({
   path: '/mnt/m/Heat.mkv', exists: true, sizeBytes: 100, dev: 1, inode: 2, nlink: 1,
   hardlinks: ['/mnt/m/Heat.mkv'], torrents: [], arr: [], root: null, sourcesUnavailable: [],
   jellyfin: { itemId: null, isAlternateVersion: false, siblingPaths: [] },
-  isDirectory: false, arrUnmappable: { count: 0, samples: [] },
+  isDirectory: false, arrUnmappable: { count: 0, samples: [] }, torrentSource: { kind: 'none' },
   ...over,
 })
 
@@ -80,6 +87,16 @@ describe('guard.cross-seed', () => {
     expect(v.outcome).toBe('block')
     expect(v.overridable).toBe(true)
     expect(v.evidence.hashes).toEqual(['A', 'B'])
+  })
+
+  it('tells two boxes seeding the same infohash apart in its evidence', () => {
+    const v = verdict(evaluateGuards(resolution({
+      torrents: [torrent({ hash: 'same' }), torrent({ instanceId: 'box-b', hash: 'same' })],
+    }), config()), 'guard.cross-seed')
+    expect(v.outcome).toBe('block')
+    expect(v.evidence.torrents).toEqual([
+      { instanceId: 'box-a', hash: 'same', name: 'Heat' }, { instanceId: 'box-b', hash: 'same', name: 'Heat' },
+    ])
   })
 })
 
@@ -195,6 +212,30 @@ describe('guard.protected', () => {
   // are simply unconfigured (null is a legitimate 'not used')", not assumed here. A `Resolution`
   // built the way that test proves (`sourcesUnavailable: []`) must not wedge every delete just
   // because an operator has no *arr integration at all.
+  it('blocks, with no override, when one qBittorrent instance could not be verified, and names it', () => {
+    const v = verdict(evaluateGuards(resolution({ sourcesUnavailable: ['qbittorrent:box-b'] }), config()), 'guard.protected')
+    expect(v.outcome).toBe('block')
+    expect(v.overridable).toBe(false)
+    expect(v.reason).toMatch(/box-b/)
+  })
+
+  it('names the mapping hole, with no override, when no instance can be determined for the path', () => {
+    const hole = 'the mapping for /mnt/m names qBittorrent path /movies but no instance'
+    const v = verdict(evaluateGuards(resolution({
+      torrentSource: { kind: 'unknown', reason: hole }, sourcesUnavailable: ['qbittorrent'],
+    }), config()), 'guard.protected')
+    expect(v.outcome).toBe('block')
+    expect(v.overridable).toBe(false)
+    expect(v.reason).toContain(hole)
+  })
+
+  it('names every unavailable instance when several are', () => {
+    const v = verdict(evaluateGuards(resolution({ sourcesUnavailable: ['qbittorrent:box-a', 'qbittorrent:box-b'] }), config()), 'guard.protected')
+    expect(v.outcome).toBe('block')
+    expect(v.reason).toMatch(/box-a/)
+    expect(v.reason).toMatch(/box-b/)
+  })
+
   it('does not block when *arr is simply not configured — sourcesUnavailable stays empty per the resolver', () => {
     const v = verdict(evaluateGuards(resolution({ sourcesUnavailable: [] }), config()), 'guard.protected')
     expect(v.outcome).toBe('pass')
@@ -203,8 +244,81 @@ describe('guard.protected', () => {
 
 describe('guard.torrent-scope', () => {
   const pack = (over = {}) => torrent({
-    files: { count: 12, paths: ['/mnt/m/Heat.mkv', ...Array.from({ length: 11 }, (_, i) => `/mnt/m/E${i}.mkv`)] },
+    files: filesOf(file('Heat.mkv', '/mnt/m/Heat.mkv'), ...Array.from({ length: 11 }, (_, i) => file(`E${i}.mkv`, `/mnt/m/E${i}.mkv`))),
     ...over,
+  })
+
+  /** A movie released the way the owner's torrents arrive: the film, its sidecars and a sample. */
+  const movieRelease = () => filesOf(
+    file('Heat/Heat.mkv', '/mnt/m/Heat.mkv', 8_000_000_000),
+    file('Heat/Heat.nfo', '/mnt/m/Heat.nfo', 4_000),
+    file('Heat/Subs/Eng.srt', '/mnt/m/Subs/Eng.srt', 90_000),
+    file('Heat/Sample/sample.mkv', '/mnt/m/Sample/sample.mkv', 60_000_000),
+  )
+
+  it('torrent-scope ignores companion files', () => {
+    const v = verdict(evaluateGuards(resolution({ torrents: [torrent({ files: movieRelease() })] }), config()), 'guard.torrent-scope')
+    expect(v.outcome).toBe('pass')
+    // The operator is still told what goes along with the film.
+    expect(v.evidence.companionFiles).toBe(3)
+  })
+
+  it('torrent-scope still blocks a partially queued pack', () => {
+    // Ten episodes and an .nfo, one episode queued. The .nfo is a companion and is not counted;
+    // the nine other episodes are media the plan never named.
+    const season = filesOf(
+      ...Array.from({ length: 10 }, (_, i) => file(`Show/S01E${i + 1}.mkv`, `/mnt/m/S01E${i + 1}.mkv`)),
+      file('Show/Show.nfo', '/mnt/m/Show.nfo', 2_000),
+    )
+    const v = verdict(evaluateGuards(resolution({
+      path: '/mnt/m/S01E1.mkv', hardlinks: ['/mnt/m/S01E1.mkv'], torrents: [torrent({ files: season })],
+    }), config()), 'guard.torrent-scope')
+    expect(v.outcome).toBe('block')
+    expect(v.overridable).toBe(true)
+    const offenders = v.evidence.offenders as Array<{ instanceId: string; filesNotInPlan: number; fileCount: number }>
+    expect(offenders[0]).toMatchObject({ instanceId: 'box-a', fileCount: 11, filesNotInPlan: 9 })
+    expect(v.reason).toMatch(/9 media file/)
+  })
+
+  it('counts a film whose name merely looks like a sample as media, not a companion (Ruling 11)', () => {
+    const v = verdict(evaluateGuards(resolution({
+      torrents: [torrent({
+        files: filesOf(
+          file('Pack/Heat.mkv', '/mnt/m/Heat.mkv', 8_000_000_000),
+          file('Pack/Sample City (1999).mkv', '/mnt/m/Sample City (1999).mkv', 6_000_000_000),
+        ),
+      })],
+    }), config()), 'guard.torrent-scope')
+    expect(v.outcome).toBe('block')
+    expect((v.evidence.offenders as Array<{ filesNotInPlan: number }>)[0]!.filesNotInPlan).toBe(1)
+  })
+
+  it('counts an oversized sample as media, so it blocks and needs an override', () => {
+    const v = verdict(evaluateGuards(resolution({
+      torrents: [torrent({
+        files: filesOf(
+          file('Heat/Heat.mkv', '/mnt/m/Heat.mkv', 1_000),
+          file('Heat/Sample/sample.mkv', '/mnt/m/Sample/sample.mkv', 100),
+        ),
+      })],
+    }), config()), 'guard.torrent-scope')
+    expect(v.outcome).toBe('block')
+  })
+
+  it('lets a companion no mapping covers go with the release — it is still a companion', () => {
+    const v = verdict(evaluateGuards(resolution({
+      torrents: [torrent({ files: filesOf(file('Heat/Heat.mkv', '/mnt/m/Heat.mkv'), file('Heat/Heat.nfo', null, 10)) })],
+    }), config()), 'guard.torrent-scope')
+    expect(v.outcome).toBe('pass')
+  })
+
+  it('blocks when the target is itself only a companion of a film the plan does not name', () => {
+    // Deleting a sample must never take the film it was cut from.
+    const v = verdict(evaluateGuards(resolution({
+      path: '/mnt/m/Sample/sample.mkv', hardlinks: ['/mnt/m/Sample/sample.mkv'],
+      torrents: [torrent({ files: movieRelease() })],
+    }), config()), 'guard.torrent-scope')
+    expect(v.outcome).toBe('block')
   })
 
   it('passes when the target is the torrent\'s only file', () => {
@@ -223,9 +337,9 @@ describe('guard.torrent-scope', () => {
   })
 
   it('passes when every one of the torrent\'s files is targeted by the plan', () => {
-    const files = { count: 2, paths: ['/mnt/m/Heat.mkv', '/mnt/m/Heat-cd2.mkv'] }
+    const files = filesOf(file('Heat.mkv', '/mnt/m/Heat.mkv'), file('Heat-cd2.mkv', '/mnt/m/Heat-cd2.mkv'))
     const v = verdict(
-      evaluateGuards(resolution({ torrents: [torrent({ files })] }), config(), { plannedPaths: files.paths }),
+      evaluateGuards(resolution({ torrents: [torrent({ files })] }), config(), { plannedPaths: ['/mnt/m/Heat.mkv', '/mnt/m/Heat-cd2.mkv'] }),
       'guard.torrent-scope',
     )
     expect(v.outcome).toBe('pass')
@@ -235,23 +349,23 @@ describe('guard.torrent-scope', () => {
     // A hash qBittorrent no longer has answers []. Read as "zero files", filesNotInPlan is zero and
     // the guard would wave through a delete-with-data on the strength of an empty answer.
     const v = verdict(
-      evaluateGuards(resolution({ torrents: [torrent({ files: { count: 0, paths: [] } })] }), config()),
+      evaluateGuards(resolution({ torrents: [torrent({ files: filesOf() })] }), config()),
       'guard.torrent-scope',
     )
     expect(v.outcome).toBe('block')
     expect(v.reason).toMatch(/no files/i)
   })
 
-  it('blocks when the torrent file list could not be read at all', () => {
-    const v = verdict(evaluateGuards(resolution({ torrents: [torrent({ files: null })] }), config()), 'guard.torrent-scope')
+  it('torrent-scope blocks an unreadable file list', () => {
+    const v = verdict(evaluateGuards(resolution({ torrents: [torrent({ files: null, companionCount: null })] }), config()), 'guard.torrent-scope')
     expect(v.outcome).toBe('block')
     expect(v.overridable).toBe(true)
     expect(v.reason).toMatch(/file list/i)
   })
 
-  it('counts a file whose path no mapping covers as one the plan does not target', () => {
+  it('counts a media file whose path no mapping covers as one the plan does not target', () => {
     const v = verdict(
-      evaluateGuards(resolution({ torrents: [torrent({ files: { count: 2, paths: ['/mnt/m/Heat.mkv'] } })] }), config()),
+      evaluateGuards(resolution({ torrents: [torrent({ files: filesOf(file('Heat.mkv', '/mnt/m/Heat.mkv'), file('Other.mkv', null)) })] }), config()),
       'guard.torrent-scope',
     )
     expect(v.outcome).toBe('block')
@@ -264,7 +378,7 @@ describe('guard.torrent-scope', () => {
     const v = verdict(evaluateGuards(resolution({
       nlink: 2,
       hardlinks: ['/mnt/m/Heat.mkv', '/downloads/Heat.mkv'],
-      torrents: [torrent({ files: { count: 1, paths: ['/downloads/Heat.mkv'] } })],
+      torrents: [torrent({ files: filesOf(file('Heat.mkv', '/downloads/Heat.mkv')) })],
     }), config()), 'guard.torrent-scope')
     expect(v.outcome).toBe('pass')
   })
@@ -334,5 +448,67 @@ describe('isBlocked', () => {
   it('is not blocked by a warn verdict', () => {
     const v = evaluateGuards(resolution({ nlink: 2, hardlinks: ['/a', '/b'] }), config())
     expect(isBlocked(v, []).blocked).toBe(false)
+  })
+})
+
+describe('guard.untracked', () => {
+  const boxA = { kind: 'instance', instanceId: 'box-a' } as const
+
+  it('guard.untracked blocks (overridable) a file in a torrent-backed root that no torrent owns, and passes in a root with source none', () => {
+    // Nothing would remove this file but a raw unlink, in a root box A saves its torrents into. Either
+    // it is a leftover — which the override says, in so many words — or a torrent the index and box
+    // A both failed to tie to it is still seeding it.
+    const v = verdict(evaluateGuards(resolution({ torrentSource: boxA }), config()), 'guard.untracked')
+    expect(v.outcome).toBe('block')
+    expect(v.overridable).toBe(true)
+    expect(v.reason).toMatch(/box-a/)
+    expect(v.evidence.instanceId).toBe('box-a')
+    expect(isBlocked([v], ['guard.untracked']).blocked).toBe(false)
+
+    expect(verdict(evaluateGuards(resolution({ torrentSource: { kind: 'none' } }), config()), 'guard.untracked').outcome).toBe('pass')
+  })
+
+  it('passes when a torrent owns the file', () => {
+    const v = verdict(evaluateGuards(resolution({ torrentSource: boxA, torrents: [torrent()] }), config()), 'guard.untracked')
+    expect(v.outcome).toBe('pass')
+  })
+
+  it('passes for a path that is already gone, and for a directory — neither is a file to unlink', () => {
+    expect(verdict(evaluateGuards(resolution({ torrentSource: boxA, exists: false }), config()), 'guard.untracked').outcome).toBe('pass')
+    expect(verdict(evaluateGuards(resolution({ torrentSource: boxA, isDirectory: true }), config()), 'guard.untracked').outcome).toBe('pass')
+  })
+
+  it("passes a file whose torrent this run already removed with its data, only while its bytes are that torrent's", () => {
+    // The next episode of a fully queued pack, still on disk while qBittorrent finishes deleting it:
+    // its torrent is gone from the fresh list because an earlier action of this run removed it.
+    const removed = (identity: { dev: number; inode: number; sizeBytes: number } | null) => ({
+      removedThisRun: new Map([['/mnt/m/Heat.mkv', { torrents: [{ instanceId: 'box-a', hash: 'hp' }], identity }]]),
+    })
+    const r = resolution({ torrentSource: boxA })
+    const same = verdict(evaluateGuards(r, config(), removed({ dev: 1, inode: 2, sizeBytes: 100 })), 'guard.untracked')
+    expect(same.outcome).toBe('pass')
+    expect(same.reason).toMatch(/hp on box-a/)
+    expect(same.evidence.removedTorrents).toEqual([{ instanceId: 'box-a', hash: 'hp' }])
+
+    // Anything else at the path is judged like any other file: a new inode, a new size, or nothing
+    // recorded at all (the path was empty when the torrent went).
+    for (const identity of [{ dev: 1, inode: 3, sizeBytes: 100 }, { dev: 1, inode: 2, sizeBytes: 99 }, null]) {
+      expect(verdict(evaluateGuards(r, config(), removed(identity)), 'guard.untracked').outcome).toBe('block')
+    }
+    // ...and the planner, which passes no such map, never sees the pass.
+    expect(verdict(evaluateGuards(r, config()), 'guard.untracked').outcome).toBe('block')
+  })
+
+  it("leaves an instance that could not be asked to guard.protected, so no override is invited for a block that cannot be overridden", () => {
+    const r = resolution({ torrentSource: boxA, sourcesUnavailable: ['qbittorrent:box-a'] })
+    expect(verdict(evaluateGuards(r, config()), 'guard.untracked').outcome).toBe('pass')
+    expect(verdict(evaluateGuards(r, config()), 'guard.protected').outcome).toBe('block')
+  })
+
+  it('runs alongside the other five, one verdict per guard', () => {
+    expect(evaluateGuards(resolution(), config()).map((v) => v.guard).sort()).toEqual([
+      'guard.cross-seed', 'guard.hardlink', 'guard.private-ratio', 'guard.protected', 'guard.torrent-scope',
+      'guard.untracked',
+    ])
   })
 })

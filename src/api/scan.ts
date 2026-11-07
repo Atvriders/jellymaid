@@ -21,9 +21,13 @@ export function registerScanRoutes(
     // src/scan/verification.ts. This route only maps its refusal onto a status code.
     const result = deps.runner.start(parsed.data)
     if ('error' in result) {
-      return result.reason === 'unverified'
-        ? reply.code(412).send({ error: result.error, forcible: true })
-        : reply.code(409).send({ error: result.error })
+      if (result.reason === 'unverified') return reply.code(412).send({ error: result.error, forcible: true })
+      // Busy: another scan, a plan that holds the ActivityLock, or a server shutting down. The
+      // runner's result puts its prose in `error` and the machine word in `reason`; on the wire it is
+      // C12's shape, the same as the plans route's 409 — `error` the word, `reason` the prose — since
+      // the client shows `reason` whenever one is sent. Forwarded the runner's way round, the
+      // operator would read "busy" and never learn WHAT holds the lock (Ruling 14).
+      return reply.code(409).send({ error: 'busy', reason: result.error })
     }
     return reply.code(202).send(result)
   })

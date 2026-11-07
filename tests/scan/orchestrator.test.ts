@@ -11,7 +11,7 @@ import type { Phase } from '../../src/scan/phases/types.js'
 let db: Db
 const deps = () => ({
   config: fileConfigSchema.parse({}), pathMap: createPathMap([]),
-  jellyfin: null, qbittorrent: null, radarr: null, sonarr: null, hasher: null,
+  jellyfin: null, qbittorrents: new Map(), radarr: null, sonarr: null, hasher: null,
 })
 
 const fakePhase = (name: string, impl: Phase['run']): Phase => ({ name: name as Phase['name'], run: impl })

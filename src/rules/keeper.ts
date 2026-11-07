@@ -1,3 +1,5 @@
+import type { KeeperPolicy } from '../config/schema.js'
+
 export interface MemberFacts {
   itemId: string
   height: number | null
@@ -52,19 +54,40 @@ export function scoreMember(m: MemberFacts, w: KeeperWeights): { total: number; 
   return { total, breakdown }
 }
 
+/**
+ * Which copy of a duplicate group is pre-selected to KEEP, per `config.keeper.policy`:
+ *  - `best-quality`: the highest score under `w`, ties going to the larger file, then the lower id;
+ *  - `smallest`: the smallest file, ties going to the higher score, then the lower id. A copy whose
+ *    size is unknown, or zero (a broken file — `fs.junk` reports zero-byte media), is not shown to
+ *    be the smallest and never wins; with no copy of known size there is no smallest and the keeper
+ *    is null;
+ *  - `none`: null — the operator picks.
+ * A null keeper pre-selects nothing for deletion. Scores are returned for every member under every
+ * policy, so the comparison the operator decides from is the same whichever policy is set.
+ */
 export function pickKeeper(
   members: MemberFacts[],
   w: KeeperWeights,
-): { keeperId: string; scores: Record<string, { total: number; breakdown: Record<string, number> }> } {
+  policy: KeeperPolicy = 'best-quality',
+): { keeperId: string | null; scores: Record<string, { total: number; breakdown: Record<string, number> }> } {
   const scores: Record<string, { total: number; breakdown: Record<string, number> }> = {}
   for (const m of members) scores[m.itemId] = scoreMember(m, w)
+  if (policy === 'none') return { keeperId: null, scores }
 
-  const sorted = [...members].sort((a, b) => {
+  const byQuality = (a: MemberFacts, b: MemberFacts): number => {
     const diff = scores[b.itemId]!.total - scores[a.itemId]!.total
     if (Math.abs(diff) > 1e-9) return diff
     const size = (b.sizeBytes ?? 0) - (a.sizeBytes ?? 0)
     if (size !== 0) return size
     return a.itemId.localeCompare(b.itemId)
-  })
-  return { keeperId: sorted[0]!.itemId, scores }
+  }
+
+  if (policy === 'smallest') {
+    const sized = members.filter((m) => m.sizeBytes !== null && m.sizeBytes > 0)
+    const sorted = sized.sort((a, b) => (a.sizeBytes! - b.sizeBytes!) || byQuality(a, b))
+    return { keeperId: sorted[0]?.itemId ?? null, scores }
+  }
+
+  const sorted = [...members].sort(byQuality)
+  return { keeperId: sorted[0]?.itemId ?? null, scores }
 }

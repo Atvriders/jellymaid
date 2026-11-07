@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { normalizeTitle, trigramSimilarity } from '../../src/rules/normalize.js'
+import { editionOf, isMultiEpisodeFile, normalizeTitle, trigramSimilarity } from '../../src/rules/normalize.js'
 
 describe('normalizeTitle', () => {
   const cases: Array<[string, string]> = [
@@ -78,4 +78,78 @@ describe('trigramSimilarity', () => {
   it('is symmetric', () => {
     expect(trigramSimilarity('alien', 'aliens')).toBe(trigramSimilarity('aliens', 'alien'))
   })
+})
+
+describe('editionOf', () => {
+  it("editionOf recognises Extended, Director's Cut, Unrated, Theatrical, IMAX, Final Cut, Ultimate, Special Edition, Remastered, Criterion", () => {
+    const cases: Array<[string, string]> = [
+      ['Aliens.1986.Extended.Cut.1080p.BluRay.x264-GRP.mkv', 'Extended'],
+      ["Kingdom of Heaven (2005) - Director's Cut.mkv", "Director's Cut"],
+      ['Blade.Runner.1982.Directors.Cut.1080p.BluRay.mkv', "Director's Cut"],
+      ['Kingdom of Heaven (2005) - Director’s Cut.mkv', "Director's Cut"],
+      ['Kingdom of Heaven (2005) - Directorʼs Cut.mkv', "Director's Cut"],
+      ['Kingdom.of.Heaven.2005.Director`s.Cut.mkv', "Director's Cut"],
+      ['Old.School.2003.UNRATED.720p.BluRay.mkv', 'Unrated'],
+      ['Aliens 1986 Theatrical 1080p.mkv', 'Theatrical'],
+      ['Dune.Part.Two.2024.IMAX.2160p.WEB-DL.mkv', 'IMAX'],
+      ['Blade Runner: The Final Cut', 'Final Cut'],
+      ['Batman.v.Superman.2016.Ultimate.Edition.1080p.BluRay.mkv', 'Ultimate'],
+      ['Aliens (1986) {edition-Special Edition}.mkv', 'Special Edition'],
+      ['Jaws.1975.REMASTERED.1080p.BluRay.mkv', 'Remastered'],
+      ['Seven.Samurai.1954.Criterion.1080p.BluRay.mkv', 'Criterion'],
+    ]
+    for (const [input, expected] of cases) expect(editionOf(input), input).toBe(expected)
+  })
+
+  it('returns null when no edition is named', () => {
+    for (const input of ['Heat.1995.1080p.BluRay.x264-GROUP.mkv', 'The Bourne Ultimatum', 'Cut Bank (2014)', 'Heat']) {
+      expect(editionOf(input), input).toBeNull()
+    }
+  })
+
+  it('lists every edition a name carries, in one canonical order', () => {
+    // "Remastered Director's Cut" and "Director's Cut Remastered" are one edition; both differ from
+    // a plain Director's Cut.
+    expect(editionOf('Movie.1990.Remastered.Directors.Cut.mkv')).toBe("Director's Cut, Remastered")
+    expect(editionOf('Movie.1990.Directors.Cut.Remastered.mkv')).toBe("Director's Cut, Remastered")
+  })
+
+  it("reads a path's file name first and falls back to its release folder", () => {
+    expect(editionOf('/path/to/movies/Aliens (1986)/Aliens (1986) - Theatrical.mkv')).toBe('Theatrical')
+    expect(editionOf('/path/to/movies/Aliens.1986.Special.Edition.1080p/grp-aliens-1080p.mkv')).toBe('Special Edition')
+    expect(editionOf('/path/to/movies/Movie.Extended/Movie.Theatrical.mkv')).toBe('Theatrical')
+    expect(editionOf('/path/to/movies/Aliens (1986)/Aliens (1986).mkv')).toBeNull()
+  })
+})
+
+describe('isMultiEpisodeFile', () => {
+  it.each([
+    'Show.S01E01E02.1080p.WEB-DL.mkv',
+    'Show.S01E01-E02.1080p.WEB-DL.mkv',
+    'Show.S01E01-02.1080p.WEB-DL.mkv',
+    'show - s1e9e10 - Two Parter.mkv',
+    'Show.S01E01E02E03.mkv',
+    '/path/to/tv/Show (1962)/Season 01/Show - S01E01-E02.mkv',
+    // Task 6 minor 1: the spellings the first pass missed.
+    'Show.S01E01-S01E02.1080p.mkv',
+    'Show.1x01-02.mkv',
+    'Show.1x01x02.mkv',
+    'Show - 1x01-1x02 - Two Parter.mkv',
+  ])('recognises %s', (name) => expect(isMultiEpisodeFile(name)).toBe(true))
+
+  it.each([
+    'Show.S01E01.1080p.WEB-DL.mkv',
+    'Show.S01E01-720p.mkv',             // a resolution, not an episode
+    'Show.S01E01-1080p.mkv',
+    'Show.S01E01-2019.mkv',             // a year
+    'Show.S01E02-01.mkv',               // a range never runs backwards
+    'Show.S01.1080p.WEB-DL',
+    'Show.1x01.mkv',
+    'Show.1x01-720p.mkv',
+    'Show.2x02-01.mkv',
+    'Show.1920x1080.mkv',               // a frame size
+    'Show.S01E01.3840x2160.mkv',
+    // Only the file's own name counts: a pack folder named for its range holds single episodes.
+    '/path/to/tv/Show.S01E01-E10.Pack/Show.S01E03.mkv',
+  ])('does not treat %s as multi-episode', (name) => expect(isMultiEpisodeFile(name)).toBe(false))
 })

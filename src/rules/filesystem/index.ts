@@ -108,6 +108,35 @@ const emptyFolderRule: Rule = {
 }
 
 /**
+ * Folders whose videos Jellyfin never lists as items of their own, so a video under one is not an
+ * orphan however absent it is from `jellyfin_items`:
+ *  - a disc structure (`BDMV`, `VIDEO_TS`) is ONE item, the folder holding it — its streams are
+ *    parts of that item;
+ *  - a Jellyfin extras folder's videos are attached to the movie or show they sit beside. These are
+ *    Jellyfin's own extras folder names, plus `sample` for the `Sample/` folder a scene release
+ *    ships (Jellyfin's spelling is `samples`).
+ * Reported anyway, each would be an orphan "worth" its full size, and fs.orphan-media findings feed
+ * the delete queue.
+ */
+const NON_ITEM_FOLDERS = new Set([
+  'bdmv', 'video_ts',
+  'extras', 'featurettes', 'behind the scenes', 'deleted scenes', 'interviews', 'scenes', 'shorts',
+  'trailers', 'other', 'sample', 'samples', 'clips',
+])
+
+/**
+ * Whether any folder between the library root and the file is a `NON_ITEM_FOLDERS` name (case
+ * insensitive). Only folders BELOW the root count: a root that happens to be called `other` or
+ * `extras` would otherwise silence every file in it. A path not under its recorded root (never
+ * written by the walker) is judged on every folder it names.
+ */
+function inNonItemFolder(path: string, libraryRoot: string | null): boolean {
+  const relative = libraryRoot && path.startsWith(`${libraryRoot}/`) ? path.slice(libraryRoot.length + 1) : path
+  const folders = relative.split('/').slice(0, -1)
+  return folders.some((folder) => NON_ITEM_FOLDERS.has(folder.toLowerCase()))
+}
+
+/**
  * A media file under a library root that Jellyfin does not know about under ANY path. Deliberately
  * scoped to `root_role = 'library'`: files under a download root are pre-import staging, not a
  * Jellyfin gap, per the global rule that only library roots are ever compared against Jellyfin's
@@ -134,14 +163,15 @@ const orphanMediaRule: Rule = {
   class: 'filesystem',
   requires: ['filesystem', 'jellyfin'],
   run(ctx) {
-    const rows = ctx.db.prepare(`SELECT f.container_path AS path, f.size_bytes AS size
+    const rows = ctx.db.prepare(`SELECT f.container_path AS path, f.size_bytes AS size, f.library_root AS root
       FROM fs_entries f
       WHERE f.is_media = 1 AND f.root_role = 'library'
         AND NOT EXISTS (SELECT 1 FROM jellyfin_items i WHERE i.container_path = f.container_path)
         AND NOT EXISTS (SELECT 1 FROM jellyfin_item_paths p WHERE p.container_path = f.container_path)`)
-      .all() as Array<{ path: string; size: number }>
-    return rows.map((r) =>
-      finding(ctx, 'fs.orphan-media', r.path, r.path, 'warning', { sizeBytes: r.size }, r.size))
+      .all() as Array<{ path: string; size: number; root: string | null }>
+    return rows
+      .filter((r) => !inNonItemFolder(r.path, r.root))
+      .map((r) => finding(ctx, 'fs.orphan-media', r.path, r.path, 'warning', { sizeBytes: r.size }, r.size))
   },
 }
 

@@ -35,6 +35,10 @@ export function openDb(path: string): Db {
   db.pragma('journal_mode = WAL')
   db.pragma('foreign_keys = ON')
   db.pragma('synchronous = NORMAL')
+  // The scan worker writes through its own connection while the main thread reads and plans
+  // through another. A writer holding the lock is normal, not an error: wait for it (bounded)
+  // rather than fail the request with SQLITE_BUSY the instant the two overlap.
+  db.pragma('busy_timeout = 15000')
   migrate(db)
   return db
 }

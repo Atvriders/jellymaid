@@ -3,37 +3,64 @@ services:
     image: ghcr.io/atvriders/jellymaid:latest
     container_name: jellymaid
     restart: unless-stopped
+    # Docker's own tiny init runs as PID 1 and node runs under it. It forwards `docker stop`'s
+    # SIGTERM to Jellymaid, which then shuts down gracefully (stops taking work, cancels a running
+    # scan, lets a running plan finish its CURRENT action and stay resumable, closes the database),
+    # and it reaps any child process. Without it the signal's delivery is up to node alone.
+    init: true
+    # One delete action can outlast Docker's 10 s default (qBittorrent's own delete, then up to 30 s for the disk).
+    stop_grace_period: 2m
     # Match these to the uid:gid that owns your media library on the HOST (`id -u` / `id -g`),
-    # not the other way around. Jellymaid deletes and moves files under /mnt/media and
-    # /mnt/downloads below; a container running as root would create root-owned trash/replacement
-    # files in a library your own account owns, which is a real, ongoing problem, not a one-time
-    # inconvenience. Defaults to 1000:1000, the `node` user this image is already built to run as
-    # (see Dockerfile), so most single-user Linux hosts need no override at all. Whatever you set,
-    # `./data` below must exist and be owned by that same uid:gid BEFORE first start — the daemon
-    # creates a missing bind-mount directory as root, and a non-root container cannot then write
-    # to it (`mkdir -p ./data && chown ${PUID:-1000}:${PGID:-1000} ./data`).
-    user: "${PUID:-1000}:${PGID:-1000}"
+    # not the other way around. Jellymaid deletes and moves files under the media and download
+    # mounts below; a container running as root would create root-owned trash/replacement files in
+    # a library your own account owns, which is a real, ongoing problem, not a one-time
+    # inconvenience. Defaults to 99:100, Unraid's nobody:users (the owner of its shares), so on
+    # Unraid no override is needed; set PUID/PGID in .env anywhere else. Whatever you set, the
+    # /data directory below must exist and be owned by that same uid:gid BEFORE first start — the
+    # daemon creates a missing bind-mount directory as root, and a non-root container cannot then
+    # write to it (`mkdir -p /path/to/appdata/jellymaid && chown 99:100 /path/to/appdata/jellymaid`).
+    user: "${PUID:-99}:${PGID:-100}"
     ports:
       - "8099:8099"
     environment:
-      # EXAMPLE addresses (RFC 5737 TEST-NET-1) — replace with your own hosts.
+      # EXAMPLE addresses (RFC 5737 documentation ranges) — replace with your own hosts.
       JELLYFIN_URL: "http://192.0.2.10:8096"
       JELLYFIN_API_KEY: "${JELLYFIN_API_KEY}"
-      QBIT_URL: "http://192.0.2.10:8080"
-      QBIT_USER: "${QBIT_USER}"
-      QBIT_PASS: "${QBIT_PASS}"
-      # Optional. Jellymaid only ever unmonitors in these — it never deletes or blocklists. Each is
-      # a pair, set entirely from .env: RADARR_URL and RADARR_API_KEY must both be filled in, or
-      # both left blank (the .env.example default) — the container refuses to start rather than
-      # guess at a half-configured one. Unlike JELLYFIN_URL/QBIT_URL above (mandatory, and meant to
-      # be edited directly here), both sides of each *arr pair are env-substituted, so the
-      # documented "copy .env.example to .env and fill in the values" path needs no edit to this
-      # file at all to leave Radarr/Sonarr unconfigured.
-      RADARR_URL: "${RADARR_URL:-}"
-      RADARR_API_KEY: "${RADARR_API_KEY:-}"
-      SONARR_URL: "${SONARR_URL:-}"
-      SONARR_API_KEY: "${SONARR_API_KEY:-}"
-      # Any Olson zone (e.g. America/New_York); only affects log timestamps and SCAN_CRON.
+      # qBittorrent: ONE ENTRY PER INSTANCE, as comma-separated id=url pairs. An id is 1-32
+      # lowercase letters, digits or "-" and starts with a letter or digit; you pick it again in
+      # Settings -> Path mapping, so use names that tell your boxes apart. This example has two;
+      # delete the second entry (and its two credential lines below) for a single instance.
+      # A URL may embed credentials (http://user:pass@host:8080), percent-encoded: a "," in the
+      # password MUST be written %2C (a raw comma ends the entry, and the container then refuses to
+      # start); encode every other special character the same way ("@" %40, ":" %3A, "/" %2F,
+      # "#" %23, "?" %3F, "%" %25). The per-instance variables below take a password verbatim, with
+      # no encoding at all, and win over anything embedded in a URL.
+      # (One instance can also be given as QBIT_URL, with QBIT_USER and QBIT_PASS; that older form
+      # is used only while QBIT_INSTANCES is unset, and names the instance "default".)
+      QBIT_INSTANCES: "box-a=http://198.51.100.10:8080,box-b=http://198.51.100.11:8080"
+      # Credentials are OPTIONAL and PER INSTANCE: QBIT_<ID>_USER and QBIT_<ID>_PASS, where <ID> is
+      # the instance id in capitals with "-" written "_" (box-a -> QBIT_BOX_A_USER). Leave both of
+      # an instance blank when it lets this host in without a login; set both when it asks for
+      # one. Half a pair stops the container at start: a login that can only fail is never made.
+      #
+      # UNRAID / SAME-HOST CAVEAT. qBittorrent's "bypass authentication for clients in whitelisted
+      # IP subnets" is normally set to your LAN subnet, which is why a qBittorrent on ANOTHER machine
+      # needs no credentials here. A qBittorrent on the SAME host as this container is different: a
+      # container on Docker's default bridge network reaches it from the Docker bridge address
+      # (172.17.x.x, say), which is outside that whitelist, so the LAN bypass does not apply and the
+      # instance answers 403 until it is given credentials. Set that instance's credentials. A wrong
+      # password is not retried: after one refused login Jellymaid waits 5 minutes and tries once
+      # more, and after two refused logins in a row it stops logging in to that instance until it is
+      # restarted (after a ban it waits an hour), because five failed logins ban the caller's address
+      # for an hour. Fix the password, then restart Jellymaid. An instance that needs credentials it
+      # was not given, or whose credentials were refused, reads as `auth` on /healthz.
+      QBIT_BOX_A_USER: "${QBIT_BOX_A_USER:-}"
+      QBIT_BOX_A_PASS: "${QBIT_BOX_A_PASS:-}"
+      QBIT_BOX_B_USER: "${QBIT_BOX_B_USER:-}"
+      QBIT_BOX_B_PASS: "${QBIT_BOX_B_PASS:-}"
+      # Any Olson zone (e.g. America/New_York). Jellymaid itself does not depend on it: its log
+      # timestamps are ISO-8601 UTC, and its scan schedule (scanCron in config.json) is always
+      # evaluated in UTC, whatever this says.
       TZ: "UTC"
       # Must equal the number of proxies actually in front of this service — behind a single
       # Cloudflare tunnel or reverse proxy that is 1, with nothing in front of it (this default,
@@ -52,10 +79,19 @@ services:
       # fixed schedule of your own choosing, or are restoring /data from a backup that predates
       # that file and want a specific value instead of whatever gets generated.
       # SESSION_SECRET: "${SESSION_SECRET}"
+      #
+      # OPTIONAL: Radarr and/or Sonarr. Skip this block if you run neither. Jellymaid only ever
+      # unmonitors in them — it never deletes or blocklists. Each is a PAIR: uncomment both lines
+      # of a pair and fill both values in .env, or leave both lines commented out. One half of a
+      # pair set without the other stops the container at start rather than guessing.
+      # RADARR_URL: "${RADARR_URL:-}"
+      # RADARR_API_KEY: "${RADARR_API_KEY:-}"
+      # SONARR_URL: "${SONARR_URL:-}"
+      # SONARR_API_KEY: "${SONARR_API_KEY:-}"
     volumes:
       # REQUIRED: index, config, audit log and trash manifest live here. Must pre-exist and be
-      # owned by the uid:gid set above — see the `user:` comment.
-      - ./data:/data
+      # owned by the uid:gid set above — see the `user:` comment. Point it at your appdata share.
+      - /path/to/appdata/jellymaid:/data
       # EXAMPLE paths — replace with your actual media/download directories. Read-write, not
       # read-only: Jellymaid removes empty folders and leftover hardlinks directly on disk, which
       # no API call can do, and the trash it moves deleted files into
@@ -63,5 +99,8 @@ services:
       # "delete" is a same-filesystem rename, never a copy — a read-only mount, a mount split
       # across two different filesystems, or a mount that isn't the true root of one filesystem
       # would each break that guarantee (src/plan/trash.ts).
+      # Every directory that Jellyfin or a qBittorrent instance reports files under must be
+      # visible in here: with two boxes, add one mount per box and root (for example
+      # /path/to/box-b/media:/mnt/media-b), then describe each root in Settings -> Path mapping.
       - /path/to/media:/mnt/media
       - /path/to/downloads:/mnt/downloads
